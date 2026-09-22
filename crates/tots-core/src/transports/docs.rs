@@ -38,7 +38,6 @@ pub struct DocumentTransport<C: DocumentChannel> {
     connected: bool,
     pending: VecDeque<Frame>,
     reassembly: Vec<u8>,
-    expect: Option<usize>,
 }
 
 impl<C: DocumentChannel> DocumentTransport<C> {
@@ -50,7 +49,6 @@ impl<C: DocumentChannel> DocumentTransport<C> {
             connected: false,
             pending: VecDeque::new(),
             reassembly: Vec::new(),
-            expect: None,
         }
     }
 }

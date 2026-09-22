@@ -26,4 +26,4 @@ async-trait = "0.1"
 
 [lib]
 name = "tots_core"
-crate-type = ["rlib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
