@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tots-core",
+    "crates/tots-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/Endlad2/ToTS"
+authors = ["Endlad2"]
+
+[workspace.dependencies]
+tots-core = { path = "crates/tots-core" }
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+hkdf = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+url = "2"
+async-trait = "0.1"

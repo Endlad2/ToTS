@@ -1,0 +1,1 @@
+feat: ToTS Rust core with VK/Telemost/VKStream/Docs/Mail/Max/OneME transports over WireGuard/Xray and release CI
