@@ -1,9 +1,12 @@
-//! Провайдер VK Calls — получение TURN-креденшелов из ссылки на звонок.
+//! Провайдер VK Calls — получение TURN-креденшелов из ссылки на звонок,
+//! включая авторешение Smart Captcha.
 
 mod cache;
+mod captcha;
 mod client;
 mod creds;
 mod error;
+mod persona;
 
 pub use client::{VkConfig, VkProvider};
 

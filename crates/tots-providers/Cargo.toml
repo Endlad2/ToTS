@@ -10,15 +10,16 @@ tracing.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls", "json", "cookies", "gzip", "brotli", "stream"] }
 url.workspace = true
 base64.workspace = true
 hex.workspace = true
 rand.workspace = true
+rand_chacha.workspace = true
 sha2.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+md-5.workspace = true
+regex = "1.11"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

@@ -1,7 +1,4 @@
 //! ToTS providers — источники TURN-креденшелов.
-//!
-//! Единый trait [`TurnProvider`] абстрагирует получение учётных данных
-//! TURN-серверов из разных источников (VK Calls, статический список и т.д.).
 
 pub mod vk;
 
@@ -39,6 +36,9 @@ pub enum ProviderError {
         session_token: String,
         redirect_uri: String,
     },
+
+    #[error("captcha solving failed: {0}")]
+    CaptchaFailed(String),
 
     #[error("rate limited, retry after {retry_after:?}")]
     RateLimited { retry_after: Duration },
