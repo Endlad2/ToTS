@@ -156,9 +156,8 @@ mod tests {
         let reader =
             tokio::spawn(async move { read_client_id(br, bw, Duration::from_secs(5)).await });
 
-        let w = writer.await.unwrap().unwrap();
+        writer.await.unwrap().unwrap();
         let r = reader.await.unwrap().unwrap();
-        let _ = w;
         assert_eq!(r.client_id, "test-client");
         assert_eq!(r.mode, ClientMode::Udp);
         assert_eq!(r.version, VERSION_ACK);
