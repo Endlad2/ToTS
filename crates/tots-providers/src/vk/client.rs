@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::vk::cache::CredentialStore;
+use crate::vk::captcha::{self, SolveContext};
 use crate::vk::creds::{AnonToken, CallToken, OkSession};
 use crate::vk::error::VkApiError;
 use crate::{ProviderError, TurnCredentials, TurnProvider};
@@ -25,6 +26,8 @@ pub struct VkConfig {
     pub streams_per_cache: u32,
     pub restrict_to_first_client: bool,
     pub request_timeout: Duration,
+    /// Отключить авторешение капчи (только для отладки, по умолчанию `false`).
+    pub disable_captcha_solver: bool,
 }
 
 impl VkConfig {
@@ -34,6 +37,7 @@ impl VkConfig {
             streams_per_cache: consts::DEFAULT_STREAMS_PER_CACHE,
             restrict_to_first_client: false,
             request_timeout: Duration::from_secs(20),
+            disable_captcha_solver: false,
         }
     }
 }
@@ -42,6 +46,7 @@ pub struct VkProvider {
     cfg: VkConfig,
     call_code: String,
     http: Client,
+    cookie_jar: std::sync::Arc<Jar>,
     store: CredentialStore,
     lockout_until: AtomicI64,
     fetch_lock: Mutex<()>,
@@ -55,8 +60,8 @@ impl VkProvider {
         let cookie_jar = std::sync::Arc::new(Jar::default());
         let http = Client::builder()
             .timeout(cfg.request_timeout)
-            .user_agent(user_agent())
-            .cookie_provider(cookie_jar)
+            .user_agent(crate::vk::persona::USER_AGENT_CHROME_WINDOWS)
+            .cookie_provider(cookie_jar.clone())
             .gzip(true)
             .brotli(true)
             .build()?;
@@ -67,6 +72,7 @@ impl VkProvider {
             cfg,
             call_code,
             http,
+            cookie_jar,
             store,
             lockout_until: AtomicI64::new(0),
             fetch_lock: Mutex::new(()),
@@ -123,15 +129,16 @@ impl VkProvider {
 
         for (client_id, client_secret) in pairs {
             debug!(stream_id, client_id, "vk: trying pair");
-            match self.fetch_with_pair(stream_id, client_id, client_secret).await {
+            match self
+                .fetch_with_pair(stream_id, client_id, client_secret)
+                .await
+            {
                 Ok(creds) => return Ok(creds),
                 Err(e) => {
                     warn!(stream_id, client_id, error = %e, "vk: pair failed");
                     let terminal = matches!(
                         e,
-                        ProviderError::CaptchaRequired { .. }
-                            | ProviderError::InvalidLink(_)
-                            | ProviderError::Unavailable(_)
+                        ProviderError::InvalidLink(_) | ProviderError::Unavailable(_)
                     );
                     last_err = Some(e);
                     if terminal {
@@ -184,6 +191,7 @@ impl VkProvider {
         let resp: Value = self
             .http
             .post(consts::ANON_TOKEN_URL)
+            .headers(crate::vk::persona::base_headers())
             .header("Origin", "https://vk.ru")
             .header("Referer", "https://vk.ru/")
             .form(&form)
@@ -211,35 +219,120 @@ impl VkProvider {
             client_id
         );
         let name = random_name();
-        let form = [
-            (
-                "vk_join_link",
-                format!("https://vk.ru/call/join/{}", self.call_code),
-            ),
-            ("name", name),
-            ("access_token", anon_token.to_string()),
-        ];
-        let resp: Value = self
-            .http
-            .post(&url)
-            .header("Origin", "https://vk.ru")
-            .header("Referer", "https://vk.ru/")
-            .form(&form)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(err) = resp.get("error") {
-            let parsed = VkApiError::from_value(err)
-                .ok_or_else(|| ProviderError::Malformed(format!("unparsed error: {err}")))?;
-            return Err(parsed.into_provider_error());
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            if attempt > 3 {
+                return Err(ProviderError::CaptchaFailed(
+                    "too many captcha retries".into(),
+                ));
+            }
+            let form = [
+                (
+                    "vk_join_link",
+                    format!("https://vk.ru/call/join/{}", self.call_code),
+                ),
+                ("name", name.clone()),
+                ("access_token", anon_token.to_string()),
+            ];
+            let resp: Value = self
+                .http
+                .post(&url)
+                .headers(crate::vk::persona::base_headers())
+                .header("Origin", "https://vk.ru")
+                .header("Referer", "https://vk.ru/")
+                .form(&form)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if let Some(err) = resp.get("error") {
+                let parsed = VkApiError::from_value(err)
+                    .ok_or_else(|| ProviderError::Malformed(format!("unparsed error: {err}")))?;
+
+                if parsed.is_captcha() && !self.cfg.disable_captcha_solver {
+                    let session_token = parsed.session_token.clone().unwrap_or_default();
+                    let redirect_uri = parsed.redirect_uri.clone().unwrap_or_default();
+                    debug!(
+                        session_token_len = session_token.len(),
+                        redirect_uri = %redirect_uri,
+                        "vk: solving captcha automatically"
+                    );
+                    match self.try_solve_captcha(&session_token, &redirect_uri).await {
+                        Ok(success_token) => {
+                            debug!(len = success_token.len(), "vk: captcha solved");
+                            let retry_form = [
+                                (
+                                    "vk_join_link",
+                                    format!("https://vk.ru/call/join/{}", self.call_code),
+                                ),
+                                ("name", name.clone()),
+                                ("access_token", anon_token.to_string()),
+                                ("success_token", success_token),
+                                ("session_token", session_token),
+                            ];
+                            let retry: Value = self
+                                .http
+                                .post(&url)
+                                .headers(crate::vk::persona::base_headers())
+                                .header("Origin", "https://vk.ru")
+                                .header("Referer", "https://vk.ru/")
+                                .form(&retry_form)
+                                .send()
+                                .await?
+                                .json()
+                                .await?;
+                            if let Some(retry_err) = retry.get("error") {
+                                if let Some(p) = VkApiError::from_value(retry_err) {
+                                    return Err(p.into_provider_error());
+                                }
+                                return Err(ProviderError::Malformed(format!(
+                                    "captcha retry error: {retry_err}"
+                                )));
+                            }
+                            let token = retry
+                                .get("response")
+                                .and_then(|r| r.get("token"))
+                                .and_then(|t| t.as_str())
+                                .ok_or_else(|| {
+                                    ProviderError::Malformed(format!(
+                                        "no token after captcha: {retry}"
+                                    ))
+                                })?;
+                            return Ok(CallToken(token.to_string()));
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "vk: captcha solve failed");
+                            return Err(ProviderError::CaptchaFailed(e.to_string()));
+                        }
+                    }
+                }
+                return Err(parsed.into_provider_error());
+            }
+
+            let token = resp
+                .get("response")
+                .and_then(|r| r.get("token"))
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| ProviderError::Malformed(format!("no token: {resp}")))?;
+            return Ok(CallToken(token.to_string()));
         }
-        let token = resp
-            .get("response")
-            .and_then(|r| r.get("token"))
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| ProviderError::Malformed(format!("no token: {resp}")))?;
-        Ok(CallToken(token.to_string()))
+    }
+
+    async fn try_solve_captcha(
+        &self,
+        session_token: &str,
+        redirect_uri: &str,
+    ) -> Result<String, captcha::CaptchaError> {
+        let ctx = SolveContext {
+            http: self.http.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+            session_token: session_token.to_string(),
+            redirect_uri: redirect_uri.to_string(),
+            attempt: 1,
+        };
+        captcha::solve(ctx).await
     }
 
     async fn fetch_ok_session(&self) -> Result<OkSession, ProviderError> {
@@ -257,6 +350,7 @@ impl VkProvider {
         let resp: Value = self
             .http
             .post(&url)
+            .headers(crate::vk::persona::base_headers())
             .header("Origin", "https://vk.ru")
             .header("Referer", "https://vk.ru/")
             .form(&form)
@@ -291,6 +385,7 @@ impl VkProvider {
         let resp: Value = self
             .http
             .post(&url)
+            .headers(crate::vk::persona::base_headers())
             .header("Origin", "https://vk.ru")
             .header("Referer", "https://vk.ru/")
             .form(&form)
@@ -358,7 +453,10 @@ impl TurnProvider for VkProvider {
         false
     }
     fn reset_errors(&self, stream_id: u32) {
-        self.store.slot(stream_id).error_count.store(0, Ordering::Relaxed);
+        self.store
+            .slot(stream_id)
+            .error_count
+            .store(0, Ordering::Relaxed);
     }
     fn drop_credentials(&self, stream_id: u32) {
         self.store.slot(stream_id).invalidate();
@@ -407,17 +505,15 @@ fn random_name() -> String {
     )
 }
 
-fn user_agent() -> &'static str {
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn parse_full_url() {
-        assert_eq!(parse_call_code("https://vk.ru/call/join/ABC123").unwrap(), "ABC123");
+        assert_eq!(
+            parse_call_code("https://vk.ru/call/join/ABC123").unwrap(),
+            "ABC123"
+        );
     }
     #[test]
     fn parse_bare_code() {

@@ -1,16 +1,21 @@
 //! Упрощённая DTLS-сессия: X25519-ECDH + ChaCha20-Poly1305.
 //!
-//! Использует общий `Arc<tokio::sync::Mutex<S>>` для I/O, поэтому
-//! `into_split()` работает без unsafe: обе половины держат один и тот же Arc.
+//! `ReadHalf` и `WriteHalf` реализуют `tokio::io::AsyncRead` / `AsyncWrite`,
+//! поэтому их можно использовать с `AsyncReadExt`/`AsyncWriteExt` и
+//! `tokio::io::split`-подобными идиомами.
+//!
+//! Внутри используется `Arc<Mutex<S>>` — оба half'а делят один и тот же I/O.
 
 use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::debug;
 
 use super::record::{self, RecordHeader};
@@ -102,76 +107,6 @@ where
         }
     }
 
-    pub async fn write(&self, payload: &[u8]) -> Result<(), DtlsError> {
-        let _g = self.write_lock.lock().await;
-        let seq = {
-            let mut s = self.send_seq.lock().unwrap();
-            let v = *s;
-            *s += 1;
-            v
-        };
-
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[0..2].copy_from_slice(&EPOCH_APP.to_be_bytes());
-        nonce_bytes[2..10].copy_from_slice(&seq.to_be_bytes());
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        let mut ct = payload.to_vec();
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(nonce, &[], &mut ct)
-            .map_err(|_| DtlsError::Crypto("encrypt".into()))?;
-        ct.extend_from_slice(&tag);
-
-        let rec = record::wrap_application_data(EPOCH_APP, seq, &ct);
-        let mut inner = self.inner.lock().await;
-        inner.write_all(&rec).await?;
-        inner.flush().await?;
-        Ok(())
-    }
-
-    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, DtlsError> {
-        let _g = self.read_lock.lock().await;
-        let mut inner = self.inner.lock().await;
-        loop {
-            let mut hdr_buf = [0u8; record::HEADER_LEN];
-            inner.read_exact(&mut hdr_buf).await?;
-            let hdr = RecordHeader::decode(&hdr_buf)?;
-            let mut payload = vec![0u8; hdr.length as usize];
-            inner.read_exact(&mut payload).await?;
-
-            match hdr.content_type {
-                record::CONTENT_TYPE_APPLICATION_DATA => {
-                    if payload.len() < 16 {
-                        return Err(DtlsError::Crypto("short payload".into()));
-                    }
-                    let (ct, tag) = payload.split_at(payload.len() - 16);
-                    let mut nonce_bytes = [0u8; 12];
-                    nonce_bytes[0..2].copy_from_slice(&hdr.epoch.to_be_bytes());
-                    let mut seq64 = [0u8; 8];
-                    seq64[2..8].copy_from_slice(&hdr.sequence);
-                    nonce_bytes[2..10].copy_from_slice(&seq64);
-                    let nonce = Nonce::from_slice(&nonce_bytes);
-
-                    let mut plain = ct.to_vec();
-                    self.cipher
-                        .decrypt_in_place_detached(
-                            nonce,
-                            &[],
-                            &mut plain,
-                            chacha20poly1305::Tag::from_slice(tag),
-                        )
-                        .map_err(|_| DtlsError::Crypto("decrypt".into()))?;
-                    let n = plain.len().min(buf.len());
-                    buf[..n].copy_from_slice(&plain[..n]);
-                    return Ok(n);
-                }
-                record::CONTENT_TYPE_ALERT => return Ok(0),
-                _ => continue,
-            }
-        }
-    }
-
     pub fn into_split(self) -> (ReadHalf<S>, WriteHalf<S>) {
         (
             ReadHalf {
@@ -212,7 +147,8 @@ impl<S> ReadHalf<S>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
 {
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, DtlsError> {
+    /// Читает одну расшифрованную запись в `buf`, возвращает её длину.
+    pub async fn read_record(&mut self, buf: &mut [u8]) -> Result<usize, DtlsError> {
         let _g = self.read_lock.lock().await;
         let mut inner = self.inner.lock().await;
         loop {
@@ -245,6 +181,7 @@ where
                 buf[..n].copy_from_slice(&plain[..n]);
                 return Ok(n);
             }
+            // Другие типы записей в этой версии игнорируем.
         }
     }
 }
@@ -253,7 +190,8 @@ impl<S> WriteHalf<S>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
 {
-    pub async fn write(&mut self, payload: &[u8]) -> Result<(), DtlsError> {
+    /// Шифрует `payload` и отправляет одной DTLS-записью.
+    pub async fn write_record(&mut self, payload: &[u8]) -> Result<(), DtlsError> {
         let _g = self.write_lock.lock().await;
         let seq = {
             let mut s = self.send_seq.lock().unwrap();
@@ -278,6 +216,69 @@ where
         Ok(())
     }
 }
+
+// ─── AsyncRead для ReadHalf ──────────────────────────────────────────────
+//
+// Работает как `poll_read`: если данные из последней записи ещё не выданы —
+// докидываем остаток; иначе запускаем `read_record`.
+
+impl<S> AsyncRead for ReadHalf<S>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // Получаем future `read_record` через `Box::pin` (асинхронный метод
+        // на `&mut self`), но её нельзя поллить без владения `&mut self`.
+        // Проще: раз — сразу фьючим в локальный буфер.
+        let mut tmp = vec![0u8; buf.remaining()];
+        let fut = this.read_record(&mut tmp);
+        let mut fut = Box::pin(fut);
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(n)) => {
+                buf.put_slice(&tmp[..n]);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> AsyncWrite for WriteHalf<S>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let len = buf.len();
+        let fut = this.write_record(buf);
+        let mut fut = Box::pin(fut);
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(len)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────
 
 fn sha256_32(input: &[u8]) -> [u8; 32] {
     let out = Sha256::digest(input);
@@ -331,3 +332,6 @@ async fn read_handshake<S: AsyncReadExt + Unpin>(s: &mut S) -> io::Result<Vec<u8
     s.read_exact(&mut payload).await?;
     Ok(payload)
 }
+
+// Импорт Future только для `.poll()` на `Pin<Box<dyn ...>>`.
+use std::future::Future as _;

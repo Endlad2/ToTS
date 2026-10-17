@@ -111,11 +111,13 @@ pub async fn load_assets_async(
             .header("Sec-Fetch-Mode", "no-cors")
             .header("Sec-Fetch-Dest", "image");
         let _ = req.send().await;
-        // Небольшой джиттер между запросами.
-        tokio::time::sleep(std::time::Duration::from_millis(
-            rand::thread_rng().gen_range(20..80),
-        ))
-        .await;
+
+        // Джиттер вычисляем ДО await, чтобы ThreadRng не пересекал точку await.
+        let jitter_ms = {
+            let mut rng = rand::thread_rng();
+            rng.gen_range(20..80u64)
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
     }
     let _ = cookie_jar;
     Ok(())

@@ -2,7 +2,6 @@
 
 use std::time::{Duration, Instant};
 
-use rand::Rng;
 use tracing::debug;
 
 use super::api::{self, CaptchaError, CheckResult};
@@ -20,8 +19,7 @@ pub async fn solve(
     debug!("captcha: componentDone sent");
 
     // 2. Пауза (пользователь смотрит на виджет).
-    let click_ms = 450 + rand::thread_rng().gen_range(0..500);
-    dwell(click_ms, click_ms + 100).await;
+    dwell(450, 950).await;
 
     // 3. check с пустым ответом.
     let sensors_start = Instant::now();
@@ -57,12 +55,13 @@ fn interpret_check(check: CheckResult) -> Result<String, CaptchaError> {
         debug!("captcha: checkbox accepted");
         return Ok(check.success_token);
     }
-    Err(CaptchaError::Api(format!("checkbox status: {}", check.status)))
+    Err(CaptchaError::Api(format!(
+        "checkbox status: {}",
+        check.status
+    )))
 }
 
 fn generate_browser_fp() -> String {
-    let mut rng = rand::thread_rng();
-    let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes);
+    let bytes: [u8; 16] = rand::random();
     hex::encode(bytes)
 }

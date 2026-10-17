@@ -1,21 +1,4 @@
 //! Автоматическое решение VK Smart Captcha (captchaNotRobot).
-//!
-//! Пайплайн:
-//! 1. Загрузка HTML страницы капчи по redirect_uri.
-//! 2. Парсинг PoW (input, difficulty, prefix) и debug_info.
-//! 3. Параллельно загружаются assets (CSS/JS/шрифты).
-//! 4. Если в HTML есть window.init — challenge берётся оттуда; иначе
-//!    вызывается `captchaNotRobot.initSession`.
-//! 5. `captchaNotRobot.settings` — период телеметрии.
-//! 6. Пауза (имитация отрисовки виджета).
-//! 7. Решение: checkbox (просто ждём + `check`) или slider (`getContent` →
-//!    анализ изображения → `check` с лучшей попыткой).
-//! 8. `captchaNotRobot.endSession`.
-//!
-//! Ошибки:
-//! * `error_limit` → rate limit (ретрай через паузу).
-//! * `bot` → эскалация на slider.
-//! * `ErrUnavailable` (страница отдала 429/5xx) → НЕ аутаж, персона жива.
 
 mod api;
 mod assets;
@@ -27,24 +10,17 @@ mod telemetry;
 
 pub use api::{CaptchaError, SolveResult};
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use rand::Rng;
 use reqwest::cookie::Jar;
 use reqwest::Client;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use super::persona;
-
 const MAX_ATTEMPTS: u32 = 2;
-const API_VERSION: &str = "5.131";
-const API_HOST: &str = "api.vk.ru";
-const CAPTCHA_DOMAIN: &str = "vk.ru";
+pub(crate) const API_HOST: &str = "api.vk.ru";
+pub(crate) const API_VERSION: &str = "5.131";
 
 pub struct SolveContext {
     pub http: Client,
@@ -63,14 +39,11 @@ pub async fn solve(ctx: SolveContext) -> SolveResult {
             Ok(token) => return Ok(token),
             Err(e) => {
                 warn!(attempt, error = %e, "captcha: attempt failed");
+                let fatal = matches!(e, CaptchaError::RateLimit | CaptchaError::Bot);
                 last_err = Some(e);
-                if matches!(
-                    last_err,
-                    Some(CaptchaError::RateLimit) | Some(CaptchaError::Bot)
-                ) {
+                if fatal {
                     break;
                 }
-                // Пауза перед следующей попыткой.
                 let backoff = Duration::from_millis(500 * attempt as u64);
                 tokio::time::sleep(backoff).await;
             }
@@ -80,14 +53,11 @@ pub async fn solve(ctx: SolveContext) -> SolveResult {
 }
 
 async fn solve_once(ctx: &SolveContext) -> Result<String, CaptchaError> {
-    // 1. Загружаем HTML страницы капчи.
     let html = api::fetch_html(ctx).await?;
     debug!(len = html.len(), "captcha: html loaded");
 
-    // 2. Парсим PoW, debug_info, window.init.
     let page = html::parse_page(&html).map_err(|e| CaptchaError::Unavailable(e.to_string()))?;
 
-    // 3. Параллельно грузим assets.
     let assets_task = assets::load_assets_async(
         ctx.http.clone(),
         ctx.cookie_jar.clone(),
@@ -95,7 +65,6 @@ async fn solve_once(ctx: &SolveContext) -> Result<String, CaptchaError> {
         &ctx.redirect_uri,
     );
 
-    // 4. Решаем PoW и собираем конверт.
     let pow_hash = pow::solve_and_wrap(
         &page.pow,
         page.debug_info.clone(),
@@ -106,10 +75,8 @@ async fn solve_once(ctx: &SolveContext) -> Result<String, CaptchaError> {
     .await?;
     debug!("captcha: pow ready");
 
-    // 5. Ждём assets (но не блокируемся — если они упадут, всё равно продолжим).
     let _ = assets_task.await;
 
-    // 6. show_type и slider content.
     let (show_type, slider_content) = if page.init.found {
         (page.init.show_type.clone(), page.init.content.clone())
     } else {
@@ -117,7 +84,6 @@ async fn solve_once(ctx: &SolveContext) -> Result<String, CaptchaError> {
     };
     debug!(show_type = %show_type, "captcha: challenge type");
 
-    // 7. settings.
     let settings = api::settings(ctx).await?;
     let sensors_delay = settings
         .get("response")
@@ -127,23 +93,17 @@ async fn solve_once(ctx: &SolveContext) -> Result<String, CaptchaError> {
         .unwrap_or(Duration::from_millis(100));
     debug!(delay = ?sensors_delay, "captcha: sensors config");
 
-    // 8. Имитация отрисовки виджета.
     dwell(250, 400).await;
 
     let check_result = match show_type.as_str() {
-        "slider" => {
-            slider::solve(ctx, &pow_hash, &page, slider_content, sensors_delay).await
-        }
-        "checkbox" | "" => {
-            checkbox::solve(ctx, &pow_hash, &page, sensors_delay).await
-        }
+        "slider" => slider::solve(ctx, &pow_hash, &page, slider_content, sensors_delay).await,
+        "checkbox" | "" => checkbox::solve(ctx, &pow_hash, &page, sensors_delay).await,
         other => {
             warn!(show_type = other, "captcha: unsupported type");
             Err(CaptchaError::Unsupported(other.to_string()))
         }
     };
 
-    // 9. Если checkbox вернул ShowTypeSlider — эскалируем.
     let success_token = match check_result {
         Ok(tok) => tok,
         Err(CaptchaError::ShowTypeSlider(content)) => {
@@ -157,7 +117,6 @@ async fn solve_once(ctx: &SolveContext) -> Result<String, CaptchaError> {
         }
     };
 
-    // 10. endSession.
     if let Err(e) = api::end_session(ctx).await {
         warn!(error = %e, "captcha: endSession failed (non-fatal)");
     }
@@ -165,13 +124,14 @@ async fn solve_once(ctx: &SolveContext) -> Result<String, CaptchaError> {
     Ok(success_token)
 }
 
-/// Пауза в миллисекундах [min, max).
 pub(crate) async fn dwell(min: u64, max: u64) {
-    let ms = min + rand::thread_rng().gen_range(0..(max - min).max(1));
+    let ms = {
+        let mut rng = rand::thread_rng();
+        min + rng.gen_range(0..(max.saturating_sub(min)).max(1))
+    };
     tokio::time::sleep(Duration::from_millis(ms)).await;
 }
 
-/// Тело запроса в формате x-www-form-urlencoded.
 pub(crate) fn encode_form(values: &[(&str, String)]) -> String {
     let mut out = String::new();
     for (i, (k, v)) in values.iter().enumerate() {

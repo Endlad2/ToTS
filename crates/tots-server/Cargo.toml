@@ -10,7 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 tots-core = { path = "../tots-core" }
-tots-wire = { path = "../tots-wire" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -22,3 +21,4 @@ serde_json.workspace = true
 hex.workspace = true
 bytes.workspace = true
 futures.workspace = true
+parking_lot.workspace = true

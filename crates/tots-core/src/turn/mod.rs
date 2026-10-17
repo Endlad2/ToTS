@@ -94,12 +94,15 @@ impl TurnClient {
             if requested_family == 6 {
                 msg.add(Attr::RequestedAddressFamily(0x02));
             }
+
+            // Порядок важен: Username, Realm, Nonce идут ПЕРЕД MessageIntegrity,
+            // а MI вычисляется по уже сериализованному сообщению без MI.
             if !realm.is_empty() && !nonce.is_empty() {
-                let key = build_long_term_key(&self.username, &realm, &self.password);
-                let integrity = msg.compute_integrity(&key);
                 msg.add(Attr::Username(self.username.clone()));
                 msg.add(Attr::Realm(realm.clone()));
                 msg.add(Attr::Nonce(nonce.clone()));
+                let key = build_long_term_key(&self.username, &realm, &self.password);
+                let integrity = msg.compute_integrity(&key);
                 msg.add(Attr::MessageIntegrity(integrity));
             }
 
@@ -179,11 +182,11 @@ impl TurnAllocation {
         let txid = random_txid();
         let mut msg = Message::new(Method::CreatePermission, Class::Request, txid);
         msg.add(Attr::XorPeerAddress(peer));
+        msg.add(Attr::Username(self.username.clone()));
+        msg.add(Attr::Realm(realm.clone()));
+        msg.add(Attr::Nonce(nonce.clone()));
         let key = build_long_term_key(&self.username, &realm, &self.password);
         let integrity = msg.compute_integrity(&key);
-        msg.add(Attr::Username(self.username.clone()));
-        msg.add(Attr::Realm(realm));
-        msg.add(Attr::Nonce(nonce));
         msg.add(Attr::MessageIntegrity(integrity));
 
         let resp = self.stun_request(msg).await?;
@@ -206,11 +209,11 @@ impl TurnAllocation {
         let mut msg = Message::new(Method::ChannelBind, Class::Request, txid);
         msg.add(Attr::ChannelNumber(channel));
         msg.add(Attr::XorPeerAddress(peer));
+        msg.add(Attr::Username(self.username.clone()));
+        msg.add(Attr::Realm(realm.clone()));
+        msg.add(Attr::Nonce(nonce.clone()));
         let key = build_long_term_key(&self.username, &realm, &self.password);
         let integrity = msg.compute_integrity(&key);
-        msg.add(Attr::Username(self.username.clone()));
-        msg.add(Attr::Realm(realm));
-        msg.add(Attr::Nonce(nonce));
         msg.add(Attr::MessageIntegrity(integrity));
 
         let resp = self.stun_request(msg).await?;
@@ -257,7 +260,8 @@ impl TurnAllocation {
                 let mut slice = data;
                 if let Ok(msg) = Message::decode(&mut slice) {
                     if msg.method == Method::Data && msg.class == Class::Indication {
-                        if let (Some(peer), Some(payload)) = (msg.find_xor_peer(), msg.find_data()) {
+                        if let (Some(peer), Some(payload)) = (msg.find_xor_peer(), msg.find_data())
+                        {
                             return Ok((peer, payload));
                         }
                     }
@@ -272,11 +276,11 @@ impl TurnAllocation {
         let txid = random_txid();
         let mut msg = Message::new(Method::Refresh, Class::Request, txid);
         msg.add(Attr::Lifetime(lifetime));
+        msg.add(Attr::Username(self.username.clone()));
+        msg.add(Attr::Realm(realm.clone()));
+        msg.add(Attr::Nonce(nonce.clone()));
         let key = build_long_term_key(&self.username, &realm, &self.password);
         let integrity = msg.compute_integrity(&key);
-        msg.add(Attr::Username(self.username.clone()));
-        msg.add(Attr::Realm(realm));
-        msg.add(Attr::Nonce(nonce));
         msg.add(Attr::MessageIntegrity(integrity));
 
         let resp = self.stun_request(msg).await?;
@@ -294,11 +298,11 @@ impl TurnAllocation {
         let txid = random_txid();
         let mut msg = Message::new(Method::Refresh, Class::Request, txid);
         msg.add(Attr::Lifetime(0));
-        let key = build_long_term_key(&self.username, &self.realm, &self.password);
-        let integrity = msg.compute_integrity(&key);
         msg.add(Attr::Username(self.username.clone()));
         msg.add(Attr::Realm(self.realm.clone()));
         msg.add(Attr::Nonce(self.nonce.clone()));
+        let key = build_long_term_key(&self.username, &self.realm, &self.password);
+        let integrity = msg.compute_integrity(&key);
         msg.add(Attr::MessageIntegrity(integrity));
         let bytes = msg.encode();
         let _ = self.socket.send(&bytes).await;

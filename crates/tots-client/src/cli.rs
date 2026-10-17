@@ -70,6 +70,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 12)]
     pub streams_per_cred: u32,
 
+    /// Отключить авторешение капчи VK (по умолчанию включено).
+    #[arg(long)]
+    pub no_captcha_solver: bool,
+
     #[arg(long)]
     pub debug: bool,
 }

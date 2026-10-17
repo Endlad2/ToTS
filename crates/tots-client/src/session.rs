@@ -64,13 +64,33 @@ pub async fn run_vk(
         .context("parse TURN server addr")?;
     info!(%turn_server, "using TURN server from provider");
 
-    let io = Transport::turn(turn_server, creds.username.clone(), creds.password.clone())
-        .await
-        .context("TURN allocate")?;
+    let io = Transport::turn(
+        turn_server,
+        creds.username.clone(),
+        creds.password.clone(),
+    )
+    .await
+    .context("TURN allocate")?;
 
     let stream: BoxStream = match io {
+        Transport::Turn(mut alloc) => {
+            // Два обязательных шага перед отправкой данных через TURN:
+            // 1. CreatePermission — разрешает трафик к пиру (нашему серверу).
+            // 2. ChannelBind — привязывает канал 0x4000 к пиру, после чего
+            //    данные можно слать короткими ChannelData-пакетами.
+            info!(%peer, "TURN: creating permission");
+            alloc
+                .create_permission(peer)
+                .await
+                .context("TURN CreatePermission")?;
+
+            info!(%peer, "TURN: binding channel");
+            let channel = alloc.channel_bind(peer).await.context("TURN ChannelBind")?;
+            info!(channel = format!("0x{:04x}", channel), "TURN: channel bound");
+
+            Box::new(TurnIo::new(alloc, peer))
+        }
         Transport::Direct(s) => Box::new(TcpIo(s)),
-        Transport::Turn(a) => Box::new(TurnIo::new(a, peer)),
     };
 
     let _ = streams;
@@ -97,7 +117,7 @@ async fn run_single_session(
     let dtls = DtlsConnector::connect(
         adapter,
         DtlsConfig {
-            handshake_timeout: Duration::from_secs(20),
+            handshake_timeout: Duration::from_secs(30),
         },
     )
     .await

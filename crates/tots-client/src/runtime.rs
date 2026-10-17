@@ -51,17 +51,15 @@ pub async fn run(cli: Cli) -> Result<()> {
 
             let mut cfg = VkConfig::new(link);
             cfg.streams_per_cache = cli.streams_per_cred;
+            cfg.disable_captcha_solver = cli.no_captcha_solver;
 
             let provider = VkProvider::new(cfg).context("init vk provider")?;
 
-            // Прогреваем первый поток, чтобы сразу увидеть проблемы с captcha.
             match provider.get_credentials(1).await {
                 Ok(_) => info!("vk provider ready"),
                 Err(e) => {
-                    if matches!(e, tots_providers::ProviderError::CaptchaRequired { .. }) {
-                        bail!("VK requires captcha: {e}. Solve it manually and restart.");
-                    }
-                    return Err(e).context("warm-up fetch");
+                    let msg = format!("{e}");
+                    bail!("VK fetch failed: {msg}");
                 }
             }
 

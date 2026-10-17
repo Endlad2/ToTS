@@ -2,7 +2,7 @@
 
 use bytes::{BufMut, BytesMut};
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha1::Sha1;
 
 use super::attr::{decode_attr, Attr, MAGIC_COOKIE};
 
@@ -164,6 +164,10 @@ impl Message {
         })
     }
 
+    /// Вычисляет MessageIntegrity (HMAC-SHA1 по RFC 5389).
+    ///
+    /// Длина сообщения в заголовке должна быть увеличена на 24 байта:
+    /// 4 байта заголовка атрибута + 20 байт HMAC-SHA1.
     pub fn compute_integrity(&self, key: &[u8]) -> Vec<u8> {
         let mut buf = BytesMut::with_capacity(256);
         let msg_type = encode_msg_type(self.method, self.class);
@@ -177,10 +181,12 @@ impl Message {
             attr.encode(&mut buf, &self.txid);
         }
 
+        // По RFC 5389 §15.4: длина в заголовке = текущая длина + 24
+        // (заголовок MESSAGE-INTEGRITY 4 байта + HMAC-SHA1 20 байт).
         let fake_len = (buf.len() - 20 + 24) as u16;
         buf[len_pos..len_pos + 2].copy_from_slice(&fake_len.to_be_bytes());
 
-        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac");
+        let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("hmac");
         mac.update(&buf);
         mac.finalize().into_bytes().to_vec()
     }

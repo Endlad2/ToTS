@@ -1,7 +1,5 @@
 //! Proof-of-work: SHA-256 перебор + телеметрия + base64url-конверт.
 
-use std::time::Instant;
-
 use base64::Engine;
 use rand::Rng;
 use serde::Serialize;
@@ -10,7 +8,6 @@ use sha2::{Digest, Sha256};
 use super::api::CaptchaError;
 use super::html::PowParams;
 
-/// Телеметрия живого браузера для PoW.
 #[derive(Serialize)]
 struct Telemetry {
     globals: Globals,
@@ -211,6 +208,8 @@ pub async fn solve_and_wrap(
     page_origin: &str,
     domain: &str,
 ) -> Result<String, CaptchaError> {
+    let _ = debug_info;
+
     // 1. Решаем PoW.
     let (hash, nonce) = solve_pow(&pow.input, pow.difficulty)
         .ok_or_else(|| CaptchaError::PowParse("pow failed".into()))?;
@@ -222,8 +221,8 @@ pub async fn solve_and_wrap(
 
     // 3. Хешируем канонизированную телеметрию.
     let tel_hash = {
-        let canonical = canonical_json(&telemetry_json)
-            .map_err(|e| CaptchaError::PowParse(e.to_string()))?;
+        let canonical =
+            canonical_json(&telemetry_json).map_err(|e| CaptchaError::PowParse(e.to_string()))?;
         let sum = Sha256::digest(&canonical);
         hex::encode(sum)
     };
@@ -238,7 +237,7 @@ pub async fn solve_and_wrap(
         tel_hash
     );
 
-    // 5. Base64url.
+    // 5. Base64.
     let encoded = base64::engine::general_purpose::STANDARD.encode(envelope.as_bytes());
     Ok(format!("{}{}", pow.prefix, encoded))
 }
@@ -263,7 +262,6 @@ fn pow_duration_ms(nonce: u32) -> u64 {
     ((nonce as f64 + 1.0) * 0.015).round().max(1.0) as u64
 }
 
-/// Канонизирует JSON: переставляет ключи по алфавиту.
 fn canonical_json(data: &[u8]) -> Result<Vec<u8>, serde_json::Error> {
     let v: serde_json::Value = serde_json::from_slice(data)?;
     let canonical = sort_value(&v);
@@ -404,9 +402,4 @@ fn build_telemetry(page_origin: &str, domain: &str) -> Telemetry {
             orientation_angle: 0,
         },
     }
-}
-
-#[allow(dead_code)]
-fn _unused_instant() -> Instant {
-    Instant::now()
 }
