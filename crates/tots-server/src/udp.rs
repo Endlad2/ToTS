@@ -20,7 +20,6 @@ use tots_core::obf::Profile;
 use crate::auth::Authorizer;
 
 const PEER_QUEUE_CAP: usize = 256;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub async fn serve(
     listen: SocketAddr,
@@ -33,7 +32,6 @@ pub async fn serve(
     let sock = Arc::new(UdpSocket::bind(listen).await?);
     info!(%listen, "udp listener up");
 
-    // Пиры: addr -> отправитель для mpsc.
     let peers: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
@@ -87,7 +85,6 @@ async fn handle_peer(
 ) -> Result<()> {
     let adapter = UdpPeerStream::new(sock.clone(), peer, rx);
 
-    // 1. DTLS handshake.
     let dtls = DtlsAcceptor::accept(
         adapter,
         DtlsConfig {
@@ -98,7 +95,6 @@ async fn handle_peer(
     .context("DTLS accept")?;
     info!(%peer, "DTLS handshake complete");
 
-    // 2. Client ID через `AsyncReadExt` (half'ы теперь реализуют его).
     let (mut rd, mut wr) = dtls.into_split();
     let mut len_buf = [0u8; 1];
     tokio::time::timeout(Duration::from_secs(5), rd.read_exact(&mut len_buf))
@@ -115,20 +111,17 @@ async fn handle_peer(
 
     info!(%peer, client_id = %client_id, mode, "client identified");
 
-    // 3. ACK.
     if version >= 2 {
         wr.write_all(&[0x06]).await.context("ack")?;
         wr.flush().await?;
     }
 
-    // 4. Авторизация.
     if !authorizer.is_authorized(&client_id).await {
         warn!(%peer, client_id = %client_id, "unauthorized");
         anyhow::bail!("unauthorized");
     }
     info!(%peer, "client authorized");
 
-    // 5. Backend — UDP-сокет к WireGuard.
     let backend = UdpSocket::bind("0.0.0.0:0").await?;
     backend
         .connect(connect)
@@ -136,7 +129,6 @@ async fn handle_peer(
         .with_context(|| format!("connect backend {connect}"))?;
     info!(%peer, backend = %connect, "backend connected");
 
-    // 6. Двунаправленный копир: dtls <-> backend.
     let mut dtls_to_backend_buf = vec![0u8; 16 * 1024];
     let mut backend_to_dtls_buf = vec![0u8; 16 * 1024];
 
@@ -157,7 +149,7 @@ async fn handle_peer(
             r = backend.recv(&mut backend_to_dtls_buf) => {
                 match r {
                     Ok(n) => {
-                        if let Err(e) = wr.write(&backend_to_dtls_buf[..n]).await {
+                        if let Err(e) = wr.write_all(&backend_to_dtls_buf[..n]).await {
                             debug!(%peer, "dtls write: {e}");
                             break;
                         }
