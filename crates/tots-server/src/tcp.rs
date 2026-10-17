@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
@@ -46,7 +47,7 @@ pub async fn serve(
 async fn handle_session(
     stream: tokio::net::TcpStream,
     connect: SocketAddr,
-    _authorizer: Arc<Authorizer>,
+    authorizer: Arc<Authorizer>,
 ) -> Result<()> {
     let dtls = DtlsAcceptor::accept(
         stream,
@@ -60,18 +61,25 @@ async fn handle_session(
     let (mut rd, mut wr) = dtls.into_split();
 
     let mut len_buf = [0u8; 1];
-    read_exact(&mut rd, &mut len_buf).await?;
+    rd.read_exact(&mut len_buf).await?;
     let len = len_buf[0] as usize;
     let mut id_buf = vec![0u8; len];
-    read_exact(&mut rd, &mut id_buf).await?;
+    rd.read_exact(&mut id_buf).await?;
     let mut tail = [0u8; 2];
-    let _ = tokio::time::timeout(Duration::from_secs(2), read_exact(&mut rd, &mut tail)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), rd.read_exact(&mut tail)).await;
     let client_id = String::from_utf8_lossy(&id_buf).to_string();
-    debug!(client_id, "client id read");
+    debug!(client_id = %client_id, "client id read");
 
     if tail[1] >= 2 {
-        wr.write(&[0x06]).await.context("write ack")?;
+        wr.write_all(&[0x06]).await.context("write ack")?;
+        wr.flush().await?;
     }
+
+    if !authorizer.is_authorized(&client_id).await {
+        warn!(client_id = %client_id, "unauthorized");
+        anyhow::bail!("unauthorized");
+    }
+    info!(%client_id, "client authorized");
 
     let backend = tokio::net::TcpStream::connect(connect)
         .await
@@ -85,7 +93,6 @@ async fn handle_session(
             match rd.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    use tokio::io::AsyncWriteExt;
                     if bw.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
@@ -95,13 +102,12 @@ async fn handle_session(
         }
     };
     let down = async {
-        use tokio::io::AsyncReadExt;
         loop {
             let mut buf = vec![0u8; 16 * 1024];
             match br.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    if wr.write(&buf[..n]).await.is_err() {
+                    if wr.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
@@ -112,24 +118,6 @@ async fn handle_session(
     tokio::select! {
         _ = up => {}
         _ = down => {}
-    }
-    Ok(())
-}
-
-async fn read_exact<S>(rd: &mut tots_core::dtls::session::ReadHalf<S>, buf: &mut [u8]) -> Result<()>
-where
-    S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin + Send,
-{
-    let mut total = 0;
-    while total < buf.len() {
-        let n = rd
-            .read(&mut buf[total..])
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        if n == 0 {
-            anyhow::bail!("eof");
-        }
-        total += n;
     }
     Ok(())
 }
