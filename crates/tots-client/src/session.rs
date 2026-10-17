@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
@@ -64,20 +65,12 @@ pub async fn run_vk(
         .context("parse TURN server addr")?;
     info!(%turn_server, "using TURN server from provider");
 
-    let io = Transport::turn(
-        turn_server,
-        creds.username.clone(),
-        creds.password.clone(),
-    )
-    .await
-    .context("TURN allocate")?;
+    let io = Transport::turn(turn_server, creds.username.clone(), creds.password.clone())
+        .await
+        .context("TURN allocate")?;
 
     let stream: BoxStream = match io {
         Transport::Turn(mut alloc) => {
-            // Два обязательных шага перед отправкой данных через TURN:
-            // 1. CreatePermission — разрешает трафик к пиру (нашему серверу).
-            // 2. ChannelBind — привязывает канал 0x4000 к пиру, после чего
-            //    данные можно слать короткими ChannelData-пакетами.
             info!(%peer, "TURN: creating permission");
             alloc
                 .create_permission(peer)
@@ -131,9 +124,22 @@ async fn run_single_session(
         Mode::Tcp => ClientMode::Tcp,
     };
 
-    send_client_id(&mut wr, &mut rd, &client_id, wire_mode)
-        .await
-        .context("send client ID")?;
+    // Client ID с retransmit.
+    let rec = build_client_id_record(&client_id, wire_mode);
+    let mut ack = [0u8; 1];
+    for wait in [1u64, 2, 4] {
+        wr.write_all(&rec).await?;
+        wr.flush().await?;
+        match tokio::time::timeout(Duration::from_secs(wait), rd.read_exact(&mut ack)).await {
+            Ok(Ok(())) if ack[0] == 0x06 => {
+                info!("client ID acknowledged");
+                break;
+            }
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(anyhow::anyhow!("{}", e)),
+            Err(_) => {}
+        }
+    }
 
     let sock = UdpSocket::bind(listen).await?;
     info!(%listen, "UDP relay listening");
@@ -148,7 +154,7 @@ async fn run_single_session(
                 match r {
                     Ok((n, peer)) => {
                         last_peer = Some(peer);
-                        if let Err(e) = wr.write(&from_client[..n]).await {
+                        if let Err(e) = wr.write_all(&from_client[..n]).await {
                             warn!("dtls write: {e}");
                             break;
                         }
@@ -175,33 +181,6 @@ async fn run_single_session(
     Ok(())
 }
 
-async fn send_client_id<R, W>(
-    wr: &mut W,
-    rd: &mut R,
-    client_id: &str,
-    mode: ClientMode,
-) -> Result<()>
-where
-    R: ReadHalf,
-    W: WriteHalf,
-{
-    let rec = build_client_id_record(client_id, mode);
-    let mut ack = [0u8; 1];
-    for wait in [1u64, 2, 4] {
-        wr.write(&rec).await?;
-        match tokio::time::timeout(Duration::from_secs(wait), rd.read_exact(&mut ack)).await {
-            Ok(Ok(())) if ack[0] == 0x06 => {
-                info!("client ID acknowledged");
-                return Ok(());
-            }
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(anyhow::anyhow!("{}", e)),
-            Err(_) => {}
-        }
-    }
-    anyhow::bail!("server did not acknowledge client ID")
-}
-
 fn build_client_id_record(client_id: &str, mode: ClientMode) -> Vec<u8> {
     let bytes = client_id.as_bytes();
     let len = bytes.len().min(255);
@@ -211,62 +190,4 @@ fn build_client_id_record(client_id: &str, mode: ClientMode) -> Vec<u8> {
     buf.push(mode as u8);
     buf.push(2);
     buf
-}
-
-pub trait WriteHalf {
-    fn write<'a>(
-        &'a mut self,
-        buf: &'a [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
-}
-
-pub trait ReadHalf {
-    fn read_exact<'a>(
-        &'a mut self,
-        buf: &'a mut [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
-}
-
-impl<S> WriteHalf for tots_core::dtls::session::WriteHalf<S>
-where
-    S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin + Send,
-{
-    fn write<'a>(
-        &'a mut self,
-        buf: &'a [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            self.write(buf)
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        })
-    }
-}
-
-impl<S> ReadHalf for tots_core::dtls::session::ReadHalf<S>
-where
-    S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin + Send,
-{
-    fn read_exact<'a>(
-        &'a mut self,
-        buf: &'a mut [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut total = 0;
-            while total < buf.len() {
-                let n = self
-                    .read(&mut buf[total..])
-                    .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                if n == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "eof",
-                    ));
-                }
-                total += n;
-            }
-            Ok(())
-        })
-    }
 }
