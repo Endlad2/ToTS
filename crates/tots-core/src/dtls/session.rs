@@ -1,10 +1,6 @@
 //! Упрощённая DTLS-сессия: X25519-ECDH + ChaCha20-Poly1305.
 //!
-//! `ReadHalf` и `WriteHalf` реализуют `tokio::io::AsyncRead` / `AsyncWrite`,
-//! поэтому их можно использовать с `AsyncReadExt`/`AsyncWriteExt` и
-//! `tokio::io::split`-подобными идиомами.
-//!
-//! Внутри используется `Arc<Mutex<S>>` — оба half'а делят один и тот же I/O.
+//! `ReadHalf` и `WriteHalf` реализуют `tokio::io::AsyncRead` / `AsyncWrite`.
 
 use std::io;
 use std::pin::Pin;
@@ -147,7 +143,6 @@ impl<S> ReadHalf<S>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
 {
-    /// Читает одну расшифрованную запись в `buf`, возвращает её длину.
     pub async fn read_record(&mut self, buf: &mut [u8]) -> Result<usize, DtlsError> {
         let _g = self.read_lock.lock().await;
         let mut inner = self.inner.lock().await;
@@ -181,7 +176,6 @@ where
                 buf[..n].copy_from_slice(&plain[..n]);
                 return Ok(n);
             }
-            // Другие типы записей в этой версии игнорируем.
         }
     }
 }
@@ -190,7 +184,6 @@ impl<S> WriteHalf<S>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
 {
-    /// Шифрует `payload` и отправляет одной DTLS-записью.
     pub async fn write_record(&mut self, payload: &[u8]) -> Result<(), DtlsError> {
         let _g = self.write_lock.lock().await;
         let seq = {
@@ -217,11 +210,6 @@ where
     }
 }
 
-// ─── AsyncRead для ReadHalf ──────────────────────────────────────────────
-//
-// Работает как `poll_read`: если данные из последней записи ещё не выданы —
-// докидываем остаток; иначе запускаем `read_record`.
-
 impl<S> AsyncRead for ReadHalf<S>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
@@ -232,13 +220,14 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        // Получаем future `read_record` через `Box::pin` (асинхронный метод
-        // на `&mut self`), но её нельзя поллить без владения `&mut self`.
-        // Проще: раз — сразу фьючим в локальный буфер.
         let mut tmp = vec![0u8; buf.remaining()];
-        let fut = this.read_record(&mut tmp);
-        let mut fut = Box::pin(fut);
-        match fut.as_mut().poll(cx) {
+        // Ограничиваем область жизни future: как только poll вернул Ready,
+        // future уничтожается, и tmp освобождается.
+        let poll_result = {
+            let mut fut = Box::pin(this.read_record(&mut tmp));
+            fut.as_mut().poll(cx)
+        };
+        match poll_result {
             Poll::Ready(Ok(n)) => {
                 buf.put_slice(&tmp[..n]);
                 Poll::Ready(Ok(()))
@@ -260,9 +249,11 @@ where
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let len = buf.len();
-        let fut = this.write_record(buf);
-        let mut fut = Box::pin(fut);
-        match fut.as_mut().poll(cx) {
+        let poll_result = {
+            let mut fut = Box::pin(this.write_record(buf));
+            fut.as_mut().poll(cx)
+        };
+        match poll_result {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(len)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
             Poll::Pending => Poll::Pending,
@@ -277,8 +268,6 @@ where
         Poll::Ready(Ok(()))
     }
 }
-
-// ─── helpers ─────────────────────────────────────────────────────────────
 
 fn sha256_32(input: &[u8]) -> [u8; 32] {
     let out = Sha256::digest(input);
@@ -333,5 +322,4 @@ async fn read_handshake<S: AsyncReadExt + Unpin>(s: &mut S) -> io::Result<Vec<u8
     Ok(payload)
 }
 
-// Импорт Future только для `.poll()` на `Pin<Box<dyn ...>>`.
 use std::future::Future as _;
