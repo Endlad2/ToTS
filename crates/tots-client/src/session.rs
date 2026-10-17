@@ -131,11 +131,11 @@ async fn run_single_session(
         wr.write_all(&rec).await?;
         wr.flush().await?;
         match tokio::time::timeout(Duration::from_secs(wait), rd.read_exact(&mut ack)).await {
-            Ok(Ok(())) if ack[0] == 0x06 => {
+            Ok(Ok(_)) if ack[0] == 0x06 => {
                 info!("client ID acknowledged");
                 break;
             }
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(anyhow::anyhow!("{}", e)),
             Err(_) => {}
         }
