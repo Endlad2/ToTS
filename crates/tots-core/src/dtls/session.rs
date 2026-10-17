@@ -23,8 +23,6 @@ pub struct DtlsSession<S> {
     inner: Arc<tokio::sync::Mutex<S>>,
     cipher: Arc<ChaCha20Poly1305>,
     send_seq: Arc<Mutex<u64>>,
-    #[allow(dead_code)]
-    recv_seq: Arc<Mutex<u64>>,
     read_lock: Arc<tokio::sync::Mutex<()>>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -99,7 +97,6 @@ where
             inner: Arc::new(tokio::sync::Mutex::new(inner)),
             cipher: Arc::new(ChaCha20Poly1305::new(Key::from_slice(&key))),
             send_seq: Arc::new(Mutex::new(0)),
-            recv_seq: Arc::new(Mutex::new(0)),
             read_lock: Arc::new(tokio::sync::Mutex::new(())),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }

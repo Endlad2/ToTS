@@ -14,7 +14,7 @@ use tots_providers::vk::VkProvider;
 use tots_providers::TurnProvider;
 
 use crate::cli::{Mode, Transport as TransportFlag};
-use crate::transport::{IoStream, TcpIo, TokioIoAdapter, TurnIo, Transport};
+use crate::transport::{IoStream, TcpIo, TokioIoAdapter, Transport, TurnIo};
 
 pub type BoxStream = Box<dyn IoStream + Send + Unpin>;
 
@@ -36,7 +36,10 @@ pub async fn run_direct(
         Transport::Direct(s) => Box::new(TcpIo(s)),
         Transport::Turn(a) => Box::new(TurnIo::new(a, peer)),
     };
-    run_single_session(stream, listen, profile, obf_key, obf_timing, client_id, mode).await
+    run_single_session(
+        stream, listen, profile, obf_key, obf_timing, client_id, mode,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -61,13 +64,9 @@ pub async fn run_vk(
         .context("parse TURN server addr")?;
     info!(%turn_server, "using TURN server from provider");
 
-    let io = Transport::turn(
-        turn_server,
-        creds.username.clone(),
-        creds.password.clone(),
-    )
-    .await
-    .context("TURN allocate")?;
+    let io = Transport::turn(turn_server, creds.username.clone(), creds.password.clone())
+        .await
+        .context("TURN allocate")?;
 
     let stream: BoxStream = match io {
         Transport::Direct(s) => Box::new(TcpIo(s)),
@@ -75,7 +74,10 @@ pub async fn run_vk(
     };
 
     let _ = streams;
-    run_single_session(stream, listen, profile, obf_key, obf_timing, client_id, mode).await
+    run_single_session(
+        stream, listen, profile, obf_key, obf_timing, client_id, mode,
+    )
+    .await
 }
 
 async fn run_single_session(
@@ -92,9 +94,12 @@ async fn run_single_session(
     let adapter = TokioIoAdapter::new(stream);
 
     info!("starting DTLS handshake");
-    let dtls = DtlsConnector::connect(adapter, DtlsConfig {
-        handshake_timeout: Duration::from_secs(20),
-    })
+    let dtls = DtlsConnector::connect(
+        adapter,
+        DtlsConfig {
+            handshake_timeout: Duration::from_secs(20),
+        },
+    )
     .await
     .context("DTLS handshake")?;
     info!("DTLS handshake complete");
@@ -106,7 +111,6 @@ async fn run_single_session(
         Mode::Tcp => ClientMode::Tcp,
     };
 
-    // Client ID с retransmit.
     send_client_id(&mut wr, &mut rd, &client_id, wire_mode)
         .await
         .context("send client ID")?;
@@ -151,7 +155,6 @@ async fn run_single_session(
     Ok(())
 }
 
-/// Отправляет Client ID с retransmit-подтверждением.
 async fn send_client_id<R, W>(
     wr: &mut W,
     rd: &mut R,
@@ -190,23 +193,18 @@ fn build_client_id_record(client_id: &str, mode: ClientMode) -> Vec<u8> {
     buf
 }
 
-/// Интерфейсы, чтобы отвязать `send_client_id` от конкретного типа half.
 pub trait WriteHalf {
     fn write<'a>(
         &'a mut self,
         buf: &'a [u8],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
 }
 
 pub trait ReadHalf {
     fn read_exact<'a>(
         &'a mut self,
         buf: &'a mut [u8],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>>;
 }
 
 impl<S> WriteHalf for tots_core::dtls::session::WriteHalf<S>
@@ -216,9 +214,7 @@ where
     fn write<'a>(
         &'a mut self,
         buf: &'a [u8],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
         Box::pin(async move {
             self.write(buf)
                 .await
@@ -234,9 +230,7 @@ where
     fn read_exact<'a>(
         &'a mut self,
         buf: &'a mut [u8],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let mut total = 0;
             while total < buf.len() {

@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use tots_core::obf::Profile;
@@ -25,7 +24,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     let obf_key = decode_obf_key(profile, cli.obf_key.as_deref())?;
 
     if matches!(profile, Profile::None) {
-        warn!("running with --obf-profile=none: any client reaching {} can relay", cli.listen);
+        warn!(
+            "running with --obf-profile=none: any client reaching {} can relay",
+            cli.listen
+        );
     }
 
     let authorizer = match cli.clients_file.as_deref() {
@@ -44,12 +46,26 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     match cli.mode {
         Mode::Udp => {
-            udp::serve(cli.listen, cli.connect, profile, obf_key, cli.obf_timing, authorizer)
-                .await
+            udp::serve(
+                cli.listen,
+                cli.connect,
+                profile,
+                obf_key,
+                cli.obf_timing,
+                authorizer,
+            )
+            .await
         }
         Mode::Tcp => {
-            tcp::serve(cli.listen, cli.connect, profile, obf_key, cli.obf_timing, authorizer)
-                .await
+            tcp::serve(
+                cli.listen,
+                cli.connect,
+                profile,
+                obf_key,
+                cli.obf_timing,
+                authorizer,
+            )
+            .await
         }
     }
 }
@@ -74,6 +90,3 @@ fn decode_obf_key(profile: Profile, raw: Option<&str>) -> Result<Option<Vec<u8>>
     }
     Ok(Some(bytes))
 }
-
-#[allow(dead_code)]
-fn _assert_tcp_listener_unused(_: TcpListener) {}

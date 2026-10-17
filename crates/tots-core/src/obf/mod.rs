@@ -17,7 +17,9 @@ pub enum Profile {
 }
 
 impl Profile {
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Разбирает имя профиля (без конфликта с `std::str::FromStr`).
+    #[allow(clippy::should_implement_trait)]
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "none" => Some(Self::None),
             "rtpopus" => Some(Self::Rtpopus),
@@ -38,11 +40,14 @@ impl Profile {
 }
 
 /// Кодек обфускации — обёртка с внутренним Mutex.
+///
+/// `Rtpopus3` заметно крупнее остальных вариантов, поэтому боксован,
+/// чтобы размер `Codec` не тянул всю enum на 480 байт.
 pub enum Codec {
     Plain,
     Rtpopus(Mutex<rtpopus::Conn>),
     Rtpopus2(Mutex<rtpopus2::Conn>),
-    Rtpopus3(Mutex<rtpopus3::Conn>),
+    Rtpopus3(Box<Mutex<rtpopus3::Conn>>),
 }
 
 impl Codec {
@@ -50,16 +55,24 @@ impl Codec {
         match profile {
             Profile::None => Ok(Codec::Plain),
             Profile::Rtpopus => {
-                let k = key.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "obf key required"))?;
+                let k = key.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "obf key required")
+                })?;
                 Ok(Codec::Rtpopus(Mutex::new(rtpopus::Conn::new(k, false)?)))
             }
             Profile::Rtpopus2 => {
-                let k = key.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "obf key required"))?;
+                let k = key.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "obf key required")
+                })?;
                 Ok(Codec::Rtpopus2(Mutex::new(rtpopus2::Conn::new(k, false)?)))
             }
             Profile::Rtpopus3 => {
-                let k = key.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "obf key required"))?;
-                Ok(Codec::Rtpopus3(Mutex::new(rtpopus3::Conn::new(k, false)?)))
+                let k = key.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "obf key required")
+                })?;
+                Ok(Codec::Rtpopus3(Box::new(Mutex::new(rtpopus3::Conn::new(
+                    k, false,
+                )?))))
             }
         }
     }
@@ -68,16 +81,24 @@ impl Codec {
         match profile {
             Profile::None => Ok(Codec::Plain),
             Profile::Rtpopus => {
-                let k = key.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "obf key required"))?;
+                let k = key.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "obf key required")
+                })?;
                 Ok(Codec::Rtpopus(Mutex::new(rtpopus::Conn::new(k, true)?)))
             }
             Profile::Rtpopus2 => {
-                let k = key.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "obf key required"))?;
+                let k = key.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "obf key required")
+                })?;
                 Ok(Codec::Rtpopus2(Mutex::new(rtpopus2::Conn::new(k, true)?)))
             }
             Profile::Rtpopus3 => {
-                let k = key.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "obf key required"))?;
-                Ok(Codec::Rtpopus3(Mutex::new(rtpopus3::Conn::new(k, true)?)))
+                let k = key.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "obf key required")
+                })?;
+                Ok(Codec::Rtpopus3(Box::new(Mutex::new(rtpopus3::Conn::new(
+                    k, true,
+                )?))))
             }
         }
     }

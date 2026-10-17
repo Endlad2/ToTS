@@ -50,10 +50,18 @@ pub struct Cli {
 
 fn humantime_parse(s: &str) -> Result<Duration, String> {
     if let Some(v) = s.strip_suffix("ms") {
-        return v.parse::<u64>().map(Duration::from_millis).map_err(|e| e.to_string());
+        return v
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .map_err(|e| e.to_string());
     }
     if let Some(v) = s.strip_suffix('s') {
-        return v.parse::<u64>().map(Duration::from_secs).map_err(|e| e.to_string());
+        return v
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|e| e.to_string());
     }
-    s.parse::<u64>().map(Duration::from_secs).map_err(|e| e.to_string())
+    s.parse::<u64>()
+        .map(Duration::from_secs)
+        .map_err(|e| e.to_string())
 }

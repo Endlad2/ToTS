@@ -48,15 +48,17 @@ async fn handle_session(
     connect: SocketAddr,
     _authorizer: Arc<Authorizer>,
 ) -> Result<()> {
-    let dtls = DtlsAcceptor::accept(stream, DtlsConfig {
-        handshake_timeout: Duration::from_secs(30),
-    })
+    let dtls = DtlsAcceptor::accept(
+        stream,
+        DtlsConfig {
+            handshake_timeout: Duration::from_secs(30),
+        },
+    )
     .await
     .context("DTLS accept")?;
 
     let (mut rd, mut wr) = dtls.into_split();
 
-    // Читаем Client ID вручную (half-сессия не реализует AsyncRead).
     let mut len_buf = [0u8; 1];
     read_exact(&mut rd, &mut len_buf).await?;
     let len = len_buf[0] as usize;
@@ -67,19 +69,16 @@ async fn handle_session(
     let client_id = String::from_utf8_lossy(&id_buf).to_string();
     debug!(client_id, "client id read");
 
-    // ACK.
     if tail[1] >= 2 {
         wr.write(&[0x06]).await.context("write ack")?;
     }
 
-    // Backend.
     let backend = tokio::net::TcpStream::connect(connect)
         .await
         .with_context(|| format!("connect backend {connect}"))?;
     backend.set_nodelay(true).ok();
     let (mut br, mut bw) = backend.into_split();
 
-    // Двунаправленный копир через half-сессии.
     let up = async {
         loop {
             let mut buf = vec![0u8; 16 * 1024];

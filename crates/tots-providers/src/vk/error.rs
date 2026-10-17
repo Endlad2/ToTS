@@ -10,8 +10,11 @@ use super::consts;
 pub struct VkApiError {
     pub code: i64,
     pub message: String,
+    #[allow(dead_code)]
     pub captcha_sid: Option<String>,
+    #[allow(dead_code)]
     pub captcha_ts: Option<String>,
+    #[allow(dead_code)]
     pub captcha_attempt: Option<String>,
     pub redirect_uri: Option<String>,
     pub session_token: Option<String>,
