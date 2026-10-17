@@ -1,4 +1,9 @@
 //! Проверка Client ID по файлу clients.json.
+//!
+//! В текущей версии метод `is_authorized` ещё не подключён в основном
+//! транспортном пути (udp/tcp); файл `clients.json` загружается, но
+//! используется только когда подключим DTLS-сервер полноценно.
+//! Помечено `#[allow(dead_code)]`, чтобы CI не спотыкался.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,10 +20,12 @@ struct ClientsFile {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ClientInfo {
     #[serde(default)]
+    #[allow(dead_code)]
     comment: String,
 }
 
 pub struct Authorizer {
+    #[allow(dead_code)]
     inner: RwLock<HashMap<String, ClientInfo>>,
 }
 
@@ -39,6 +46,7 @@ impl Authorizer {
         })
     }
 
+    #[allow(dead_code)]
     pub async fn is_authorized(&self, client_id: &str) -> bool {
         self.inner.read().await.contains_key(client_id)
     }

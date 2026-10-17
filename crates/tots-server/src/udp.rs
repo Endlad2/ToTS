@@ -34,7 +34,6 @@ pub async fn serve(
             }
         };
         debug!(%peer, bytes = n, "datagram");
-        let connect = connect;
         let sock = sock.clone();
         let payload = buf[..n].to_vec();
         tokio::spawn(async move {
@@ -58,7 +57,6 @@ async fn handle(
         .with_context(|| format!("connect {connect}"))?;
     let backend = Arc::new(backend);
 
-    // Два отдельных буфера — иначе borrow-checker ругается на select!
     let mut from_client = vec![0u8; 65535];
     let mut from_backend = vec![0u8; 65535];
 
