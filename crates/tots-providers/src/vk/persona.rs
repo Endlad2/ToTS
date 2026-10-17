@@ -1,12 +1,6 @@
 //! Браузерная персона: UA, sec-ch-ua, TLS-отпечаток.
-//!
-//! VK сверяет User-Agent, sec-ch-ua-mobile, sec-ch-ua-platform и JA3.
-//! Персона фиксирована на Chrome 146 для согласованности.
 
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, USER_AGENT};
-
-/// Клиентские подсказки Chrome 146.
-pub const CHROME_MAJOR: u32 = 146;
 
 /// Chrome 146 sec-ch-ua строка.
 pub const SEC_CH_UA: &str =
@@ -39,6 +33,9 @@ pub fn base_headers() -> HeaderMap {
         "sec-ch-ua-platform",
         HeaderValue::from_static(SEC_CH_UA_PLATFORM),
     );
-    h.insert(ACCEPT_LANGUAGE, HeaderValue::from_static(ACCEPT_LANGUAGE_VALUE));
+    h.insert(
+        ACCEPT_LANGUAGE,
+        HeaderValue::from_static(ACCEPT_LANGUAGE_VALUE),
+    );
     h
 }

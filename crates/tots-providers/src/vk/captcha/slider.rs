@@ -44,10 +44,8 @@ pub async fn solve(
     }
     debug!(source = %content.source, len = content.value.len(), "captcha: slider getContent");
 
-    // 1. getContent.
     let raw = get_content(ctx, &content).await?;
 
-    // 2. Парсим puzzle.
     let puzzle = parse_puzzle(&raw)?;
     debug!(
         grid = puzzle.grid,
@@ -56,7 +54,6 @@ pub async fn solve(
         "captcha: slider puzzle decoded"
     );
 
-    // 3. Ранжируем.
     let guesses = rank_guesses(&puzzle)?;
     let limit = (puzzle.attempts as usize).min(guesses.len());
     if limit == 0 {
@@ -65,11 +62,9 @@ pub async fn solve(
     let attempts = pick_attempts(&guesses, limit);
     debug!(total = guesses.len(), limit, "captcha: slider ranked");
 
-    // 4. componentDone.
     let browser_fp = generate_browser_fp();
     api::component_done(ctx, &browser_fp).await?;
 
-    // 5. Перебираем попытки.
     for (i, guess) in attempts.iter().enumerate() {
         debug!(
             attempt = i + 1,
@@ -164,10 +159,10 @@ fn parse_puzzle(raw: &Value) -> Result<Puzzle, CaptchaError> {
     }
     let mut tail = nums.split_off(1);
     let mut attempts: u32 = 4;
-    if tail.len() % 2 != 0 {
+    if !tail.len().is_multiple_of(2) {
         attempts = tail.pop().unwrap_or(4) as u32;
     }
-    if tail.is_empty() || tail.len() % 2 != 0 {
+    if tail.is_empty() || !tail.len().is_multiple_of(2) {
         return Err(CaptchaError::Api("bad swap payload".into()));
     }
 
@@ -262,7 +257,7 @@ fn identity(grid: usize) -> Vec<usize> {
 
 fn apply_swaps(grid: usize, swaps: &[usize]) -> Option<Vec<usize>> {
     let total = grid * grid;
-    if total == 0 || swaps.len() % 2 != 0 {
+    if total == 0 || !swaps.len().is_multiple_of(2) {
         return None;
     }
     let mut map: Vec<usize> = (0..total).collect();
@@ -355,16 +350,16 @@ fn sample_luma(
 ) -> u8 {
     let dx = dst.2 - dst.0;
     let dy = dst.3 - dst.1;
-    let sx = if dx > 0 {
-        src.0 + (x.saturating_sub(dst.0)) * (src.2 - src.0) / dx
-    } else {
-        src.0
-    };
-    let sy = if dy > 0 {
-        src.1 + (y.saturating_sub(dst.1)) * (src.3 - src.1) / dy
-    } else {
-        src.1
-    };
+    let sx = (x.saturating_sub(dst.0))
+        .checked_mul(src.2 - src.0)
+        .and_then(|v| v.checked_div(dx))
+        .map(|v| src.0 + v)
+        .unwrap_or(src.0);
+    let sy = (y.saturating_sub(dst.1))
+        .checked_mul(src.3 - src.1)
+        .and_then(|v| v.checked_div(dy))
+        .map(|v| src.1 + v)
+        .unwrap_or(src.1);
     let p = img.get_pixel(sx, sy);
     ((299 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000).min(255) as u8
 }
@@ -378,16 +373,16 @@ fn sample_rgb(
 ) -> [u8; 3] {
     let dx = dst.2 - dst.0;
     let dy = dst.3 - dst.1;
-    let sx = if dx > 0 {
-        src.0 + (x.saturating_sub(dst.0)) * (src.2 - src.0) / dx
-    } else {
-        src.0
-    };
-    let sy = if dy > 0 {
-        src.1 + (y.saturating_sub(dst.1)) * (src.3 - src.1) / dy
-    } else {
-        src.1
-    };
+    let sx = (x.saturating_sub(dst.0))
+        .checked_mul(src.2 - src.0)
+        .and_then(|v| v.checked_div(dx))
+        .map(|v| src.0 + v)
+        .unwrap_or(src.0);
+    let sy = (y.saturating_sub(dst.1))
+        .checked_mul(src.3 - src.1)
+        .and_then(|v| v.checked_div(dy))
+        .map(|v| src.1 + v)
+        .unwrap_or(src.1);
     let p = img.get_pixel(sx, sy);
     [p[0], p[1], p[2]]
 }

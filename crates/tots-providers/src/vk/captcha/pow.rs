@@ -18,7 +18,7 @@ struct Telemetry {
     nav_tamper: NavTamper,
     referrer: Referrer,
     devtools: DevTools,
-    css: CSS,
+    css: Css,
     native_integrity: NativeIntegrity,
     cookie_test: CookieTest,
     ancestor_origins: AncestorOrigins,
@@ -131,7 +131,7 @@ struct DevTools {
 }
 
 #[derive(Serialize)]
-struct CSS {
+struct Css {
     #[serde(rename = "expectedMissing")]
     expected_missing: u32,
 }
@@ -210,16 +210,13 @@ pub async fn solve_and_wrap(
 ) -> Result<String, CaptchaError> {
     let _ = debug_info;
 
-    // 1. Решаем PoW.
     let (hash, nonce) = solve_pow(&pow.input, pow.difficulty)
         .ok_or_else(|| CaptchaError::PowParse("pow failed".into()))?;
 
-    // 2. Собираем телеметрию.
     let telemetry = build_telemetry(page_origin, domain);
     let telemetry_json =
         serde_json::to_vec(&telemetry).map_err(|e| CaptchaError::PowParse(e.to_string()))?;
 
-    // 3. Хешируем канонизированную телеметрию.
     let tel_hash = {
         let canonical =
             canonical_json(&telemetry_json).map_err(|e| CaptchaError::PowParse(e.to_string()))?;
@@ -227,7 +224,6 @@ pub async fn solve_and_wrap(
         hex::encode(sum)
     };
 
-    // 4. Формируем конверт.
     let envelope = format!(
         r#"{{"hash":"{}","nonce":{},"duration_ms":{},"telemetry":{},"tel_hash":"{}"}}"#,
         hash,
@@ -237,7 +233,6 @@ pub async fn solve_and_wrap(
         tel_hash
     );
 
-    // 5. Base64.
     let encoded = base64::engine::general_purpose::STANDARD.encode(envelope.as_bytes());
     Ok(format!("{}{}", pow.prefix, encoded))
 }
@@ -371,7 +366,7 @@ fn build_telemetry(page_origin: &str, domain: &str) -> Telemetry {
             open: false,
             delay_ms: 0,
         },
-        css: CSS {
+        css: Css {
             expected_missing: 0,
         },
         native_integrity: NativeIntegrity {

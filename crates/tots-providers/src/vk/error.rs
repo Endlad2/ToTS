@@ -10,9 +10,6 @@ use super::consts;
 pub struct VkApiError {
     pub code: i64,
     pub message: String,
-    pub captcha_sid: Option<String>,
-    pub captcha_ts: Option<String>,
-    pub captcha_attempt: Option<String>,
     pub redirect_uri: Option<String>,
     pub session_token: Option<String>,
 }
@@ -44,9 +41,6 @@ impl VkApiError {
         Some(Self {
             code,
             message,
-            captcha_sid: str_or_num("captcha_sid"),
-            captcha_ts: str_or_num("captcha_ts"),
-            captcha_attempt: str_or_num("captcha_attempt"),
             redirect_uri,
             session_token,
         })

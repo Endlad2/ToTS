@@ -27,7 +27,6 @@ pub struct SolveContext {
     pub cookie_jar: Arc<Jar>,
     pub session_token: String,
     pub redirect_uri: String,
-    pub attempt: u32,
 }
 
 /// Пробует решить капчу. Возвращает success_token или ошибку.
