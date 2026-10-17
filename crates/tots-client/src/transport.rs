@@ -1,6 +1,5 @@
 //! Транспорт до сервера: TURN-релей либо прямое подключение.
 
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -44,14 +43,16 @@ pub trait IoStream: Send + Unpin {
     fn read<'a>(
         &'a mut self,
         buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>>;
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<usize>> + Send + 'a>>;
 
     fn write<'a>(
         &'a mut self,
         buf: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>;
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>>;
 
-    fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn close<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 }
 
 /// Обёртка TcpStream как IoStream.
@@ -61,19 +62,21 @@ impl IoStream for TcpIo {
     fn read<'a>(
         &'a mut self,
         buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<usize>> + Send + 'a>> {
         Box::pin(self.0.read(buf))
     }
     fn write<'a>(
         &'a mut self,
         buf: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {
         Box::pin(async move {
             self.0.write_all(buf).await?;
             self.0.flush().await
         })
     }
-    fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    fn close<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             let _ = self.0.shutdown().await;
         })
@@ -96,7 +99,7 @@ impl IoStream for TurnIo {
     fn read<'a>(
         &'a mut self,
         buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'a>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<usize>> + Send + 'a>> {
         Box::pin(async move {
             let (_peer, payload) = self
                 .alloc
@@ -111,7 +114,7 @@ impl IoStream for TurnIo {
     fn write<'a>(
         &'a mut self,
         buf: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {
         Box::pin(async move {
             self.alloc
                 .send_channel_data(self.peer, buf)
@@ -120,16 +123,14 @@ impl IoStream for TurnIo {
             Ok(())
         })
     }
-    fn close<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    fn close<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {})
     }
 }
 
 /// Оборачивает `Box<dyn IoStream>` в tokio-совместимый `AsyncRead + AsyncWrite`.
-///
-/// Реализация простая: `poll_read`/`poll_write` создают future от IoStream и
-/// сразу его поллят. Это допустимо, потому что underlying IoStream — уже
-/// асинхронный примитив (TcpStream/TURN), а не блокирующий.
 pub struct TokioIoAdapter {
     inner: Box<dyn IoStream + Send + Unpin>,
 }
@@ -150,16 +151,11 @@ impl AsyncRead for TokioIoAdapter {
         if remaining == 0 {
             return Poll::Ready(Ok(()));
         }
-        // Берём свободный срез у buf через unsafe, чтобы не аллоцировать.
-        let dst = unsafe {
-            let ptr = buf.unfilled_mut().as_mut_ptr() as *mut u8;
-            std::slice::from_raw_parts_mut(ptr, remaining)
-        };
-        let mut fut = self.inner.read(dst);
-        match fut.as_mut().poll(cx) {
+        let mut tmp = vec![0u8; remaining];
+        let mut fut = self.inner.read(&mut tmp);
+        match std::future::Future::poll(fut.as_mut(), cx) {
             Poll::Ready(Ok(n)) => {
-                unsafe { buf.assume_init(n) };
-                buf.advance(n);
+                buf.put_slice(&tmp[..n]);
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -176,29 +172,20 @@ impl AsyncWrite for TokioIoAdapter {
     ) -> Poll<io::Result<usize>> {
         let len = buf.len();
         let mut fut = self.inner.write(buf);
-        match fut.as_mut().poll(cx) {
+        match std::future::Future::poll(fut.as_mut(), cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(len)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
     }
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut fut = self.inner.close();
-        match fut.as_mut().poll(cx) {
+        match std::future::Future::poll(fut.as_mut(), cx) {
             Poll::Ready(()) => Poll::Ready(Ok(())),
             Poll::Pending => Poll::Pending,
         }
     }
 }
-
-// Для `poll_read` нужен `Future`-трейт в scope.
-use std::future::Future as _;
