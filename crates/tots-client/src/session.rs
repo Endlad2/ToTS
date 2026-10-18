@@ -69,6 +69,10 @@ pub async fn run_vk(
         .await
         .context("TURN allocate")?;
 
+    // --- Обязательные шаги перед DTLS-трафиком ---
+    // 1. CreatePermission разрешает TURN-серверу пересылать пакеты на наш peer.
+    // 2. ChannelBind привязывает короткий канал (0x4000) к peer, после чего
+    //    данные уходят ChannelData-пакетами. Без обоих TURN молча блокирует.
     let stream: BoxStream = match io {
         Transport::Turn(mut alloc) => {
             info!(%peer, "TURN: creating permission");
