@@ -1,63 +1,21 @@
 # Провайдеры
 
-## Принцип
+Флаг `-provider` выбирает, как клиент доходит до сервера: через TURN-реле сервиса звонков (`vk`, по умолчанию) или напрямую (`direct`).
 
-`tots-providers` — единственное место, где живёт логика получения
-TURN-креденшелов. Клиент и сервер зависят только от trait `TurnProvider`.
+## `vk` (по умолчанию)
 
-```
-use tots_providers::{TurnProvider, TurnCredentials, ProviderError};
+Трафик идёт через TURN-серверы VK Calls. Нужна активная ссылка на звонок:
 
-let provider = tots_providers::vk::VkProvider::new(cfg)?;
-let creds: TurnCredentials = provider.get_credentials(stream_id).await?;
-```
+- `-link` - ссылка вида `https://vk.ru/call/join/<code>`.
 
-## Реализованные
+Необязательные:
 
-### VK Calls (`vk`)
+- `-streams-per-cred` (по умолчанию 12) - сколько потоков делят одни учётные данные.
+- `-manual-captcha` - сразу открывать captcha в браузере.
+- `-platform` (`desktop` \| `mobile`, по умолчанию `desktop`) - каким устройством представляться при авторизации.
 
-Получает TURN-креды из ссылки на звонок VK.
+## `direct`
 
-```
-use tots_providers::vk::{VkConfig, VkProvider};
+Без реле: трафик идёт прямо на `-peer`, сервер тот же. Флаги звонков и TURN (`-links`, `-turn`, `-port`, `-transport`) игнорируются, `-n` по умолчанию 1.
 
-let cfg = VkConfig {
-    link: "https://vk.ru/call/join/ABC123".into(),
-    streams_per_cache: 12,
-    restrict_to_first_client: false,
-    request_timeout: Duration::from_secs(20),
-};
-let provider = VkProvider::new(cfg)?;
-```
-
-## Планируемые
-
-| Провайдер ↕▾ | Источник ↕▾ | Статус ↕▾ |
-|---|---|---|
-| −`direct` | прямо на `--peer`, без TURN | TODO |
-| −`static` | статический список в конфиге | TODO |
-| −`telemost` | Yandex Telemost | TODO |
-⚙
-
-## Написание своего провайдера
-
-```
-use async_trait::async_trait;
-use tots_providers::{ProviderError, TurnCredentials, TurnProvider};
-
-struct MyProvider { /* ... */ }
-
-#[async_trait]
-impl TurnProvider for MyProvider {
-    async fn get_credentials(&self, stream_id: u32)
-        -> Result<TurnCredentials, ProviderError>
-    {
-        // ...
-        # todo!()
-    }
-    fn name(&self) -> &'static str { "my" }
-}
-```
-
-Достаточно реализовать `get_credentials`; остальные методы имеют
-разумные дефолты.
+Не работает, если IP сервера недоступен (белые списки операторов) - там только `vk`. Подробнее - [modes.md](modes.md).
