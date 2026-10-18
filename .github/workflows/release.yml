@@ -1,171 +1,98 @@
-name: Release
+name: release
 
+# Тег собирается из UTC-времени запуска: ГГ.ММ.ДД.час.минута (например 26.10.18.2145).
+# Релиз публикуется всегда, ручным запуском или пушем в main.
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
-  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-  GO_VERSION: "1.26.9"
-  GORELEASER_VERSION: v2.17.1
-  GOMOBILE_VERSION: v0.0.0-20260821190718-4776eadac327
-  TASK_VERSION: 3.52.0
+  GO_VERSION: "1.26"
+  GORELEASER_VERSION: "v2.17.1"
 
 jobs:
-  build-ios:
-    name: Build iOS XCFramework
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v6.0.2
-
-      - uses: actions/setup-go@v6.4.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - uses: arduino/setup-task@v2.0.0
-        with:
-          version: ${{ env.TASK_VERSION }}
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install gomobile
-        run: |
-          go install golang.org/x/mobile/cmd/gomobile@${{ env.GOMOBILE_VERSION }}
-          gomobile init
-
-      - name: Build XCFramework
-        run: task build:ios
-
-      - name: Zip XCFramework
-        run: cd dist && zip -r Mobile.xcframework.zip Mobile.xcframework
-
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: ios-xcframework-zip
-          path: dist/Mobile.xcframework.zip
-          retention-days: 7
-
-  build-android:
-    name: Build Android AAR
+  release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.0.2
-
-      - uses: actions/setup-go@v6.4.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - uses: arduino/setup-task@v2.0.0
-        with:
-          version: ${{ env.TASK_VERSION }}
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Android NDK
-        run: |
-          NDK_DIR=$(ls -d $ANDROID_SDK_ROOT/ndk/*/ 2>/dev/null | sort -V | tail -n1)
-          echo "ANDROID_NDK_HOME=${NDK_DIR%/}" >> $GITHUB_ENV
-
-      - name: Install gomobile
-        run: |
-          go install golang.org/x/mobile/cmd/gomobile@${{ env.GOMOBILE_VERSION }}
-          gomobile init
-
-      - name: Build AAR
-        run: task build:android
-
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: android-aar
-          path: |
-            dist/tots.aar
-            dist/tots-sources.jar
-          retention-days: 7
-
-  goreleaser:
-    name: GoReleaser
-    runs-on: ubuntu-latest
-    needs: [build-ios, build-android]
-    steps:
-      - uses: actions/checkout@v6.0.2
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v6.4.0
+      - name: Compute tag (UTC ГГ.ММ.ДД.час.минута)
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="$(date -u +%y.%m.%d.%H%M)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Computed release tag: $TAG"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - uses: docker/setup-qemu-action@v4.0.0
+      - name: Create git tag and empty release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - uses: docker/setup-buildx-action@v4.1.0
+          # Тег из времени UTC: коллизия в пределах минуты теоретически возможна только при
+          # параллельных ручных запусках, их режет concurrency выше.
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists, refusing to overwrite" >&2
+            exit 1
+          fi
+          git tag -a "$TAG" -m "ToTS $TAG"
+          git push origin "$TAG"
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v4.2.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # goreleaser с mode: replace не умеет публиковать поверх существующего
+          # черновика, поэтому создаём пустой релиз здесь, а goreleaser зальёт в него ассеты.
+          gh release create "$TAG" \
+            --title "ToTS $TAG" \
+            --notes "Сборка ToTS от $(date -u '+%Y-%m-%d %H:%M UTC')" \
+            --draft
 
-      - name: Install syft (SBOM)
-        uses: anchore/sbom-action/download-syft@v0.24.0
-
-      - uses: actions/download-artifact@v7.0.0
-        with:
-          name: ios-xcframework-zip
-          path: mobile-dist/
-
-      - uses: actions/download-artifact@v7.0.0
-        with:
-          name: android-aar
-          path: mobile-dist/
-
-      - uses: goreleaser/goreleaser-action@v7.2.2
+      - name: Run goreleaser
+        uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: ${{ env.GORELEASER_VERSION }}
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Привязываем сборку к тегу, который только что создали, а не к предыдущему.
+          GORELEASER_CURRENT_TAG: ${{ steps.tag.outputs.tag }}
+          GORELEASER_FORCE_TOKEN: "github"
 
-  notify-telegram:
-    name: Telegram announce
-    runs-on: ubuntu-latest
-    needs: goreleaser
-    steps:
-      - name: Send release message
+      - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          BODY=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body -q .body | head -c 3000)
-          URL=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json url -q .url)
-          # GH-markdown -> Telegram-HTML: сначала экранируем HTML, потом размечаем.
-          # Хвосты "by @user in <PR-url>" и ссылки на коммит из авто-нотов убираем - в посте это шум.
-          HTML=$(printf '%s' "$BODY" \
-            | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' \
-            | sed -E \
-                -e 's| by @[[:alnum:]_-]+ in https://[^[:space:]]+||g' \
-                -e 's|[[:space:]]*\(\[[0-9a-f]{6,}\]\(https?://[^)]+/commit/[^)]+\)\)||g' \
-                -e 's|\[([^]]+)\]\((https?://[^)]+)\)|<a href="\2">\1</a>|g' \
-                -e 's|\*\*([^*]+)\*\*|<b>\1</b>|g' \
-                -e 's|`([^`]+)`|<code>\1</code>|g' \
-                -e 's|^#{1,6}[[:space:]]+(.*)$|<b>\1</b>|' \
-                -e 's|^[-*][[:space:]]+([0-9a-f]{7,40}:[[:space:]]+)?|• |' \
-                -e 's|\(@([[:alnum:]_-]+)\)|(<a href="https://github.com/\1">\1</a>)|g')
-          TEXT=$(printf '🐒💨 <b>ToTS (Go) %s</b>\n\n%s\n\n<a href="%s">Релиз на GitHub</a>' "$GITHUB_REF_NAME" "$HTML" "$URL")
-          send() {
-            curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${CHAT_ID}" \
-              --data-urlencode "text=$1" \
-              --data-urlencode "parse_mode=${2:-}" \
-              --data-urlencode "disable_web_page_preview=true" \
-              -o /dev/null
-          }
-          # Кривой HTML роняет весь sendMessage - фолбэк plain text, чтобы анонс не пропал
-          send "$TEXT" HTML || send "$(printf '🚀 ToTS %s\n\n%s\n\n%s' "$GITHUB_REF_NAME" "$BODY" "$URL")"
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false --latest
+
+      - name: Summary
+        run: |
+          {
+            echo "### ToTS release ${{ steps.tag.outputs.tag }}"
+            echo ""
+            echo "Ассеты:"
+            echo '```'
+            ls -la dist/ 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
