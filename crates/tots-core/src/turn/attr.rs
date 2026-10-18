@@ -203,6 +203,8 @@ fn decode_xor_addr(value: &[u8], txid: &[u8; 12]) -> Result<SocketAddr, super::T
             let ip = std::net::Ipv6Addr::from(ip_bytes);
             Ok(SocketAddr::from((ip, port)))
         }
-        _ => Err(super::TurnError::Parse(format!("unknown address family {family}"))),
+        _ => Err(super::TurnError::Parse(format!(
+            "unknown address family {family}"
+        ))),
     }
 }

@@ -70,7 +70,10 @@ pub struct Conn {
 impl Conn {
     pub fn new(key: &[u8], is_server: bool) -> io::Result<Self> {
         if key.len() != KEY_LEN {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "rtpopus3: bad key len"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rtpopus3: bad key len",
+            ));
         }
         let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
 
@@ -223,7 +226,10 @@ impl Conn {
 
     pub fn unwrap_into_mut(&mut self, wire: &[u8], dst: &mut [u8]) -> io::Result<usize> {
         if wire.len() < OVERHEAD {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "packet too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet too short",
+            ));
         }
         let payload_len = wire.len() - OVERHEAD;
         if dst.len() < payload_len {

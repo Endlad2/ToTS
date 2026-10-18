@@ -39,7 +39,10 @@ pub async fn fetch_html(ctx: &SolveContext) -> Result<String, CaptchaError> {
         .http
         .get(&ctx.redirect_uri)
         .headers(persona::base_headers())
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
         .header("Upgrade-Insecure-Requests", "1")
         .header("Sec-Fetch-Dest", "document")
         .header("Sec-Fetch-Mode", "navigate")
@@ -58,8 +61,13 @@ pub async fn fetch_html(ctx: &SolveContext) -> Result<String, CaptchaError> {
 }
 
 /// `captchaNotRobot.initSession` — получает show_type и content settings.
-pub async fn init_session(ctx: &SolveContext) -> Result<(String, super::slider::ContentRef), CaptchaError> {
-    let url = format!("https://{}/method/captchaNotRobot.initSession?v={}", API_HOST, API_VERSION);
+pub async fn init_session(
+    ctx: &SolveContext,
+) -> Result<(String, super::slider::ContentRef), CaptchaError> {
+    let url = format!(
+        "https://{}/method/captchaNotRobot.initSession?v={}",
+        API_HOST, API_VERSION
+    );
     let body = encode_form(&[
         ("session_token", ctx.session_token.clone()),
         ("domain", "vk.ru".to_string()),
@@ -122,7 +130,10 @@ pub fn parse_content_ref(raw: Option<&Value>) -> super::slider::ContentRef {
 
 /// `captchaNotRobot.settings`.
 pub async fn settings(ctx: &SolveContext) -> Result<Value, CaptchaError> {
-    let url = format!("https://{}/method/captchaNotRobot.settings?v={}", API_HOST, API_VERSION);
+    let url = format!(
+        "https://{}/method/captchaNotRobot.settings?v={}",
+        API_HOST, API_VERSION
+    );
     let body = encode_form(&[
         ("session_token", ctx.session_token.clone()),
         ("domain", "vk.ru".to_string()),
@@ -193,7 +204,10 @@ pub async fn check(
     sensors_elapsed: Duration,
     browser_fp: &str,
 ) -> Result<CheckResult, CaptchaError> {
-    let url = format!("https://{}/method/captchaNotRobot.check?v={}", API_HOST, API_VERSION);
+    let url = format!(
+        "https://{}/method/captchaNotRobot.check?v={}",
+        API_HOST, API_VERSION
+    );
     let analytics = super::telemetry::build_analytics(sensors_elapsed);
     let mut form: Vec<(&str, String)> = vec![
         ("session_token", ctx.session_token.clone()),

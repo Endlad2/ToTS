@@ -83,7 +83,10 @@ pub async fn run_vk(
 
             info!(%peer, "TURN: binding channel");
             let channel = alloc.channel_bind(peer).await.context("TURN ChannelBind")?;
-            info!(channel = format!("0x{:04x}", channel), "TURN: channel bound");
+            info!(
+                channel = format!("0x{:04x}", channel),
+                "TURN: channel bound"
+            );
 
             Box::new(TurnIo::new(alloc, peer))
         }

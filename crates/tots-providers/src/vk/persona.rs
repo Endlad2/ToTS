@@ -3,8 +3,7 @@
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, USER_AGENT};
 
 /// Chrome 146 sec-ch-ua строка.
-pub const SEC_CH_UA: &str =
-    r#""Google Chrome";v="146", "Chromium";v="146", "Not)A;Brand";v="24""#;
+pub const SEC_CH_UA: &str = r#""Google Chrome";v="146", "Chromium";v="146", "Not)A;Brand";v="24""#;
 
 /// Chrome 146 sec-ch-ua-mobile (desktop).
 pub const SEC_CH_UA_MOBILE: &str = "?0";
@@ -23,7 +22,10 @@ pub const ACCEPT_LANGUAGE_VALUE: &str = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7";
 /// Базовые заголовки персоны, которые обязаны совпадать у всех запросов к VK.
 pub fn base_headers() -> HeaderMap {
     let mut h = HeaderMap::new();
-    h.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_CHROME_WINDOWS));
+    h.insert(
+        USER_AGENT,
+        HeaderValue::from_static(USER_AGENT_CHROME_WINDOWS),
+    );
     h.insert("sec-ch-ua", HeaderValue::from_static(SEC_CH_UA));
     h.insert(
         "sec-ch-ua-mobile",

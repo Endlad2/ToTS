@@ -45,7 +45,8 @@ fn re_pow_args() -> &'static Regex {
 
 fn re_pow_prefix() -> &'static Regex {
     RE_POW_PREFIX.get_or_init(|| {
-        Regex::new(r#"captchaPowResult["'\]]{0,3}\s*=\s*["']([A-Za-z0-9._-]{0,8})["']\s*\+"#).unwrap()
+        Regex::new(r#"captchaPowResult["'\]]{0,3}\s*=\s*["']([A-Za-z0-9._-]{0,8})["']\s*\+"#)
+            .unwrap()
     })
 }
 
@@ -65,9 +66,7 @@ fn re_debug_info() -> &'static Regex {
 }
 
 fn re_origin() -> &'static Regex {
-    RE_ORIGIN.get_or_init(|| {
-        Regex::new(r#"apiDomain["']?\s*:\s*["']([^"']+)["']"#).unwrap()
-    })
+    RE_ORIGIN.get_or_init(|| Regex::new(r#"apiDomain["']?\s*:\s*["']([^"']+)["']"#).unwrap())
 }
 
 pub fn parse_page(html: &str) -> Result<Page, String> {
@@ -77,8 +76,8 @@ pub fn parse_page(html: &str) -> Result<Page, String> {
     }
 
     let pow = parse_pow(html)?;
-    let debug_info = parse_debug_info(html)
-        .ok_or_else(|| "captcha debug_info not found".to_string())?;
+    let debug_info =
+        parse_debug_info(html).ok_or_else(|| "captcha debug_info not found".to_string())?;
     let init = parse_init(html);
     let origin = re_origin()
         .captures(html)

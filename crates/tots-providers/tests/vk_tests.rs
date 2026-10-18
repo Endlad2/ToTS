@@ -34,10 +34,7 @@ async fn provider_fetches_real_credentials() {
 #[tokio::test]
 #[ignore = "requires network"]
 async fn provider_returns_captcha_or_invalid_for_bad_link() {
-    let provider = VkProvider::new(VkConfig::new(
-        "https://vk.ru/call/join/aaaaaaaaaaaa",
-    ))
-    .unwrap();
+    let provider = VkProvider::new(VkConfig::new("https://vk.ru/call/join/aaaaaaaaaaaa")).unwrap();
     match provider.get_credentials(1).await {
         Err(ProviderError::CaptchaRequired { .. }) => {}
         Err(ProviderError::InvalidLink(_)) => {}

@@ -133,7 +133,10 @@ fn parse_puzzle(raw: &Value) -> Result<Puzzle, CaptchaError> {
     let response = raw
         .get("response")
         .ok_or_else(|| CaptchaError::Api(format!("no response: {raw}")))?;
-    let status = response.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let status = response
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if status.to_lowercase() != "ok" {
         return Err(CaptchaError::Api(format!("getContent status: {status}")));
     }

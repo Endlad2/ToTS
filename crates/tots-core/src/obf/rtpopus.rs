@@ -111,7 +111,10 @@ impl Conn {
 
     pub fn unwrap_into_mut(&mut self, wire: &[u8], dst: &mut [u8]) -> io::Result<usize> {
         if wire.len() < OVERHEAD {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "packet too short"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet too short",
+            ));
         }
         let payload_len = wire.len() - OVERHEAD;
         if dst.len() < payload_len {

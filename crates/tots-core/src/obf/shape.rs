@@ -52,7 +52,10 @@ impl Shaper {
 
             let jitter_span = (self.interval.as_nanos() as f64 * 0.10) as u64;
             let jitter = if jitter_span > 0 {
-                Duration::from_nanos(rng.gen_range(0..=jitter_span * 2).saturating_sub(jitter_span))
+                Duration::from_nanos(
+                    rng.gen_range(0..=jitter_span * 2)
+                        .saturating_sub(jitter_span),
+                )
             } else {
                 Duration::ZERO
             };

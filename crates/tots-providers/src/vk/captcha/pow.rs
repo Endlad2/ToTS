@@ -386,7 +386,9 @@ fn build_telemetry(page_origin: &str, domain: &str) -> Telemetry {
             local_storage: true,
             session_storage: true,
         },
-        max_touch_points: MaxTouchPoints { max_touch_points: 0 },
+        max_touch_points: MaxTouchPoints {
+            max_touch_points: 0,
+        },
         timezone_locale: TimezoneLocale {
             timezone: "Europe/Moscow".into(),
             languages: vec!["ru-RU".into(), "en-US".into()],
