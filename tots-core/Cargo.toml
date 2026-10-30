@@ -1,0 +1,23 @@
+[package]
+name = "tots-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chacha20poly1305.workspace = true
+futures.workspace = true
+postcard.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+turnclient.workspace = true
+uuid.workspace = true
+webrtc.workspace = true

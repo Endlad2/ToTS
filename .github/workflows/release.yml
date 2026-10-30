@@ -1,0 +1,161 @@
+name: Build and Release ToTS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  metadata:
+    name: Generate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Generate YY.MM.DD.HH.MM tag
+        id: tag
+        shell: bash
+        run: |
+          TAG="$(TZ=Europe/Amsterdam date +'%y.%m.%d.%H.%M')"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: tots-linux-x86_64
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: tots-windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target }}
+
+      - name: Build tots-core and tots-server
+        run: cargo build --release --target ${{ matrix.target }} -p tots-core -p tots-server
+
+      - name: Package Linux build
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          cp "target/${{ matrix.target }}/release/tots-server" dist/tots-server
+
+          CORE_RLIB="$(find "target/${{ matrix.target }}/release/deps" -maxdepth 1 -type f -name 'libtots_core-*.rlib' -print -quit)"
+          if [ -z "$CORE_RLIB" ]; then
+            echo "tots-core .rlib was not found" >&2
+            exit 1
+          fi
+          cp "$CORE_RLIB" dist/tots-core.rlib
+
+          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" tots-server tots-core.rlib
+
+      - name: Package Windows build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          Copy-Item "target\${{ matrix.target }}\release\tots-server.exe" "dist\tots-server.exe"
+
+          $core = Get-ChildItem "target\${{ matrix.target }}\release\deps\libtots_core-*.rlib" | Select-Object -First 1
+          if (-not $core) {
+            throw "tots-core .rlib was not found"
+          }
+          Copy-Item $core.FullName "dist\tots-core.rlib"
+
+          Compress-Archive -Path "dist\*" -DestinationPath "${{ matrix.artifact }}.zip" -Force
+
+      - name: Upload Linux artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload Windows artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum tots-linux-x86_64.tar.gz tots-windows-x86_64.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Ensure release tag is unique
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists. Re-run in the next minute or delete the old tag/release." >&2
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            release-assets/tots-linux-x86_64.tar.gz \
+            release-assets/tots-windows-x86_64.zip \
+            release-assets/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "ToTS $TAG" \
+            --generate-notes
