@@ -383,7 +383,13 @@ async fn run_turn_ingress(state: AppState) -> Result<()> {
             }
             Frame::Data { payload } => {
                 if let Some(backend) = sessions.lock().await.get(&source).cloned() {
-                    backend.send(&payload).await?;
+                    if let Err(err) = backend.send(&payload).await {
+                        if err.kind() == std::io::ErrorKind::ConnectionRefused {
+                            warn!(%source, %err, "backend temporarily refused TURN payload; keeping session alive");
+                            continue;
+                        }
+                        return Err(err.into());
+                    }
                 }
             }
             Frame::SignalOffer { sdp_json } => {
@@ -445,6 +451,11 @@ fn spawn_backend_to_turn(
                             break;
                         }
                     }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    warn!(%client, %err, "backend temporarily refused UDP; keeping TURN return path alive");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
                 }
                 Err(err) => {
                     warn!(%client, %err, "backend receive failed");
@@ -622,7 +633,13 @@ async fn serve_data_channel(state: AppState, data_channel: Arc<dyn DataChannel>)
                     }
                     Frame::Data { payload } => {
                         if let Some(sock) = backend.lock().await.clone() {
-                            sock.send(&payload).await?;
+                            if let Err(err) = sock.send(&payload).await {
+                                if err.kind() == std::io::ErrorKind::ConnectionRefused {
+                                    warn!(%err, "backend temporarily refused WebRTC payload; keeping data channel alive");
+                                    continue;
+                                }
+                                return Err(err.into());
+                            }
                         }
                     }
                     Frame::Ping { nonce } => {
@@ -666,6 +683,11 @@ fn spawn_backend_to_data_channel(
                         warn!(%err, "failed to return backend packet over WebRTC");
                         break;
                     }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    warn!(%err, "backend temporarily refused UDP; keeping WebRTC return path alive");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
                 }
                 Err(err) => {
                     warn!(%err, "backend receive failed");

@@ -15,6 +15,7 @@ use crate::{Frame, PacketCipher, TurnProvider, PROTOCOL_VERSION};
 pub const DEFAULT_LOCAL_PORT: u16 = 7000;
 pub const DEFAULT_WEBRTC_PORT: u16 = 8443;
 pub const DEFAULT_TURN_PORT: u16 = 50000;
+pub const MAX_DATA_PAYLOAD: usize = 16_000;
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -41,7 +42,58 @@ impl Default for ClientConfig {
     }
 }
 
-pub async fn run(config: ClientConfig, provider: Arc<dyn TurnProvider>) -> Result<()> {
+/// An authenticated ToTS data session. It exposes raw payload datagrams so
+/// front-ends can attach either the legacy local UDP/KCP socket or a real TUN
+/// interface without re-implementing transport selection/authentication.
+pub struct ClientSession {
+    transport: Transport,
+    cipher: PacketCipher,
+}
+
+impl ClientSession {
+    pub fn transport_name(&self) -> &'static str {
+        self.transport.name()
+    }
+
+    pub async fn send_payload(&self, payload: &[u8]) -> Result<()> {
+        if payload.len() > MAX_DATA_PAYLOAD {
+            bail!(
+                "payload is {} bytes, exceeding ToTS DataChannel limit of {} bytes",
+                payload.len(),
+                MAX_DATA_PAYLOAD
+            );
+        }
+        let packet = self
+            .cipher
+            .seal(&Frame::Data { payload: payload.to_vec() })?;
+        self.transport.send(packet).await
+    }
+
+    /// Wait for the next application payload. Ping frames are handled in-band
+    /// and never leak into the attached local interface.
+    pub async fn recv_payload(&mut self) -> Result<Vec<u8>> {
+        loop {
+            let packet = self.transport.recv().await?;
+            match self.cipher.open(&packet)? {
+                Frame::Data { payload } => return Ok(payload),
+                Frame::Ping { nonce } => {
+                    self.transport
+                        .send(self.cipher.seal(&Frame::Pong { nonce })?)
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub async fn close(&self) {
+        self.transport.close().await;
+    }
+}
+
+/// Establishes both transport probes, chooses the preferred working transport,
+/// and authorizes device_id. No local UDP or TUN interface is opened here.
+pub async fn connect(config: &ClientConfig, provider: Arc<dyn TurnProvider>) -> Result<ClientSession> {
     if config.password.is_empty() {
         bail!("password must not be empty");
     }
@@ -152,35 +204,31 @@ pub async fn run(config: ClientConfig, provider: Arc<dyn TurnProvider>) -> Resul
     .await?;
     info!(transport = transport.name(), device_id = %config.device_id, "device authorized");
 
+    Ok(ClientSession { transport, cipher })
+}
+
+/// Legacy KCP-facing local UDP mode.
+pub async fn run(config: ClientConfig, provider: Arc<dyn TurnProvider>) -> Result<()> {
+    let mut session = connect(&config, provider).await?;
+
     let socket = UdpSocket::bind(config.local_bind)
         .await
         .with_context(|| format!("bind local KCP-facing UDP socket at {}", config.local_bind))?;
     info!(local = %config.local_bind, "ToTS local UDP port is listening");
 
-    // WebRTC data messages are intentionally kept below the common 16 KiB
-    // DataChannel message ceiling. KCP datagrams should normally be near MTU.
-    let mut buf = vec![0u8; 16_000];
+    let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
     let mut last_local_peer: Option<SocketAddr> = None;
     loop {
         tokio::select! {
             local = socket.recv_from(&mut buf) => {
                 let (n, peer) = local.context("read local UDP datagram")?;
                 last_local_peer = Some(peer);
-                let packet = cipher.seal(&Frame::Data { payload: buf[..n].to_vec() })?;
-                transport.send(packet).await?;
+                session.send_payload(&buf[..n]).await?;
             }
-            remote = transport.recv() => {
-                let packet = remote?;
-                match cipher.open(&packet)? {
-                    Frame::Data { payload } => {
-                        if let Some(peer) = last_local_peer {
-                            socket.send_to(&payload, peer).await.context("write local UDP response")?;
-                        }
-                    }
-                    Frame::Ping { nonce } => {
-                        transport.send(cipher.seal(&Frame::Pong { nonce })?).await?;
-                    }
-                    _ => {}
+            remote = session.recv_payload() => {
+                let payload = remote?;
+                if let Some(peer) = last_local_peer {
+                    socket.send_to(&payload, peer).await.context("write local UDP response")?;
                 }
             }
         }
