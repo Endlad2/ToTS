@@ -59,8 +59,13 @@ jobs:
         with:
           shared-key: ${{ matrix.target }}
 
-      - name: Build tots-core and tots-server
+      - name: Build Linux core and server
+        if: runner.os == 'Linux'
         run: cargo build --release --target ${{ matrix.target }} -p tots-core -p tots-server
+
+      - name: Build Windows core, server and client
+        if: runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }} -p tots-core -p tots-server -p tots-client
 
       - name: Package Linux build
         if: runner.os == 'Linux'
@@ -87,14 +92,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
 
           Copy-Item "target\${{ matrix.target }}\release\tots-server.exe" "dist\tots-server.exe"
+          Copy-Item "target\${{ matrix.target }}\release\tots-client.exe" "dist\tots-client.exe"
 
-          $core = Get-ChildItem "target\${{ matrix.target }}\release\deps\libtots_core-*.rlib" | Select-Object -First 1
-          if (-not $core) {
-            throw "tots-core .rlib was not found"
-          }
-          Copy-Item $core.FullName "dist\tots-core.rlib"
-
-          Compress-Archive -Path "dist\*" -DestinationPath "${{ matrix.artifact }}.zip" -Force
+          Compress-Archive `
+            -Path "dist\tots-server.exe","dist\tots-client.exe" `
+            -DestinationPath "${{ matrix.artifact }}.zip" `
+            -Force
 
       - name: Upload Linux artifact
         if: runner.os == 'Linux'
