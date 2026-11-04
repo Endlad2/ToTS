@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Frame {
@@ -18,4 +18,8 @@ pub enum Frame {
     Data { payload: Vec<u8> },
     Ping { nonce: u64 },
     Pong { nonce: u64 },
+
+    /// Explicit layer-3 TUN session. Appended to preserve the discriminants of
+    /// all protocol-v1 frames while protocol version 2 negotiates support.
+    AuthTun { device_id: Uuid },
 }

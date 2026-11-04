@@ -27,8 +27,8 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use tots_core::{
-    Frame, PacketCipher, PROTOCOL_VERSION, DEFAULT_LOCAL_PORT, DEFAULT_TURN_PORT,
-    DEFAULT_WEBRTC_PORT,
+    Frame, PacketCipher, TotsConfig, TOTS_CONFIG_VERSION, PROTOCOL_VERSION, DEFAULT_LOCAL_PORT,
+    DEFAULT_TURN_PORT, DEFAULT_WEBRTC_PORT,
 };
 use uuid::Uuid;
 use gateway::TunGateway;
@@ -79,8 +79,9 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:40000")]
     backend: SocketAddr,
 
-    /// Route raw IPv4 packets from client --tun sessions through a Linux TUN interface and NAT them to the Internet.
-    /// When enabled, --backend is kept only for legacy UDP/KCP clients.
+    /// Eagerly create the Linux TUN/NAT Internet gateway at server startup.
+    /// Without this flag the gateway is created lazily on the first authenticated TUN client.
+    /// Legacy UDP/KCP sessions always continue to use --backend.
     #[arg(long, default_value_t = false)]
     tun_gateway: bool,
 
@@ -122,6 +123,15 @@ impl PersistentState {
 }
 
 #[derive(Clone)]
+struct TunGatewayConfig {
+    name: String,
+    address: Ipv4Addr,
+    prefix: u8,
+    mtu: u16,
+    outbound_interface: Option<String>,
+}
+
+#[derive(Clone)]
 struct AppState {
     cipher: PacketCipher,
     master_password: String,
@@ -132,7 +142,8 @@ struct AppState {
     webrtc_port: u16,
     turn_port: u16,
     backend: SocketAddr,
-    tun_gateway: Option<TunGateway>,
+    tun_gateway: Arc<Mutex<Option<TunGateway>>>,
+    tun_gateway_config: TunGatewayConfig,
     peers: Arc<Mutex<Vec<Arc<dyn PeerConnection>>>>,
 }
 
@@ -140,30 +151,68 @@ struct AppState {
 struct CreateConfigRequest {
     #[serde(default = "default_provider")]
     provider: String,
-    #[serde(default)]
+    #[serde(default = "default_provider_data")]
     provider_data: Value,
+    #[serde(default = "default_transport")]
+    transport: String,
     #[serde(default = "default_local_port")]
     local_port: u16,
+    #[serde(default)]
+    tun: bool,
+    #[serde(default = "default_tun_name")]
+    tun_name: String,
+    #[serde(default = "default_client_tun_address")]
+    tun_address: Ipv4Addr,
+    #[serde(default = "default_tun_prefix")]
+    tun_prefix: u8,
+    #[serde(default = "default_tun_mtu")]
+    tun_mtu: u16,
+    #[serde(default)]
+    tun_default_route: bool,
+    #[serde(default = "default_tun_dns")]
+    tun_dns: Vec<Ipv4Addr>,
+    #[serde(default = "default_connect_timeout_secs")]
+    connect_timeout_secs: u64,
 }
 
 fn default_provider() -> String {
     "vk".to_string()
 }
 
+fn default_provider_data() -> Value {
+    Value::Object(Default::default())
+}
+
+fn default_transport() -> String {
+    "auto".to_string()
+}
+
 fn default_local_port() -> u16 {
     DEFAULT_LOCAL_PORT
 }
 
-#[derive(Debug, Serialize)]
-struct ClientConfigResponse {
-    server: String,
-    device_id: Uuid,
-    password: String,
-    provider: String,
-    provider_data: Value,
-    local_port: u16,
-    webrtc_port: u16,
-    turn_port: u16,
+fn default_tun_name() -> String {
+    "tots0".to_string()
+}
+
+fn default_client_tun_address() -> Ipv4Addr {
+    Ipv4Addr::new(10, 77, 0, 2)
+}
+
+fn default_tun_prefix() -> u8 {
+    24
+}
+
+fn default_tun_mtu() -> u16 {
+    1300
+}
+
+fn default_tun_dns() -> Vec<Ipv4Addr> {
+    vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)]
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    8
 }
 
 #[derive(Debug, Serialize)]
@@ -210,14 +259,21 @@ async fn main() -> Result<()> {
         cli.public_host.clone()
     };
 
+    let tun_gateway_config = TunGatewayConfig {
+        name: cli.tun_name.clone(),
+        address: cli.tun_address,
+        prefix: cli.tun_prefix,
+        mtu: cli.tun_mtu,
+        outbound_interface: cli.tun_outbound_interface.clone(),
+    };
     let tun_gateway = if cli.tun_gateway {
         Some(
             TunGateway::start(
-                cli.tun_name.clone(),
-                cli.tun_address,
-                cli.tun_prefix,
-                cli.tun_mtu,
-                cli.tun_outbound_interface.clone(),
+                tun_gateway_config.name.clone(),
+                tun_gateway_config.address,
+                tun_gateway_config.prefix,
+                tun_gateway_config.mtu,
+                tun_gateway_config.outbound_interface.clone(),
             )
             .await
             .context("start server TUN Internet gateway")?,
@@ -239,7 +295,8 @@ async fn main() -> Result<()> {
         webrtc_port: cli.webrtc_port,
         turn_port: cli.turn_port,
         backend: cli.backend,
-        tun_gateway,
+        tun_gateway: Arc::new(Mutex::new(tun_gateway)),
+        tun_gateway_config,
         peers: Arc::new(Mutex::new(Vec::new())),
     };
 
@@ -265,6 +322,7 @@ async fn main() -> Result<()> {
         }
     });
 
+    let tun_gateway_active = state.tun_gateway.lock().await.is_some();
     info!(
         api = %management_addr,
         public_host = %state.public_host,
@@ -272,7 +330,8 @@ async fn main() -> Result<()> {
         webrtc_signaling_port = state.webrtc_port,
         turn_target_port = state.turn_port,
         backend = %state.backend,
-        tun_gateway = state.tun_gateway.is_some(),
+        tun_gateway = tun_gateway_active,
+        tun_gateway_lazy = !cli.tun_gateway,
         "ToTS server started"
     );
 
@@ -303,6 +362,7 @@ async fn run_management_api(state: AppState, addr: SocketAddr) -> Result<()> {
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let tun_gateway = state.tun_gateway.lock().await.is_some();
     Json(HealthResponse {
         ok: true,
         protocol_version: PROTOCOL_VERSION,
@@ -310,28 +370,40 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         webrtc_port: state.webrtc_port,
         turn_port: state.turn_port,
         stun: state.stun_server.is_some(),
-        tun_gateway: state.tun_gateway.is_some(),
+        tun_gateway,
     })
 }
 
 async fn create_config(
     State(state): State<AppState>,
     Json(req): Json<CreateConfigRequest>,
-) -> Result<Json<ClientConfigResponse>, (StatusCode, String)> {
+) -> Result<String, (StatusCode, String)> {
     let device_id = Uuid::new_v4();
     state.devices.write().await.insert(device_id);
     save_devices(&state).await.map_err(internal_server_error)?;
 
-    Ok(Json(ClientConfigResponse {
+    let config = TotsConfig {
+        version: TOTS_CONFIG_VERSION,
         server: state.public_host.clone(),
         device_id,
         password: state.master_password.clone(),
         provider: req.provider,
         provider_data: req.provider_data,
+        transport: req.transport,
         local_port: req.local_port,
+        tun: req.tun,
+        tun_name: req.tun_name,
+        tun_address: req.tun_address,
+        tun_prefix: req.tun_prefix,
+        tun_mtu: req.tun_mtu,
+        tun_default_route: req.tun_default_route,
+        tun_dns: req.tun_dns,
         webrtc_port: state.webrtc_port,
         turn_port: state.turn_port,
-    }))
+        connect_timeout_secs: req.connect_timeout_secs,
+    };
+
+    config.to_uri().map_err(internal_server_error)
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<DevicesResponse> {
@@ -366,12 +438,39 @@ fn internal_server_error(err: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }
 
+async fn ensure_tun_gateway(state: &AppState) -> Result<TunGateway> {
+    let mut slot = state.tun_gateway.lock().await;
+    if let Some(gateway) = slot.as_ref() {
+        return Ok(gateway.clone());
+    }
+
+    let config = &state.tun_gateway_config;
+    info!(
+        tun = %config.name,
+        address = %config.address,
+        prefix = config.prefix,
+        mtu = config.mtu,
+        "starting server TUN gateway lazily for an authenticated TUN client"
+    );
+    let gateway = TunGateway::start(
+        config.name.clone(),
+        config.address,
+        config.prefix,
+        config.mtu,
+        config.outbound_interface.clone(),
+    )
+    .await
+    .context("start server TUN Internet gateway for TUN session")?;
+    *slot = Some(gateway.clone());
+    Ok(gateway)
+}
+
 async fn run_turn_ingress(state: AppState) -> Result<()> {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), state.turn_port);
     let socket = Arc::new(UdpSocket::bind(bind).await?);
     let udp_sessions: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let tun_sessions: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>> =
+    let tun_sessions: Arc<Mutex<HashMap<SocketAddr, (TunGateway, mpsc::Sender<Vec<u8>>)>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut buf = vec![0u8; 65_535];
 
@@ -386,44 +485,32 @@ async fn run_turn_ingress(state: AppState) -> Result<()> {
         };
 
         match frame {
-            Frame::Probe { version, nonce } => {
-                if version == PROTOCOL_VERSION {
-                    send_udp_frame(
-                        &socket,
-                        source,
-                        &state.cipher,
-                        Frame::ProbeAck {
-                            version: PROTOCOL_VERSION,
-                            nonce,
-                        },
-                    )
-                    .await?;
-                }
+            Frame::Probe { nonce, .. } => {
+                send_udp_frame(
+                    &socket,
+                    source,
+                    &state.cipher,
+                    Frame::ProbeAck {
+                        version: PROTOCOL_VERSION,
+                        nonce,
+                    },
+                )
+                .await?;
             }
             Frame::Auth { device_id } => {
                 let valid = state.devices.read().await.contains(&device_id);
                 if valid {
-                    if state.tun_gateway.is_some() {
-                        let (return_tx, return_rx) = mpsc::channel::<Vec<u8>>(1024);
-                        tun_sessions.lock().await.insert(source, return_tx);
-                        spawn_tun_to_turn(
-                            return_rx,
-                            socket.clone(),
-                            source,
-                            state.cipher.clone(),
-                        );
-                    } else {
-                        let backend = UdpSocket::bind("0.0.0.0:0").await?;
-                        backend.connect(state.backend).await?;
-                        let backend = Arc::new(backend);
-                        udp_sessions.lock().await.insert(source, backend.clone());
-                        spawn_backend_to_turn(
-                            backend,
-                            socket.clone(),
-                            source,
-                            state.cipher.clone(),
-                        );
-                    }
+                    tun_sessions.lock().await.remove(&source);
+                    let backend = UdpSocket::bind("0.0.0.0:0").await?;
+                    backend.connect(state.backend).await?;
+                    let backend = Arc::new(backend);
+                    udp_sessions.lock().await.insert(source, backend.clone());
+                    spawn_backend_to_turn(
+                        backend,
+                        socket.clone(),
+                        source,
+                        state.cipher.clone(),
+                    );
                 }
                 send_udp_frame(
                     &socket,
@@ -440,12 +527,45 @@ async fn run_turn_ingress(state: AppState) -> Result<()> {
                 )
                 .await?;
             }
-            Frame::Data { payload } => {
-                if let Some(gateway) = state.tun_gateway.as_ref() {
-                    if let Some(return_tx) = tun_sessions.lock().await.get(&source).cloned() {
-                        if let Err(err) = gateway.forward_from_client(&payload, return_tx).await {
-                            warn!(%source, %err, "discarding invalid TURN TUN payload");
+            Frame::AuthTun { device_id } => {
+                let valid_device = state.devices.read().await.contains(&device_id);
+                let (ok, message) = if !valid_device {
+                    (false, "invalid device_id".to_string())
+                } else {
+                    match ensure_tun_gateway(&state).await {
+                        Ok(gateway) => {
+                            udp_sessions.lock().await.remove(&source);
+                            let (return_tx, return_rx) = mpsc::channel::<Vec<u8>>(1024);
+                            tun_sessions
+                                .lock()
+                                .await
+                                .insert(source, (gateway, return_tx));
+                            spawn_tun_to_turn(
+                                return_rx,
+                                socket.clone(),
+                                source,
+                                state.cipher.clone(),
+                            );
+                            (true, "ok".to_string())
                         }
+                        Err(err) => {
+                            warn!(%source, %err, "cannot start TUN gateway for TURN client");
+                            (false, format!("server TUN gateway unavailable: {err}"))
+                        }
+                    }
+                };
+                send_udp_frame(
+                    &socket,
+                    source,
+                    &state.cipher,
+                    Frame::AuthResult { ok, message },
+                )
+                .await?;
+            }
+            Frame::Data { payload } => {
+                if let Some((gateway, return_tx)) = tun_sessions.lock().await.get(&source).cloned() {
+                    if let Err(err) = gateway.forward_from_client(&payload, return_tx).await {
+                        warn!(%source, %err, "discarding invalid TURN TUN payload");
                     }
                 } else if let Some(backend) = udp_sessions.lock().await.get(&source).cloned() {
                     if let Err(err) = backend.send(&payload).await {
@@ -670,7 +790,8 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
 
 async fn serve_data_channel(state: AppState, data_channel: Arc<dyn DataChannel>) -> Result<()> {
     let backend: Arc<Mutex<Option<Arc<UdpSocket>>>> = Arc::new(Mutex::new(None));
-    let tun_return: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+    let tun_session: Arc<Mutex<Option<(TunGateway, mpsc::Sender<Vec<u8>>)>>> =
+        Arc::new(Mutex::new(None));
 
     while let Some(event) = data_channel.poll().await {
         match event {
@@ -685,7 +806,7 @@ async fn serve_data_channel(state: AppState, data_channel: Arc<dyn DataChannel>)
                 };
 
                 match frame {
-                    Frame::Probe { version, nonce } if version == PROTOCOL_VERSION => {
+                    Frame::Probe { nonce, .. } => {
                         send_data_channel_frame(
                             &data_channel,
                             &state.cipher,
@@ -699,25 +820,16 @@ async fn serve_data_channel(state: AppState, data_channel: Arc<dyn DataChannel>)
                     Frame::Auth { device_id } => {
                         let valid = state.devices.read().await.contains(&device_id);
                         if valid {
-                            if state.tun_gateway.is_some() {
-                                let (return_tx, return_rx) = mpsc::channel::<Vec<u8>>(1024);
-                                *tun_return.lock().await = Some(return_tx);
-                                spawn_tun_to_data_channel(
-                                    return_rx,
-                                    data_channel.clone(),
-                                    state.cipher.clone(),
-                                );
-                            } else {
-                                let sock = UdpSocket::bind("0.0.0.0:0").await?;
-                                sock.connect(state.backend).await?;
-                                let sock = Arc::new(sock);
-                                *backend.lock().await = Some(sock.clone());
-                                spawn_backend_to_data_channel(
-                                    sock,
-                                    data_channel.clone(),
-                                    state.cipher.clone(),
-                                );
-                            }
+                            *tun_session.lock().await = None;
+                            let sock = UdpSocket::bind("0.0.0.0:0").await?;
+                            sock.connect(state.backend).await?;
+                            let sock = Arc::new(sock);
+                            *backend.lock().await = Some(sock.clone());
+                            spawn_backend_to_data_channel(
+                                sock,
+                                data_channel.clone(),
+                                state.cipher.clone(),
+                            );
                         }
                         send_data_channel_frame(
                             &data_channel,
@@ -733,12 +845,40 @@ async fn serve_data_channel(state: AppState, data_channel: Arc<dyn DataChannel>)
                         )
                         .await?;
                     }
-                    Frame::Data { payload } => {
-                        if let Some(gateway) = state.tun_gateway.as_ref() {
-                            if let Some(return_tx) = tun_return.lock().await.clone() {
-                                if let Err(err) = gateway.forward_from_client(&payload, return_tx).await {
-                                    warn!(%err, "discarding invalid WebRTC TUN payload");
+                    Frame::AuthTun { device_id } => {
+                        let valid_device = state.devices.read().await.contains(&device_id);
+                        let (ok, message) = if !valid_device {
+                            (false, "invalid device_id".to_string())
+                        } else {
+                            match ensure_tun_gateway(&state).await {
+                                Ok(gateway) => {
+                                    *backend.lock().await = None;
+                                    let (return_tx, return_rx) = mpsc::channel::<Vec<u8>>(1024);
+                                    *tun_session.lock().await = Some((gateway, return_tx));
+                                    spawn_tun_to_data_channel(
+                                        return_rx,
+                                        data_channel.clone(),
+                                        state.cipher.clone(),
+                                    );
+                                    (true, "ok".to_string())
                                 }
+                                Err(err) => {
+                                    warn!(%err, "cannot start TUN gateway for WebRTC client");
+                                    (false, format!("server TUN gateway unavailable: {err}"))
+                                }
+                            }
+                        };
+                        send_data_channel_frame(
+                            &data_channel,
+                            &state.cipher,
+                            Frame::AuthResult { ok, message },
+                        )
+                        .await?;
+                    }
+                    Frame::Data { payload } => {
+                        if let Some((gateway, return_tx)) = tun_session.lock().await.clone() {
+                            if let Err(err) = gateway.forward_from_client(&payload, return_tx).await {
+                                warn!(%err, "discarding invalid WebRTC TUN payload");
                             }
                         } else if let Some(sock) = backend.lock().await.clone() {
                             if let Err(err) = sock.send(&payload).await {
@@ -758,8 +898,7 @@ async fn serve_data_channel(state: AppState, data_channel: Arc<dyn DataChannel>)
                         )
                         .await?;
                     }
-                    Frame::Probe { .. }
-                    | Frame::ProbeAck { .. }
+                    Frame::ProbeAck { .. }
                     | Frame::SignalOffer { .. }
                     | Frame::SignalAnswer { .. }
                     | Frame::AuthResult { .. }

@@ -1,21 +1,34 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use rand::Rng;
-use tokio::net::UdpSocket;
+use tokio::net::{lookup_host, UdpSocket};
 use tokio::time::timeout;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::transport::{Transport, TurnTransport, WebRtcTransport};
-use crate::{Frame, PacketCipher, TurnProvider, PROTOCOL_VERSION};
+use crate::{Frame, PacketCipher, TurnCredentials, TurnProvider, PROTOCOL_VERSION};
 
 pub const DEFAULT_LOCAL_PORT: u16 = 7000;
 pub const DEFAULT_WEBRTC_PORT: u16 = 8443;
 pub const DEFAULT_TURN_PORT: u16 = 50000;
 pub const MAX_DATA_PAYLOAD: usize = 16_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportPreference {
+    Auto,
+    ProviderRelay,
+}
+
+impl Default for TransportPreference {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -26,6 +39,7 @@ pub struct ClientConfig {
     pub password: String,
     pub device_id: Uuid,
     pub connect_timeout: Duration,
+    pub transport_preference: TransportPreference,
 }
 
 impl Default for ClientConfig {
@@ -38,8 +52,15 @@ impl Default for ClientConfig {
             password: String::new(),
             device_id: Uuid::nil(),
             connect_timeout: Duration::from_secs(8),
+            transport_preference: TransportPreference::Auto,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SessionMode {
+    LegacyPayload,
+    Tun,
 }
 
 /// An authenticated ToTS data session. It exposes raw payload datagrams so
@@ -48,11 +69,22 @@ impl Default for ClientConfig {
 pub struct ClientSession {
     transport: Transport,
     cipher: PacketCipher,
+    route_exception_ipv4: Vec<Ipv4Addr>,
+    // Jazz TURN credentials are tied to a live Jazz guest session. Retaining
+    // the provider keeps that session alive for the lifetime of the transport.
+    _provider: Arc<dyn TurnProvider>,
 }
 
 impl ClientSession {
     pub fn transport_name(&self) -> &'static str {
         self.transport.name()
+    }
+
+    /// IPv4 endpoints that must stay on the original physical route when a
+    /// client installs a full-tunnel default route. This is non-empty for
+    /// provider-relayed transports such as TURN and Jazz.
+    pub fn route_exception_ipv4(&self) -> &[Ipv4Addr] {
+        &self.route_exception_ipv4
     }
 
     pub async fn send_payload(&self, payload: &[u8]) -> Result<()> {
@@ -91,9 +123,27 @@ impl ClientSession {
     }
 }
 
-/// Establishes both transport probes, chooses the preferred working transport,
-/// and authorizes device_id. No local UDP or TUN interface is opened here.
+/// Establishes transport probes, chooses the preferred working transport, and
+/// authorizes a legacy payload session.
 pub async fn connect(config: &ClientConfig, provider: Arc<dyn TurnProvider>) -> Result<ClientSession> {
+    connect_mode(config, provider, SessionMode::LegacyPayload).await
+}
+
+/// Establishes an authenticated layer-3 TUN session. The explicit AuthTun
+/// handshake prevents raw IP packets from ever being mistaken for legacy UDP
+/// backend payloads on the server.
+pub async fn connect_tun(
+    config: &ClientConfig,
+    provider: Arc<dyn TurnProvider>,
+) -> Result<ClientSession> {
+    connect_mode(config, provider, SessionMode::Tun).await
+}
+
+async fn connect_mode(
+    config: &ClientConfig,
+    provider: Arc<dyn TurnProvider>,
+    mode: SessionMode,
+) -> Result<ClientSession> {
     if config.password.is_empty() {
         bail!("password must not be empty");
     }
@@ -103,108 +153,106 @@ pub async fn connect(config: &ClientConfig, provider: Arc<dyn TurnProvider>) -> 
 
     let cipher = PacketCipher::new(&config.password);
 
-    info!("probing direct WebRTC transport");
-    let direct = match WebRtcTransport::connect(
+    if config.transport_preference == TransportPreference::Auto {
+        info!("probing direct WebRTC transport");
+        match WebRtcTransport::connect(
+            &config.server,
+            config.webrtc_port,
+            config.connect_timeout,
+        )
+        .await
+        {
+            Ok(t) => {
+                let mut direct = Transport::WebRtc(t);
+                match probe(&mut direct, &cipher, config.connect_timeout).await {
+                    Ok(()) => {
+                        info!("selecting direct WebRTC");
+                        authorize(
+                            &mut direct,
+                            &cipher,
+                            config.device_id,
+                            config.connect_timeout,
+                            mode,
+                        )
+                        .await?;
+                        info!(transport = direct.name(), device_id = %config.device_id, "device authorized");
+                        return Ok(ClientSession {
+                            transport: direct,
+                            cipher,
+                            route_exception_ipv4: Vec::new(),
+                            _provider: provider,
+                        });
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "direct WebRTC probe failed; trying provider relay");
+                        direct.close().await;
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "direct WebRTC connection failed; trying provider relay");
+            }
+        }
+    } else {
+        info!(provider = provider.name(), "provider relay forced; skipping direct WebRTC probe");
+    }
+
+    info!(provider = provider.name(), "requesting provider TURN credentials");
+    let creds = provider
+        .get_credentials()
+        .await
+        .context("TURN provider failed")?;
+    let route_exception_ipv4 = resolve_relay_ipv4(&creds).await;
+    let mut signaling = TurnTransport::connect(
+        &creds,
         &config.server,
-        config.webrtc_port,
+        config.turn_port,
+        config.connect_timeout,
+    )
+    .await
+    .context("provider TURN signaling allocation failed")?;
+
+    let relay_webrtc = match WebRtcTransport::connect_via_turn(
+        &creds,
+        &mut signaling,
+        &cipher,
         config.connect_timeout,
     )
     .await
     {
-        Ok(t) => {
-            let mut tr = Transport::WebRtc(t);
-            match probe(&mut tr, &cipher, config.connect_timeout).await {
-                Ok(()) => Some(tr),
-                Err(err) => {
-                    warn!(error = %err, "direct WebRTC probe failed");
-                    tr.close().await;
-                    None
-                }
-            }
-        }
+        Ok(transport) => transport,
         Err(err) => {
-            warn!(error = %err, "direct WebRTC connection failed");
-            None
+            signaling.close().await;
+            return Err(err).context("provider-relayed WebRTC setup failed");
         }
     };
-
-    info!(provider = provider.name(), "requesting TURN credentials");
-    let turn = match provider.get_credentials().await {
-        Ok(creds) => {
-            match TurnTransport::connect(
-                &creds,
-                &config.server,
-                config.turn_port,
-                config.connect_timeout,
-            )
-            .await
-            {
-                Ok(mut signaling) => {
-                    match WebRtcTransport::connect_via_turn(
-                        &creds,
-                        &mut signaling,
-                        &cipher,
-                        config.connect_timeout,
-                    )
-                    .await
-                    {
-                        Ok(t) => {
-                            let mut tr = Transport::TurnWebRtc(t);
-                            match probe(&mut tr, &cipher, config.connect_timeout).await {
-                                Ok(()) => Some(tr),
-                                Err(err) => {
-                                    warn!(error = %err, "WebRTC-over-TURN probe failed");
-                                    tr.close().await;
-                                    None
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            signaling.close().await;
-                            warn!(error = %err, "WebRTC-over-TURN setup failed");
-                            None
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!(error = %err, "TURN signaling allocation failed");
-                    None
-                }
-            }
-        }
-        Err(err) => {
-            warn!(error = %err, "TURN provider failed");
-            None
-        }
+    let mut transport = if provider.name() == "jazz" {
+        Transport::Jazz(relay_webrtc)
+    } else {
+        Transport::TurnWebRtc(relay_webrtc)
     };
-
-    let mut transport = match (direct, turn) {
-        (Some(direct), Some(turn)) => {
-            info!("both transports passed handshake; selecting direct WebRTC");
-            turn.close().await;
-            direct
-        }
-        (Some(direct), None) => {
-            info!("selecting direct WebRTC");
-            direct
-        }
-        (None, Some(turn)) => {
-            info!("selecting WebRTC DataChannel over TURN");
-            turn
-        }
-        (None, None) => bail!("neither WebRTC nor WebRTC-over-TURN passed the probe"),
-    };
+    if let Err(err) = probe(&mut transport, &cipher, config.connect_timeout).await {
+        transport.close().await;
+        return Err(err).context("provider-relayed WebRTC probe failed");
+    }
+    info!(transport = transport.name(), "selecting provider-relayed transport");
 
     authorize(
         &mut transport,
         &cipher,
         config.device_id,
         config.connect_timeout,
+        mode,
     )
     .await?;
     info!(transport = transport.name(), device_id = %config.device_id, "device authorized");
 
-    Ok(ClientSession { transport, cipher })
+    Ok(ClientSession {
+        transport,
+        cipher,
+        route_exception_ipv4,
+        _provider: provider,
+    })
 }
 
 /// Legacy KCP-facing local UDP mode.
@@ -252,6 +300,11 @@ async fn probe(transport: &mut Transport, cipher: &PacketCipher, wait: Duration)
         {
             Ok(())
         }
+        Frame::ProbeAck { version, .. } => bail!(
+            "ToTS protocol mismatch: client version {}, server version {}",
+            PROTOCOL_VERSION,
+            version
+        ),
         other => Err(anyhow!("unexpected probe reply: {other:?}")),
     }
 }
@@ -261,10 +314,13 @@ async fn authorize(
     cipher: &PacketCipher,
     device_id: Uuid,
     wait: Duration,
+    mode: SessionMode,
 ) -> Result<()> {
-    transport
-        .send(cipher.seal(&Frame::Auth { device_id })?)
-        .await?;
+    let frame = match mode {
+        SessionMode::LegacyPayload => Frame::Auth { device_id },
+        SessionMode::Tun => Frame::AuthTun { device_id },
+    };
+    transport.send(cipher.seal(&frame)?).await?;
     let packet = timeout(wait, transport.recv())
         .await
         .context("device authorization timeout")??;
@@ -273,4 +329,29 @@ async fn authorize(
         Frame::AuthResult { ok: false, message } => bail!("device rejected by server: {message}"),
         other => bail!("unexpected device authorization reply: {other:?}"),
     }
+}
+
+async fn resolve_relay_ipv4(creds: &TurnCredentials) -> Vec<Ipv4Addr> {
+    let mut unique = HashSet::new();
+    for server in &creds.servers {
+        if let Ok(ip) = server.host.parse::<IpAddr>() {
+            if let IpAddr::V4(ip) = ip {
+                unique.insert(ip);
+            }
+            continue;
+        }
+        match lookup_host((server.host.as_str(), server.port)).await {
+            Ok(addrs) => {
+                for addr in addrs {
+                    if let IpAddr::V4(ip) = addr.ip() {
+                        unique.insert(ip);
+                    }
+                }
+            }
+            Err(err) => warn!(host = %server.host, port = server.port, %err, "could not pre-resolve relay for full-tunnel route pinning"),
+        }
+    }
+    let mut result: Vec<_> = unique.into_iter().collect();
+    result.sort();
+    result
 }

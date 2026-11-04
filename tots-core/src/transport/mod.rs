@@ -9,6 +9,7 @@ pub use webrtc::WebRtcTransport;
 pub enum Transport {
     WebRtc(WebRtcTransport),
     TurnWebRtc(WebRtcTransport),
+    Jazz(WebRtcTransport),
 }
 
 impl Transport {
@@ -16,24 +17,25 @@ impl Transport {
         match self {
             Self::WebRtc(_) => "webrtc",
             Self::TurnWebRtc(_) => "webrtc-over-turn",
+            Self::Jazz(_) => "jazz",
         }
     }
 
     pub async fn send(&self, packet: Vec<u8>) -> Result<()> {
         match self {
-            Self::WebRtc(t) | Self::TurnWebRtc(t) => t.send(packet).await,
+            Self::WebRtc(t) | Self::TurnWebRtc(t) | Self::Jazz(t) => t.send(packet).await,
         }
     }
 
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         match self {
-            Self::WebRtc(t) | Self::TurnWebRtc(t) => t.recv().await,
+            Self::WebRtc(t) | Self::TurnWebRtc(t) | Self::Jazz(t) => t.recv().await,
         }
     }
 
     pub async fn close(&self) {
         match self {
-            Self::WebRtc(t) | Self::TurnWebRtc(t) => t.close().await,
+            Self::WebRtc(t) | Self::TurnWebRtc(t) | Self::Jazz(t) => t.close().await,
         }
     }
 }

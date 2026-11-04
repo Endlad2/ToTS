@@ -4,10 +4,12 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use serde_json::Value;
 use tots_core::{
-    ClientConfig, TurnProvider, DEFAULT_LOCAL_PORT, DEFAULT_TURN_PORT, DEFAULT_WEBRTC_PORT,
-    MAX_DATA_PAYLOAD,
+    ClientConfig, TotsConfig, TransportPreference, TurnProvider, DEFAULT_LOCAL_PORT,
+    DEFAULT_TURN_PORT, DEFAULT_WEBRTC_PORT, MAX_DATA_PAYLOAD,
 };
+use tots_provider_jazz::{JazzProvider, JazzProviderData};
 use tots_provider_vk::{VkProvider, VkProviderData};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -17,26 +19,37 @@ use uuid::Uuid;
 #[derive(Debug, Parser)]
 #[command(name = "tots-client", version, about = "ToTS VPN client")]
 struct Cli {
+    /// Self-contained server-issued config: tots://<base64-json>.
+    /// Values explicitly supplied on the command line override the URI values.
+    #[arg(long, value_name = "TOTS_URI")]
+    config: Option<String>,
+
     /// Public IP or DNS name of tots-server.
     #[arg(long)]
-    server: String,
+    server: Option<String>,
 
     #[arg(long)]
-    device_id: Uuid,
+    device_id: Option<Uuid>,
 
     #[arg(long)]
-    password: String,
+    password: Option<String>,
 
-    #[arg(long, default_value = "vk")]
-    provider: String,
+    #[arg(long)]
+    provider: Option<String>,
 
-    /// Provider-specific JSON object.
-    #[arg(long, default_value = "{}")]
-    provider_data: String,
+    /// Transport selection: auto prefers direct WebRTC, turn forces the selected
+    /// provider relay, and jazz forces a SaluteJazz TURN-backed relay.
+    #[arg(long, value_parser = ["auto", "turn", "jazz"])]
+    transport: Option<String>,
+
+    /// Provider-specific JSON object. Jazz accepts {"join_link":"...","name":"..."};
+    /// join_link may be omitted to create a temporary guest call automatically.
+    #[arg(long)]
+    provider_data: Option<String>,
 
     /// Legacy local UDP/KCP-facing port. Ignored when --tun is enabled.
-    #[arg(long, default_value_t = DEFAULT_LOCAL_PORT)]
-    local_port: u16,
+    #[arg(long)]
+    local_port: Option<u16>,
 
     /// Create a real layer-3 TUN interface and tunnel raw IP packets instead of
     /// opening the legacy local UDP/KCP-facing socket.
@@ -44,20 +57,20 @@ struct Cli {
     tun: bool,
 
     /// TUN interface name. On Windows this is the Wintun adapter name.
-    #[arg(long, default_value = "tots0")]
-    tun_name: String,
+    #[arg(long)]
+    tun_name: Option<String>,
 
     /// IPv4 address assigned to the client TUN interface.
-    #[arg(long, default_value = "10.77.0.2")]
-    tun_address: Ipv4Addr,
+    #[arg(long)]
+    tun_address: Option<Ipv4Addr>,
 
     /// IPv4 prefix length assigned to the TUN interface.
-    #[arg(long, default_value_t = 24)]
-    tun_prefix: u8,
+    #[arg(long)]
+    tun_prefix: Option<u8>,
 
     /// TUN MTU. Keep this below the ToTS DataChannel message ceiling.
-    #[arg(long, default_value_t = 1300)]
-    tun_mtu: u16,
+    #[arg(long)]
+    tun_mtu: Option<u16>,
 
     /// Windows full-tunnel mode: pin the ToTS server through the original gateway and
     /// install 0.0.0.0/1 + 128.0.0.0/1 on the TUN interface. Requires Administrator.
@@ -65,16 +78,37 @@ struct Cli {
     tun_default_route: bool,
 
     /// DNS servers assigned to the Windows TUN adapter in --tun-default-route mode.
-    #[arg(long, value_delimiter = ',', default_value = "1.1.1.1,8.8.8.8")]
+    #[arg(long, value_delimiter = ',')]
     tun_dns: Vec<Ipv4Addr>,
 
-    #[arg(long, default_value_t = DEFAULT_WEBRTC_PORT)]
+    #[arg(long)]
+    webrtc_port: Option<u16>,
+
+    #[arg(long)]
+    turn_port: Option<u16>,
+
+    #[arg(long)]
+    connect_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCli {
+    server: String,
+    device_id: Uuid,
+    password: String,
+    provider: String,
+    transport: String,
+    provider_data: Value,
+    local_port: u16,
+    tun: bool,
+    tun_name: String,
+    tun_address: Ipv4Addr,
+    tun_prefix: u8,
+    tun_mtu: u16,
+    tun_default_route: bool,
+    tun_dns: Vec<Ipv4Addr>,
     webrtc_port: u16,
-
-    #[arg(long, default_value_t = DEFAULT_TURN_PORT)]
     turn_port: u16,
-
-    #[arg(long, default_value_t = 8)]
     connect_timeout_secs: u64,
 }
 
@@ -84,14 +118,29 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    let cli = Cli::parse();
-    let provider: Arc<dyn TurnProvider> = match cli.provider.as_str() {
+    let cli = resolve_cli(Cli::parse())?;
+    let transport_preference = match cli.transport.as_str() {
+        "auto" => TransportPreference::Auto,
+        "turn" | "jazz" => TransportPreference::ProviderRelay,
+        other => bail!("unsupported transport '{other}'"),
+    };
+    let effective_provider = if cli.transport == "jazz" {
+        "jazz"
+    } else {
+        cli.provider.as_str()
+    };
+    let provider: Arc<dyn TurnProvider> = match effective_provider {
         "vk" => {
-            let data: VkProviderData = serde_json::from_str(&cli.provider_data)
-                .context("parse --provider-data as VK JSON")?;
+            let data: VkProviderData = serde_json::from_value(cli.provider_data.clone())
+                .context("parse provider_data as VK JSON")?;
             Arc::new(VkProvider::new(data)?)
         }
-        other => bail!("unsupported provider '{other}'; this build contains only 'vk'"),
+        "jazz" => {
+            let data: JazzProviderData = serde_json::from_value(cli.provider_data.clone())
+                .context("parse provider_data as Jazz JSON")?;
+            Arc::new(JazzProvider::new(data)?)
+        }
+        other => bail!("unsupported provider '{other}'; supported providers are 'vk' and 'jazz'"),
     };
 
     let config = ClientConfig {
@@ -102,6 +151,7 @@ async fn main() -> Result<()> {
         password: cli.password.clone(),
         device_id: cli.device_id,
         connect_timeout: Duration::from_secs(cli.connect_timeout_secs),
+        transport_preference,
     };
 
     if cli.tun {
@@ -111,10 +161,112 @@ async fn main() -> Result<()> {
     }
 }
 
+fn resolve_cli(cli: Cli) -> Result<ResolvedCli> {
+    let uri_config = cli
+        .config
+        .as_deref()
+        .map(TotsConfig::from_uri)
+        .transpose()
+        .context("decode --config")?;
+
+    let server = cli
+        .server
+        .or_else(|| uri_config.as_ref().map(|c| c.server.clone()))
+        .context("--server is required unless --config is supplied")?;
+    let device_id = cli
+        .device_id
+        .or_else(|| uri_config.as_ref().map(|c| c.device_id))
+        .context("--device-id is required unless --config is supplied")?;
+    let password = cli
+        .password
+        .or_else(|| uri_config.as_ref().map(|c| c.password.clone()))
+        .context("--password is required unless --config is supplied")?;
+
+    let provider = cli
+        .provider
+        .or_else(|| uri_config.as_ref().map(|c| c.provider.clone()))
+        .unwrap_or_else(|| "vk".to_string());
+    let transport = cli
+        .transport
+        .or_else(|| uri_config.as_ref().map(|c| c.transport.clone()))
+        .unwrap_or_else(|| "auto".to_string());
+    let provider_data = match cli.provider_data {
+        Some(json) => serde_json::from_str(&json).context("parse --provider-data as JSON")?,
+        None => uri_config
+            .as_ref()
+            .map(|c| c.provider_data.clone())
+            .unwrap_or_else(|| Value::Object(Default::default())),
+    };
+
+    let local_port = cli
+        .local_port
+        .or_else(|| uri_config.as_ref().map(|c| c.local_port))
+        .unwrap_or(DEFAULT_LOCAL_PORT);
+    let tun = cli.tun || uri_config.as_ref().map(|c| c.tun).unwrap_or(false);
+    let tun_name = cli
+        .tun_name
+        .or_else(|| uri_config.as_ref().map(|c| c.tun_name.clone()))
+        .unwrap_or_else(|| "tots0".to_string());
+    let tun_address = cli
+        .tun_address
+        .or_else(|| uri_config.as_ref().map(|c| c.tun_address))
+        .unwrap_or_else(|| Ipv4Addr::new(10, 77, 0, 2));
+    let tun_prefix = cli
+        .tun_prefix
+        .or_else(|| uri_config.as_ref().map(|c| c.tun_prefix))
+        .unwrap_or(24);
+    let tun_mtu = cli
+        .tun_mtu
+        .or_else(|| uri_config.as_ref().map(|c| c.tun_mtu))
+        .unwrap_or(1300);
+    let tun_default_route =
+        cli.tun_default_route || uri_config.as_ref().map(|c| c.tun_default_route).unwrap_or(false);
+    let tun_dns = if cli.tun_dns.is_empty() {
+        uri_config
+            .as_ref()
+            .map(|c| c.tun_dns.clone())
+            .unwrap_or_else(|| vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)])
+    } else {
+        cli.tun_dns
+    };
+    let webrtc_port = cli
+        .webrtc_port
+        .or_else(|| uri_config.as_ref().map(|c| c.webrtc_port))
+        .unwrap_or(DEFAULT_WEBRTC_PORT);
+    let turn_port = cli
+        .turn_port
+        .or_else(|| uri_config.as_ref().map(|c| c.turn_port))
+        .unwrap_or(DEFAULT_TURN_PORT);
+    let connect_timeout_secs = cli
+        .connect_timeout_secs
+        .or_else(|| uri_config.as_ref().map(|c| c.connect_timeout_secs))
+        .unwrap_or(8);
+
+    Ok(ResolvedCli {
+        server,
+        device_id,
+        password,
+        provider,
+        transport,
+        provider_data,
+        local_port,
+        tun,
+        tun_name,
+        tun_address,
+        tun_prefix,
+        tun_mtu,
+        tun_default_route,
+        tun_dns,
+        webrtc_port,
+        turn_port,
+        connect_timeout_secs,
+    })
+}
+
 async fn run_tun(
     config: ClientConfig,
     provider: Arc<dyn TurnProvider>,
-    cli: &Cli,
+    cli: &ResolvedCli,
 ) -> Result<()> {
     if cli.tun_prefix == 0 || cli.tun_prefix > 32 {
         bail!("--tun-prefix must be between 1 and 32");
@@ -132,7 +284,7 @@ async fn run_tun(
 
     // Connect/authenticate first. This preserves the original invariant that
     // no local ingress is opened before the device_id has been accepted.
-    let mut session = tots_core::connect(&config, provider).await?;
+    let mut session = tots_core::connect_tun(&config, provider).await?;
 
     let tun = DeviceBuilder::new()
         .name(cli.tun_name.clone())
@@ -165,12 +317,13 @@ async fn run_tun(
         "ToTS TUN interface is up"
     );
     let route_guard = if cli.tun_default_route {
-        if session.transport_name() == "webrtc-over-turn" {
-            bail!(
-                "--tun-default-route currently supports the direct WebRTC transport only; TURN relay endpoints also need pinned host routes before full-tunnel takeover"
-            );
-        }
-        Some(FullTunnelRouteGuard::install(&cli.server, &cli.tun_name, cli.webrtc_port, &cli.tun_dns).await?)
+        Some(FullTunnelRouteGuard::install(
+            &cli.server,
+            &cli.tun_name,
+            cli.webrtc_port,
+            &cli.tun_dns,
+            session.route_exception_ipv4(),
+        ).await?)
     } else {
         info!(
             "no default route takeover requested; add destination routes manually or use --tun-default-route on Windows"
@@ -217,8 +370,7 @@ async fn run_tun(
 struct FullTunnelRouteGuard {
     tun_index: u32,
     original_index: u32,
-    server_ip: Ipv4Addr,
-    added_server_route: bool,
+    added_host_routes: Vec<Ipv4Addr>,
     added_low_half: bool,
     added_high_half: bool,
 }
@@ -228,7 +380,13 @@ struct FullTunnelRouteGuard;
 
 impl FullTunnelRouteGuard {
     #[cfg(windows)]
-    async fn install(server: &str, tun_name: &str, server_port: u16, dns_servers: &[Ipv4Addr]) -> Result<Self> {
+    async fn install(
+        server: &str,
+        tun_name: &str,
+        server_port: u16,
+        dns_servers: &[Ipv4Addr],
+        route_exceptions: &[Ipv4Addr],
+    ) -> Result<Self> {
         use tokio::net::lookup_host;
         use tokio::process::Command;
 
@@ -268,14 +426,19 @@ impl FullTunnelRouteGuard {
             .parse()
             .context("parse TUN interface index")?;
 
-        let server_prefix = format!("{server_ip}/32");
-        let added_server_route = add_windows_route(
-            &server_prefix,
-            original_index,
-            gateway.trim(),
-            1,
-        )
-        .await?;
+        let mut protected_ips = vec![server_ip];
+        protected_ips.extend_from_slice(route_exceptions);
+        protected_ips.sort();
+        protected_ips.dedup();
+
+        let mut added_host_routes = Vec::new();
+        for ip in &protected_ips {
+            let prefix = format!("{ip}/32");
+            if add_windows_route(&prefix, original_index, gateway.trim(), 1).await? {
+                added_host_routes.push(*ip);
+            }
+        }
+
         let added_low_half = add_windows_route("0.0.0.0/1", tun_index, "0.0.0.0", 5).await?;
         let added_high_half =
             add_windows_route("128.0.0.0/1", tun_index, "0.0.0.0", 5).await?;
@@ -301,6 +464,7 @@ impl FullTunnelRouteGuard {
             original_interface = original_index,
             tun_interface = tun_index,
             dns = ?dns,
+            pinned_ipv4 = ?protected_ips,
             "Windows full-tunnel IPv4 routes installed"
         );
 
@@ -311,15 +475,20 @@ impl FullTunnelRouteGuard {
         Ok(Self {
             tun_index,
             original_index,
-            server_ip,
-            added_server_route,
+            added_host_routes,
             added_low_half,
             added_high_half,
         })
     }
 
     #[cfg(not(windows))]
-    async fn install(_server: &str, _tun_name: &str, _server_port: u16, _dns_servers: &[Ipv4Addr]) -> Result<Self> {
+    async fn install(
+        _server: &str,
+        _tun_name: &str,
+        _server_port: u16,
+        _dns_servers: &[Ipv4Addr],
+        _route_exceptions: &[Ipv4Addr],
+    ) -> Result<Self> {
         bail!("--tun-default-route is currently implemented for Windows only")
     }
 
@@ -336,8 +505,8 @@ impl FullTunnelRouteGuard {
         if self.added_high_half {
             let _ = remove_windows_route("128.0.0.0/1", self.tun_index).await;
         }
-        if self.added_server_route {
-            let prefix = format!("{}/32", self.server_ip);
+        for ip in self.added_host_routes {
+            let prefix = format!("{ip}/32");
             let _ = remove_windows_route(&prefix, self.original_index).await;
         }
         info!("Windows full-tunnel routes removed");
