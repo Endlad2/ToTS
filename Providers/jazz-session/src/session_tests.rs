@@ -177,7 +177,10 @@ async fn serve(
                             match payload["method"].as_str() {
                                 Some("rtc:track:add") => {
                                     let cid = payload["addTrackRequest"]["cid"].as_str().ok_or("missing track cid")?;
-                                    if payload["addTrackRequest"]["type"] != "AUDIO" || payload["addTrackRequest"]["source"] != "MICROPHONE" || payload["addTrackRequest"]["muted"] != true {
+                                    if payload["addTrackRequest"]["type"] != "AUDIO"
+                                        || payload["addTrackRequest"]["source"] != "MICROPHONE"
+                                        || !payload["addTrackRequest"]["muted"].is_null()
+                                    {
                                         return Err("invalid published audio track".to_owned());
                                     }
                                     media_out(&mut socket, json!({"method":"rtc:track:published","trackPublishedResponse":{"cid":cid,"track":{"sid":"server-track","type":"AUDIO","source":"MICROPHONE","muted":true}}})).await?;

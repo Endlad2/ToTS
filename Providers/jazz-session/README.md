@@ -20,8 +20,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
 
-Крейт пока не опубликован на crates.io. В Cargo.toml указан Rust 1.89;
-проверки выполнены на Rust 1.99.1, Linux x86_64 и Windows x86_64 MSVC.
+Крейт пока не опубликован на crates.io. В Cargo.toml указан минимальный Rust 1.89.
 Cargo.lock включён для воспроизводимой сборки примеров и проверок.
 
 ## API
@@ -155,3 +154,11 @@ cargo run --locked --example live_check
 
 Лицензия исходников — MIT. Материалы из предоставленного архива приложения
 не включены в поставку.
+
+### Совместимость ICE с ToTS/Jazz
+
+Для текущего `webrtc = 0.17` медиасессия использует UDP/IPv4. Из списка Jazz
+принимаются STUN и `turn:` по UDP; `turn:?transport=tcp` и `turns:` не передаются
+ICE gatherer, поскольку этот backend их не обрабатывает. Это также исключает
+нерабочие IPv6/link-local кандидаты на Windows без IPv6-маршрута. Сама исходная
+ICE-конфигурация всё равно сохраняется в `webrtc.ice_servers` снимка сессии.

@@ -139,6 +139,28 @@ pub async fn connect_tun(
     connect_mode(config, provider, SessionMode::Tun).await
 }
 
+fn host_is_not_publicly_relayable(host: &str) -> bool {
+    let host = host.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let unwrapped = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let Ok(ip) = unwrapped.parse::<IpAddr>() else {
+        return false;
+    };
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_unspecified() || ip.is_loopback() || ip.is_private() || ip.is_link_local()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_unspecified() || ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+    }
+}
+
 async fn connect_mode(
     config: &ClientConfig,
     provider: Arc<dyn TurnProvider>,
@@ -195,6 +217,13 @@ async fn connect_mode(
         }
     } else {
         info!(provider = provider.name(), "provider relay forced; skipping direct WebRTC probe");
+    }
+
+    if provider.name() == "jazz" && host_is_not_publicly_relayable(&config.server) {
+        bail!(
+            "Jazz relay cannot reach ToTS server address {}. This config embeds a local/private server address; regenerate the tots:// config after starting tots-server with --stun or --public-host <PUBLIC_IP_OR_DNS>",
+            config.server
+        );
     }
 
     info!(provider = provider.name(), "requesting provider TURN credentials");
@@ -355,3 +384,17 @@ async fn resolve_relay_ipv4(creds: &TurnCredentials) -> Vec<Ipv4Addr> {
     result.sort();
     result
 }
+#[cfg(test)]
+mod relay_host_tests {
+    use super::host_is_not_publicly_relayable;
+
+    #[test]
+    fn jazz_preflight_detects_unreachable_literal_targets() {
+        assert!(host_is_not_publicly_relayable("127.0.0.1"));
+        assert!(host_is_not_publicly_relayable("10.0.0.5"));
+        assert!(host_is_not_publicly_relayable("localhost"));
+        assert!(!host_is_not_publicly_relayable("203.0.113.10"));
+        assert!(!host_is_not_publicly_relayable("vpn.example.test"));
+    }
+}
+

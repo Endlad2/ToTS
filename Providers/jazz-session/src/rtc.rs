@@ -4,11 +4,13 @@ use tokio::sync::{mpsc::UnboundedSender, Mutex};
 use webrtc::{
     api::{
         media_engine::{MediaEngine, MIME_TYPE_OPUS},
+        setting_engine::SettingEngine,
         APIBuilder,
     },
     ice::{
         candidate::candidate_base::unmarshal_candidate,
-        url::{SchemeType, Url},
+        network_type::NetworkType,
+        url::{ProtoType, SchemeType, Url},
     },
     ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
     peer_connection::{
@@ -42,7 +44,17 @@ impl Peer {
     ) -> Result<Self, MediaError> {
         let mut engine = MediaEngine::default();
         engine.register_default_codecs().map_err(|_| MediaError)?;
-        let api = APIBuilder::new().with_media_engine(engine).build();
+        let mut settings = SettingEngine::default();
+        // The Android Jazz client can use more transports, but webrtc-rs 0.17
+        // cannot gather TURN/TCP or TURN/TLS candidates reliably on Windows.
+        // Jazz always exposes UDP relay endpoints as well; keeping the ICE
+        // agent on UDP/IPv4 avoids bogus IPv6/link-local adapters (10049) and
+        // matches the transport we later reuse for the ToTS relay.
+        settings.set_network_types(vec![NetworkType::Udp4]);
+        let api = APIBuilder::new()
+            .with_media_engine(engine)
+            .with_setting_engine(settings)
+            .build();
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers: servers,
@@ -125,53 +137,70 @@ impl Peer {
 }
 
 fn configuration(value: &Value) -> Result<Vec<RTCIceServer>, MediaError> {
-    value
-        .as_array()
-        .ok_or(MediaError)?
-        .iter()
-        .map(|item| {
-            let object = item.as_object().ok_or(MediaError)?;
-            let mut urls = match object.get("urls") {
-                Some(Value::Array(items)) => items
-                    .iter()
-                    .map(|v| v.as_str().map(str::to_owned).ok_or(MediaError))
-                    .collect::<Result<Vec<_>, _>>()?,
-                Some(Value::String(value)) => vec![value.clone()],
-                None | Some(Value::Null) => Vec::new(),
-                _ => return Err(MediaError),
-            };
-            if let Some(value) = object.get("url").filter(|v| !v.is_null()) {
-                let url = value.as_str().ok_or(MediaError)?;
-                if !urls.iter().any(|item| item == url) {
-                    urls.push(url.to_owned());
-                }
+    let entries = value.as_array().ok_or(MediaError)?;
+    let mut result = Vec::new();
+
+    for item in entries {
+        let object = item.as_object().ok_or(MediaError)?;
+        let mut raw_urls = match object.get("urls") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| v.as_str().map(str::to_owned).ok_or(MediaError))
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(Value::String(value)) => vec![value.clone()],
+            None | Some(Value::Null) => Vec::new(),
+            _ => return Err(MediaError),
+        };
+        if let Some(value) = object.get("url").filter(|v| !v.is_null()) {
+            let url = value.as_str().ok_or(MediaError)?;
+            if !raw_urls.iter().any(|item| item == url) {
+                raw_urls.push(url.to_owned());
             }
-            if urls.is_empty() {
+        }
+
+        let string = |key: &str| -> Result<String, MediaError> {
+            match object.get(key) {
+                None | Some(Value::Null) => Ok(String::new()),
+                Some(Value::String(value)) => Ok(value.clone()),
+                _ => Err(MediaError),
+            }
+        };
+        let username = string("username")?;
+        let credential = string("credential")?;
+
+        let mut urls = Vec::new();
+        for raw in raw_urls {
+            let parsed = Url::parse_url(&raw).map_err(|_| MediaError)?;
+            let supported = if parsed.scheme == SchemeType::Stun {
+                true
+            } else if parsed.scheme == SchemeType::Turn {
+                parsed.proto == ProtoType::Udp
+            } else {
+                // webrtc-rs 0.17 logs "Unable to handle URL" for TURN/TCP and
+                // TURN/TLS. Jazz provides UDP TURN alongside these URLs.
+                false
+            };
+            if !supported {
+                continue;
+            }
+            if parsed.scheme == SchemeType::Turn
+                && (username.is_empty() || credential.is_empty())
+            {
                 return Err(MediaError);
             }
-            let string = |key: &str| -> Result<String, MediaError> {
-                match object.get(key) {
-                    None | Some(Value::Null) => Ok(String::new()),
-                    Some(Value::String(value)) => Ok(value.clone()),
-                    _ => Err(MediaError),
-                }
-            };
-            let server = RTCIceServer {
+            urls.push(raw);
+        }
+
+        if !urls.is_empty() {
+            result.push(RTCIceServer {
                 urls,
-                username: string("username")?,
-                credential: string("credential")?,
-            };
-            for url in &server.urls {
-                let parsed = Url::parse_url(url).map_err(|_| MediaError)?;
-                if matches!(parsed.scheme, SchemeType::Turn | SchemeType::Turns)
-                    && (server.username.is_empty() || server.credential.is_empty())
-                {
-                    return Err(MediaError);
-                }
-            }
-            Ok(server)
-        })
-        .collect()
+                username,
+                credential,
+            });
+        }
+    }
+
+    Ok(result)
 }
 
 pub(crate) struct Media {
@@ -394,6 +423,29 @@ mod tests {
         );
         remote.close().await;
         local.close().await;
+    }
+
+    #[test]
+    fn jazz_ice_configuration_keeps_only_webrtc_rs_supported_urls() {
+        let servers = configuration(&json!([{
+            "urls": [
+                "stun:stun.example.test:3478",
+                "turn:relay.example.test:3478?transport=udp",
+                "turn:relay.example.test:3478?transport=tcp",
+                "turns:relay.example.test:443?transport=tcp"
+            ],
+            "username": "u",
+            "credential": "p"
+        }]))
+        .unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0].urls,
+            vec![
+                "stun:stun.example.test:3478".to_string(),
+                "turn:relay.example.test:3478?transport=udp".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

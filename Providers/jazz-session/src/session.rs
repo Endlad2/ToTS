@@ -164,6 +164,7 @@ pub(crate) async fn establish(call: CallInfo, timeout: Duration) -> Result<CallS
         publisher_answer: false,
         subscriber_answer: false,
         turn_configured: false,
+        rtc_joined: false,
         pending: VecDeque::new(),
         servers: None,
         ping_interval: Duration::ZERO,
@@ -225,6 +226,7 @@ struct Worker {
     publisher_answer: bool,
     subscriber_answer: bool,
     turn_configured: bool,
+    rtc_joined: bool,
     pending: VecDeque<Value>,
     servers: Option<Value>,
     ping_interval: Duration,
@@ -368,6 +370,7 @@ impl Worker {
                     self.ping_timeout = seconds(&join["pingTimeout"])?;
                     self.next_ping = Instant::now() + self.ping_interval;
                     self.state.write().await["rtc_join"] = join.clone();
+                    self.rtc_joined = true;
                 }
                 Some("rtc:pong") => {
                     if let Some(value) = payload.pointer("/pong_resp/lastPingTimestamp") {
@@ -393,16 +396,24 @@ impl Worker {
             }
         }
         if self.joined && self.media.read().await.is_some() {
-            if !self.track_requested {
+            // The real Jazz client waits for rtc:join before publishing its
+            // first media track. Its MediaTrackAddEntity contains cid/type/source
+            // (plus optional video/simulcast fields); "muted" is not a field of
+            // addTrackRequest and must not be injected here.
+            if self.rtc_joined && !self.track_requested {
                 self.track_requested = true;
                 self.send_media(json!({"method":"rtc:track:add","addTrackRequest":{
-                    "cid":self.track_cid,"type":"AUDIO","source":"MICROPHONE","muted":true}}))
+                    "cid":self.track_cid,"type":"AUDIO","source":"MICROPHONE"}}))
                     .await?;
             }
             while let Some(payload) = self.pending.pop_front() {
                 self.process_media(payload).await?;
             }
-            if self.publisher_answer && self.subscriber_answer && self.turn_configured {
+            if self.rtc_joined
+                && self.publisher_answer
+                && self.subscriber_answer
+                && self.turn_configured
+            {
                 if let Some(ready) = self.ready.take() {
                     self.state.write().await["status"] = json!("ready");
                     let _ = ready.send(());
@@ -493,9 +504,22 @@ fn has_turn_credentials(servers: &Value) -> bool {
         servers.iter().any(|server| {
             let populated = |key: &str| server[key].as_str().is_some_and(|value| !value.is_empty());
             let is_turn = |value: &Value| {
-                value
-                    .as_str()
-                    .is_some_and(|url| url.starts_with("turn:") || url.starts_with("turns:"))
+                value.as_str().is_some_and(|url| {
+                    let url = url.trim();
+                    if !url.starts_with("turn:") {
+                        return false;
+                    }
+                    let transport = url
+                        .split_once('?')
+                        .map(|(_, query)| query)
+                        .unwrap_or("")
+                        .split('&')
+                        .find_map(|part| part.strip_prefix("transport="));
+                    match transport {
+                        None => true,
+                        Some(value) => value.eq_ignore_ascii_case("udp"),
+                    }
+                })
             };
             populated("username")
                 && populated("credential")

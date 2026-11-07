@@ -153,9 +153,16 @@ impl TurnTransport {
 }
 
 async fn resolve_one(host: &str, port: u16) -> Result<SocketAddr> {
-    lookup_host((host, port))
+    let mut addrs: Vec<SocketAddr> = lookup_host((host, port))
         .await
         .with_context(|| format!("resolve {host}:{port}"))?
+        .collect();
+    // Jazz currently advertises hostnames with both address families while a
+    // sizeable number of Windows clients have no usable IPv6 route. Prefer an
+    // IPv4 endpoint, then fall back to IPv6 only when IPv4 is unavailable.
+    addrs.sort_by_key(|addr| addr.is_ipv6());
+    addrs
+        .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no address for {host}:{port}"))
 }

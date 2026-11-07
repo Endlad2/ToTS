@@ -139,6 +139,8 @@ struct AppState {
     state_file: PathBuf,
     public_host: String,
     stun_server: Option<String>,
+    config_stun_server: String,
+    config_stun_timeout: std::time::Duration,
     webrtc_port: u16,
     turn_port: u16,
     backend: SocketAddr,
@@ -292,6 +294,8 @@ async fn main() -> Result<()> {
         state_file: cli.state_file,
         public_host,
         stun_server: cli.stun.then(|| cli.stun_server.clone()),
+        config_stun_server: cli.stun_server.clone(),
+        config_stun_timeout: std::time::Duration::from_secs(cli.stun_timeout_secs),
         webrtc_port: cli.webrtc_port,
         turn_port: cli.turn_port,
         backend: cli.backend,
@@ -374,17 +378,74 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+fn host_is_not_publicly_relayable(host: &str) -> bool {
+    let host = host.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let unwrapped = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let Ok(ip) = unwrapped.parse::<IpAddr>() else {
+        // A DNS name can resolve to a public address. Leave it intact.
+        return false;
+    };
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_unspecified() || ip.is_loopback() || ip.is_private() || ip.is_link_local()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_unspecified() || ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+    }
+}
+
 async fn create_config(
     State(state): State<AppState>,
     Json(req): Json<CreateConfigRequest>,
 ) -> Result<String, (StatusCode, String)> {
+    let jazz_relay = req.provider.eq_ignore_ascii_case("jazz")
+        || req.transport.eq_ignore_ascii_case("jazz");
+    let server = if jazz_relay && host_is_not_publicly_relayable(&state.public_host) {
+        let public_ip = stun::discover_public_ip(
+            &state.config_stun_server,
+            state.config_stun_timeout,
+        )
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Jazz relay requires a public ToTS server address, but automatic STUN discovery failed: {err}. Start tots-server with --public-host <PUBLIC_IP_OR_DNS> or --stun"
+                ),
+            )
+        })?;
+        if host_is_not_publicly_relayable(&public_ip.to_string()) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Jazz relay requires a public ToTS server address; STUN returned {public_ip}. Start tots-server with --public-host <PUBLIC_IP_OR_DNS>"
+                ),
+            ));
+        }
+        info!(
+            configured_host = %state.public_host,
+            public_ip = %public_ip,
+            "auto-discovered public ToTS address for Jazz config"
+        );
+        public_ip.to_string()
+    } else {
+        state.public_host.clone()
+    };
+
     let device_id = Uuid::new_v4();
     state.devices.write().await.insert(device_id);
     save_devices(&state).await.map_err(internal_server_error)?;
 
     let config = TotsConfig {
         version: TOTS_CONFIG_VERSION,
-        server: state.public_host.clone(),
+        server,
         device_id,
         password: state.master_password.clone(),
         provider: req.provider,
@@ -1001,5 +1062,19 @@ fn random_password() -> String {
         .take(32)
         .map(char::from)
         .collect()
+}
+#[cfg(test)]
+mod config_host_tests {
+    use super::host_is_not_publicly_relayable;
+
+    #[test]
+    fn jazz_config_rejects_local_targets_but_keeps_public_hosts() {
+        for host in ["127.0.0.1", "0.0.0.0", "192.168.1.10", "169.254.1.2", "localhost", "::1", "[::1]", "fd00::1", "fe80::1"] {
+            assert!(host_is_not_publicly_relayable(host), "{host}");
+        }
+        for host in ["203.0.113.10", "198.51.100.20", "vpn.example.test"] {
+            assert!(!host_is_not_publicly_relayable(host), "{host}");
+        }
+    }
 }
 
