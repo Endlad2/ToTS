@@ -1087,6 +1087,7 @@ name = "jazz-session"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "base64 0.22.1",
  "futures-util",
  "reqwest",

@@ -111,6 +111,14 @@ struct Cli {
 struct PersistentState {
     master_password: String,
     devices: HashSet<Uuid>,
+    #[serde(default)]
+    jazz_rooms: HashMap<Uuid, JazzRoomRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JazzRoomRecord {
+    join_link: String,
+    server_name: String,
 }
 
 impl PersistentState {
@@ -118,6 +126,7 @@ impl PersistentState {
         Self {
             master_password: random_password(),
             devices: HashSet::new(),
+            jazz_rooms: HashMap::new(),
         }
     }
 }
@@ -139,14 +148,14 @@ struct AppState {
     state_file: PathBuf,
     public_host: String,
     stun_server: Option<String>,
-    config_stun_server: String,
-    config_stun_timeout: std::time::Duration,
     webrtc_port: u16,
     turn_port: u16,
     backend: SocketAddr,
     tun_gateway: Arc<Mutex<Option<TunGateway>>>,
     tun_gateway_config: TunGatewayConfig,
     peers: Arc<Mutex<Vec<Arc<dyn PeerConnection>>>>,
+    jazz_rooms: Arc<RwLock<HashMap<Uuid, JazzRoomRecord>>>,
+    jazz_tasks: Arc<Mutex<HashMap<Uuid, tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +295,7 @@ async fn main() -> Result<()> {
 
     let persisted = load_or_create_state(&cli.state_file)?;
     persist_state(&cli.state_file, &persisted)?;
+    let persisted_jazz_rooms = persisted.jazz_rooms.clone();
 
     let state = AppState {
         cipher: PacketCipher::new(&persisted.master_password),
@@ -294,15 +304,19 @@ async fn main() -> Result<()> {
         state_file: cli.state_file,
         public_host,
         stun_server: cli.stun.then(|| cli.stun_server.clone()),
-        config_stun_server: cli.stun_server.clone(),
-        config_stun_timeout: std::time::Duration::from_secs(cli.stun_timeout_secs),
         webrtc_port: cli.webrtc_port,
         turn_port: cli.turn_port,
         backend: cli.backend,
         tun_gateway: Arc::new(Mutex::new(tun_gateway)),
         tun_gateway_config,
         peers: Arc::new(Mutex::new(Vec::new())),
+        jazz_rooms: Arc::new(RwLock::new(persisted_jazz_rooms.clone())),
+        jazz_tasks: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    for (device_id, room) in persisted_jazz_rooms {
+        spawn_jazz_reconnect(state.clone(), device_id, room).await;
+    }
 
     let management_state = state.clone();
     let management_addr = SocketAddr::new(cli.api_bind, cli.api_port);
@@ -350,6 +364,9 @@ async fn main() -> Result<()> {
     for peer in peers {
         let _ = peer.close().await;
     }
+    for (_, task) in std::mem::take(&mut *state.jazz_tasks.lock().await) {
+        task.abort();
+    }
 
     Ok(())
 }
@@ -378,78 +395,84 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-fn host_is_not_publicly_relayable(host: &str) -> bool {
-    let host = host.trim();
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let unwrapped = host
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host);
-    let Ok(ip) = unwrapped.parse::<IpAddr>() else {
-        // A DNS name can resolve to a public address. Leave it intact.
-        return false;
-    };
-    match ip {
-        IpAddr::V4(ip) => {
-            ip.is_unspecified() || ip.is_loopback() || ip.is_private() || ip.is_link_local()
-        }
-        IpAddr::V6(ip) => {
-            ip.is_unspecified() || ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
-        }
-    }
-}
 
 async fn create_config(
     State(state): State<AppState>,
     Json(req): Json<CreateConfigRequest>,
 ) -> Result<String, (StatusCode, String)> {
-    let jazz_relay = req.provider.eq_ignore_ascii_case("jazz")
+    let device_id = Uuid::new_v4();
+    let jazz_transport = req.provider.eq_ignore_ascii_case("jazz")
         || req.transport.eq_ignore_ascii_case("jazz");
-    let server = if jazz_relay && host_is_not_publicly_relayable(&state.public_host) {
-        let public_ip = stun::discover_public_ip(
-            &state.config_stun_server,
-            state.config_stun_timeout,
-        )
-        .await
-        .map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "Jazz relay requires a public ToTS server address, but automatic STUN discovery failed: {err}. Start tots-server with --public-host <PUBLIC_IP_OR_DNS> or --stun"
-                ),
-            )
-        })?;
-        if host_is_not_publicly_relayable(&public_ip.to_string()) {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "Jazz relay requires a public ToTS server address; STUN returned {public_ip}. Start tots-server with --public-host <PUBLIC_IP_OR_DNS>"
-                ),
-            ));
-        }
-        info!(
-            configured_host = %state.public_host,
-            public_ip = %public_ip,
-            "auto-discovered public ToTS address for Jazz config"
-        );
-        public_ip.to_string()
+    // `--transport jazz` is itself a provider selection on the client. Emit a
+    // self-consistent URI even when the request omitted `provider: jazz`.
+    let provider = if req.transport.eq_ignore_ascii_case("jazz") {
+        "jazz".to_string()
     } else {
-        state.public_host.clone()
+        req.provider.clone()
     };
 
-    let device_id = Uuid::new_v4();
-    state.devices.write().await.insert(device_id);
-    save_devices(&state).await.map_err(internal_server_error)?;
+    let mut provider_data = req.provider_data;
+    let mut created_jazz_session = None;
+    let mut jazz_record = None;
+
+    if jazz_transport {
+        let object = provider_data.as_object_mut().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Jazz provider_data must be a JSON object".to_string(),
+            )
+        })?;
+        let server_name = format!("ToTS server {}", &device_id.to_string()[..8]);
+        let session = jazz_session::create_call(&server_name)
+            .await
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("cannot create SaluteJazz room for config: {err}"),
+                )
+            })?;
+        // Do not hand a client an invite until the server side has an actual
+        // usable Jazz data channel. This removes a race where the first ToTS
+        // Probe could be published before the server participant was ready.
+        let server_data = session.data_plane().await.map_err(|err| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("SaluteJazz room has no server data plane: {err}"),
+            )
+        })?;
+        server_data
+            .wait_ready(std::time::Duration::from_secs(20))
+            .await
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("SaluteJazz server data channel did not open: {err}"),
+                )
+            })?;
+        let join_link = session.join_url().to_string();
+        object.insert("join_link".to_string(), Value::String(join_link.clone()));
+        if !object.get("name").is_some_and(|value| {
+            value.as_str().is_some_and(|value| !value.trim().is_empty())
+        }) {
+            object.insert(
+                "name".to_string(),
+                Value::String(format!("ToTS client {}", &device_id.to_string()[..8])),
+            );
+        }
+        jazz_record = Some(JazzRoomRecord {
+            join_link,
+            server_name,
+        });
+        created_jazz_session = Some(session);
+    }
 
     let config = TotsConfig {
         version: TOTS_CONFIG_VERSION,
-        server,
+        server: state.public_host.clone(),
         device_id,
         password: state.master_password.clone(),
-        provider: req.provider,
-        provider_data: req.provider_data,
+        provider,
+        provider_data,
         transport: req.transport,
         local_port: req.local_port,
         tun: req.tun,
@@ -463,8 +486,23 @@ async fn create_config(
         turn_port: state.turn_port,
         connect_timeout_secs: req.connect_timeout_secs,
     };
+    let uri = config.to_uri().map_err(internal_server_error)?;
 
-    config.to_uri().map_err(internal_server_error)
+    state.devices.write().await.insert(device_id);
+    if let Some(record) = jazz_record {
+        state.jazz_rooms.write().await.insert(device_id, record);
+    }
+    if let Err(err) = save_devices(&state).await {
+        state.devices.write().await.remove(&device_id);
+        state.jazz_rooms.write().await.remove(&device_id);
+        return Err(internal_server_error(err));
+    }
+
+    if let Some(session) = created_jazz_session {
+        spawn_jazz_session(state.clone(), device_id, session).await;
+    }
+
+    Ok(uri)
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<DevicesResponse> {
@@ -481,6 +519,10 @@ async fn delete_config(
     if !removed {
         return Err((StatusCode::NOT_FOUND, "unknown device_id".to_string()));
     }
+    state.jazz_rooms.write().await.remove(&device_id);
+    if let Some(task) = state.jazz_tasks.lock().await.remove(&device_id) {
+        task.abort();
+    }
     save_devices(&state).await.map_err(internal_server_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -489,6 +531,7 @@ async fn save_devices(state: &AppState) -> Result<()> {
     let snapshot = PersistentState {
         master_password: state.master_password.clone(),
         devices: state.devices.read().await.clone(),
+        jazz_rooms: state.jazz_rooms.read().await.clone(),
     };
     let json = serde_json::to_vec_pretty(&snapshot)?;
     tokio::fs::write(&state.state_file, json).await?;
@@ -497,6 +540,249 @@ async fn save_devices(state: &AppState) -> Result<()> {
 
 fn internal_server_error(err: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+}
+
+
+async fn spawn_jazz_session(
+    state: AppState,
+    device_id: Uuid,
+    initial_session: jazz_session::CallSession,
+) {
+    let Some(record) = state.jazz_rooms.read().await.get(&device_id).cloned() else {
+        return;
+    };
+    spawn_jazz_task(state, device_id, record, Some(initial_session)).await;
+}
+
+async fn spawn_jazz_reconnect(state: AppState, device_id: Uuid, record: JazzRoomRecord) {
+    spawn_jazz_task(state, device_id, record, None).await;
+}
+
+async fn spawn_jazz_task(
+    state: AppState,
+    device_id: Uuid,
+    record: JazzRoomRecord,
+    initial_session: Option<jazz_session::CallSession>,
+) {
+    if let Some(old) = state.jazz_tasks.lock().await.remove(&device_id) {
+        old.abort();
+    }
+
+    let bridge_state = state.clone();
+    let task = tokio::spawn(async move {
+        let mut initial_session = initial_session;
+        loop {
+            if !bridge_state.devices.read().await.contains(&device_id) {
+                return;
+            }
+
+            let session = if let Some(session) = initial_session.take() {
+                Ok(session)
+            } else {
+                jazz_session::join_call(&record.join_link, &record.server_name).await
+            };
+
+            match session {
+                Ok(session) => {
+                    if let Err(err) = run_jazz_session(bridge_state.clone(), device_id, session).await {
+                        warn!(%device_id, %err, "Jazz room transport ended; reconnecting");
+                    }
+                }
+                Err(err) => {
+                    warn!(%device_id, %err, "cannot join persisted Jazz room; retrying");
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
+    state.jazz_tasks.lock().await.insert(device_id, task);
+}
+
+async fn run_jazz_session(
+    state: AppState,
+    device_id: Uuid,
+    session: jazz_session::CallSession,
+) -> Result<()> {
+    let data = session.data_plane().await.context("get Jazz data plane")?;
+    data.wait_ready(std::time::Duration::from_secs(30))
+        .await
+        .context("wait for Jazz reliable data channel")?;
+    info!(%device_id, "Jazz room data transport is ready");
+    let result = serve_jazz_data_plane(state, device_id, data).await;
+    let _ = session.close().await;
+    result
+}
+
+async fn serve_jazz_data_plane(
+    state: AppState,
+    expected_device_id: Uuid,
+    data: jazz_session::JazzDataPlane,
+) -> Result<()> {
+    let backend: Arc<Mutex<Option<Arc<UdpSocket>>>> = Arc::new(Mutex::new(None));
+    let tun_session: Arc<Mutex<Option<(TunGateway, mpsc::Sender<Vec<u8>>)>>> =
+        Arc::new(Mutex::new(None));
+
+    loop {
+        let packet = data.recv().await.context("receive Jazz ToTS packet")?;
+        let frame = match state.cipher.open(&packet) {
+            Ok(frame) => frame,
+            Err(err) => {
+                warn!(%expected_device_id, %err, "discarding undecryptable Jazz DataPacket");
+                continue;
+            }
+        };
+
+        match frame {
+            Frame::Probe { nonce, .. } => {
+                send_jazz_frame(
+                    &data,
+                    &state.cipher,
+                    Frame::ProbeAck {
+                        version: PROTOCOL_VERSION,
+                        nonce,
+                    },
+                )
+                .await?;
+            }
+            Frame::Auth { device_id } => {
+                let valid = device_id == expected_device_id
+                    && state.devices.read().await.contains(&device_id);
+                if valid {
+                    *tun_session.lock().await = None;
+                    let sock = UdpSocket::bind("0.0.0.0:0").await?;
+                    sock.connect(state.backend).await?;
+                    let sock = Arc::new(sock);
+                    *backend.lock().await = Some(sock.clone());
+                    spawn_backend_to_jazz(sock, data.clone(), state.cipher.clone());
+                }
+                send_jazz_frame(
+                    &data,
+                    &state.cipher,
+                    Frame::AuthResult {
+                        ok: valid,
+                        message: if valid {
+                            "ok".to_string()
+                        } else {
+                            "invalid device_id for this Jazz room".to_string()
+                        },
+                    },
+                )
+                .await?;
+            }
+            Frame::AuthTun { device_id } => {
+                let valid_device = device_id == expected_device_id
+                    && state.devices.read().await.contains(&device_id);
+                let (ok, message) = if !valid_device {
+                    (false, "invalid device_id for this Jazz room".to_string())
+                } else {
+                    match ensure_tun_gateway(&state).await {
+                        Ok(gateway) => {
+                            *backend.lock().await = None;
+                            let (return_tx, return_rx) = mpsc::channel::<Vec<u8>>(1024);
+                            *tun_session.lock().await = Some((gateway, return_tx));
+                            spawn_tun_to_jazz(return_rx, data.clone(), state.cipher.clone());
+                            (true, "ok".to_string())
+                        }
+                        Err(err) => {
+                            warn!(%expected_device_id, %err, "cannot start TUN gateway for Jazz client");
+                            (false, format!("server TUN gateway unavailable: {err}"))
+                        }
+                    }
+                };
+                send_jazz_frame(
+                    &data,
+                    &state.cipher,
+                    Frame::AuthResult { ok, message },
+                )
+                .await?;
+            }
+            Frame::Data { payload } => {
+                if let Some((gateway, return_tx)) = tun_session.lock().await.clone() {
+                    if let Err(err) = gateway.forward_from_client(&payload, return_tx).await {
+                        warn!(%expected_device_id, %err, "discarding invalid Jazz TUN payload");
+                    }
+                } else if let Some(sock) = backend.lock().await.clone() {
+                    if let Err(err) = sock.send(&payload).await {
+                        if err.kind() == std::io::ErrorKind::ConnectionRefused {
+                            warn!(%expected_device_id, %err, "backend temporarily refused Jazz payload; keeping room alive");
+                            continue;
+                        }
+                        return Err(err.into());
+                    }
+                }
+            }
+            Frame::Ping { nonce } => {
+                send_jazz_frame(&data, &state.cipher, Frame::Pong { nonce }).await?;
+            }
+            Frame::ProbeAck { .. }
+            | Frame::SignalOffer { .. }
+            | Frame::SignalAnswer { .. }
+            | Frame::AuthResult { .. }
+            | Frame::Pong { .. } => {}
+        }
+    }
+}
+
+fn spawn_tun_to_jazz(
+    mut packets: mpsc::Receiver<Vec<u8>>,
+    data: jazz_session::JazzDataPlane,
+    cipher: PacketCipher,
+) {
+    tokio::spawn(async move {
+        while let Some(payload) = packets.recv().await {
+            if let Err(err) = send_jazz_frame(&data, &cipher, Frame::Data { payload }).await {
+                warn!(%err, "failed to return server TUN packet over Jazz");
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_backend_to_jazz(
+    backend: Arc<UdpSocket>,
+    data: jazz_session::JazzDataPlane,
+    cipher: PacketCipher,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 16_000];
+        loop {
+            match backend.recv(&mut buf).await {
+                Ok(n) => {
+                    if let Err(err) = send_jazz_frame(
+                        &data,
+                        &cipher,
+                        Frame::Data {
+                            payload: buf[..n].to_vec(),
+                        },
+                    )
+                    .await
+                    {
+                        warn!(%err, "failed to return backend packet over Jazz");
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    warn!(%err, "backend temporarily refused UDP; keeping Jazz return path alive");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    warn!(%err, "backend receive failed for Jazz session");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+async fn send_jazz_frame(
+    data: &jazz_session::JazzDataPlane,
+    cipher: &PacketCipher,
+    frame: Frame,
+) -> Result<()> {
+    let packet = cipher.seal(&frame)?;
+    data.send(&packet).await.context("send Jazz ToTS packet")?;
+    Ok(())
 }
 
 async fn ensure_tun_gateway(state: &AppState) -> Result<TunGateway> {
@@ -1063,18 +1349,3 @@ fn random_password() -> String {
         .map(char::from)
         .collect()
 }
-#[cfg(test)]
-mod config_host_tests {
-    use super::host_is_not_publicly_relayable;
-
-    #[test]
-    fn jazz_config_rejects_local_targets_but_keeps_public_hosts() {
-        for host in ["127.0.0.1", "0.0.0.0", "192.168.1.10", "169.254.1.2", "localhost", "::1", "[::1]", "fd00::1", "fe80::1"] {
-            assert!(host_is_not_publicly_relayable(host), "{host}");
-        }
-        for host in ["203.0.113.10", "198.51.100.20", "vpn.example.test"] {
-            assert!(!host_is_not_publicly_relayable(host), "{host}");
-        }
-    }
-}
-

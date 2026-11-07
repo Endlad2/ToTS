@@ -20,3 +20,4 @@ tun-rs.workspace = true
 uuid.workspace = true
 webrtc.workspace = true
 tots-core = { path = "../tots-core" }
+jazz-session = { path = "../Providers/jazz-session" }

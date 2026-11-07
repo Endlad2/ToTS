@@ -1543,6 +1543,7 @@ name = "jazz-session"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "base64 0.22.1",
  "futures-util",
  "reqwest",
@@ -3510,6 +3511,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tots-core",
+ "url",
 ]
 
 [[package]]
@@ -3537,6 +3539,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "jazz-session",
  "rand 0.8.8",
  "serde",
  "serde_json",

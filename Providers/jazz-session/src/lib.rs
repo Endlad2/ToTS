@@ -9,7 +9,7 @@ mod snapshot;
 
 pub use error::{Error, Result};
 pub use http::HttpError;
-pub use session::CallSession;
+pub use session::{CallSession, JazzDataPlane};
 
 /// Создать гостевую встречу и получить её живую медиасессию.
 pub async fn create_call(name: &str) -> Result<CallSession> {

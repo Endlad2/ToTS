@@ -38,7 +38,7 @@ struct Cli {
     provider: Option<String>,
 
     /// Transport selection: auto prefers direct WebRTC, turn forces the selected
-    /// provider relay, and jazz forces a SaluteJazz TURN-backed relay.
+    /// provider relay, and jazz forces the SaluteJazz room/SFU data transport.
     #[arg(long, value_parser = ["auto", "turn", "jazz"])]
     transport: Option<String>,
 

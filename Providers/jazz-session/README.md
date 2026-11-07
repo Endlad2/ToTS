@@ -1,8 +1,9 @@
 # jazz-session
 
 Rust-библиотека для создания гостевой встречи SaluteJazz и входа по ссылке.
-Возвращает живую сессию и JSON с приглашением, TURN-кредами, полными SDP,
-ICE-кандидатами и параметрами ICE/DTLS для publisher и subscriber.
+Возвращает живую сессию, двунаправленный LiveKit/Jazz `_reliable` data plane и
+JSON с приглашением, ICE/TURN-конфигурацией, полными SDP, ICE-кандидатами и
+параметрами ICE/DTLS для publisher и subscriber.
 
 Это самостоятельная реализация гостевого протокола, без браузера, Node.js,
 официального SDK и ключа SDK. Камера и микрофон не открываются. Для переговоров
@@ -44,6 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let guest_data = guest.json().await;
     let _json_string = serde_json::to_string(&guest_data)?;
 
+    // `_reliable` data channel uses LiveKit DataPacket framing internally.
+    let guest_plane = guest.data_plane().await?;
+    guest_plane.wait_ready(std::time::Duration::from_secs(10)).await?;
+    guest_plane.send(b"hello").await?;
+
     // Сохраните оба объекта, пока используете соответствующие медиасессии.
     let guest_close = guest.close().await;
     let creator_close = creator.close().await;
@@ -58,6 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `join_call(link: &str, name: &str) -> Result<CallSession>` делает тот же вход
   в существующую встречу по HTTPS-приглашению с `psw`.
 - `session.json().await -> serde_json::Value` возвращает текущий снимок.
+- `session.data_plane().await -> Result<JazzDataPlane>` открывает доступ к
+  `_reliable` data channel; `send()`/`recv()` автоматически кодируют и декодируют
+  LiveKit `DataPacket`/`UserPacket` protobuf.
 - `session.close().await -> Result<()>` отправляет `leave` и закрывает
   WebSocket, publisher и subscriber. Метод потребляет объект сессии.
 - `Drop` инициирует такое же завершение в фоне. Для гарантированного ожидания
@@ -147,7 +156,9 @@ cargo run --locked --example live_check
 Поддерживается текущий гостевой протокол SaluteJazz. Это не официальный API
 со стабильным контрактом: изменение протокола сервиса может потребовать правок.
 Гостевой доступ должен быть разрешён; авторизация аккаунтом, комнаты ожидания,
-старый signaling без `connectorUrl`, передача звука/видео и VPN не реализованы.
+старый signaling без `connectorUrl` и передача пользовательского звука/видео не
+реализованы. VPN-логика находится выше уровнем в ToTS; этот крейт предоставляет
+только Jazz signaling/WebRTC/data-plane.
 При изменении сервером ICE/TURN-конфигурации активная сессия завершится с
 понятной ошибкой: для новых credentials требуется повторный `join_call`.
 Автоматического переподключения нет.

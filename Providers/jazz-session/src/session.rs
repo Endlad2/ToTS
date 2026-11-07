@@ -1,4 +1,4 @@
-use crate::{rtc::Media, snapshot::sdp_parameters, Error, Result};
+use crate::{rtc::{DataPlane, Media}, snapshot::sdp_parameters, Error, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
@@ -35,8 +35,30 @@ type MediaSlot = Arc<RwLock<Option<Arc<Media>>>>;
 pub struct CallSession {
     state: Arc<RwLock<Value>>,
     media: MediaSlot,
+    join_url: String,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<()>>>,
+}
+
+/// Bidirectional Jazz/LiveKit reliable data plane. Payloads are automatically
+/// wrapped/unwrapped as LiveKit DataPacket protobuf messages.
+#[derive(Clone)]
+pub struct JazzDataPlane {
+    inner: DataPlane,
+}
+
+impl JazzDataPlane {
+    pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
+        self.inner.wait_ready(timeout).await.map_err(Into::into)
+    }
+
+    pub async fn send(&self, payload: &[u8]) -> Result<()> {
+        self.inner.send(payload).await.map_err(Into::into)
+    }
+
+    pub async fn recv(&self) -> Result<Vec<u8>> {
+        self.inner.recv().await.map_err(Into::into)
+    }
 }
 
 impl fmt::Debug for CallSession {
@@ -46,6 +68,25 @@ impl fmt::Debug for CallSession {
 }
 
 impl CallSession {
+    /// Ссылка-приглашение этой комнаты. Это секрет: она содержит пароль комнаты.
+    pub fn join_url(&self) -> &str {
+        &self.join_url
+    }
+
+    /// Получить надёжный Jazz data plane. Сессия должна оставаться живой, пока
+    /// используется возвращённый объект.
+    pub async fn data_plane(&self) -> Result<JazzDataPlane> {
+        let media = self
+            .media
+            .read()
+            .await
+            .clone()
+            .ok_or(Error::Protocol("WebRTC media ещё не настроена"))?;
+        Ok(JazzDataPlane {
+            inner: media.data_plane(),
+        })
+    }
+
     /// Текущий JSON-снимок, включая исходные SDP и TURN credentials.
     pub async fn json(&self) -> Value {
         let mut result = self.state.read().await.clone();
@@ -141,8 +182,10 @@ pub(crate) async fn establish(call: CallInfo, timeout: Duration) -> Result<CallS
     .await
     .map_err(|_| Error::Timeout("WebSocket handshake"))?
     .map_err(|_| Error::WebSocket)?;
+    let join_url = call.join_url.clone();
     let state = Arc::new(RwLock::new(json!({"schema_version":1,"status":"joining",
-        "call":{"name":call.name,"room_id":call.room_id,"join_url":call.join_url,"password":call.password},
+        "call":{"name":call.name,"room_id":call.room_id,"join_url":call.join_url,"password":call.password,
+            "connector_url":call.connector_url.as_str()},
         "session":null,"webrtc":{"ice_servers":[],"publisher":null,"subscriber":null}})));
     let media: MediaSlot = Arc::new(RwLock::new(None));
     let (stop_tx, stop_rx) = oneshot::channel();
@@ -187,6 +230,7 @@ pub(crate) async fn establish(call: CallInfo, timeout: Duration) -> Result<CallS
     let mut session = CallSession {
         state,
         media,
+        join_url,
         stop: Some(stop_tx),
         task: Some(task),
     };
@@ -264,7 +308,9 @@ impl Worker {
         self.send(
             json!({"event":"join","requestId":self.join_id,"roomId":self.call.room_id,
             "payload":{"password":self.call.password,"participantName":self.call.name,
-            "jazzToken":null,"sessionId":null,"supportedFeatures":{},"isSilent":false}}),
+            "jazzToken":null,"sessionId":null,"supportedFeatures":{
+                "nickname":true,"sessionGroups":true,"attachedRooms":true
+            },"isSilent":false}}),
         )
         .await?;
         let mut timer = time::interval(Duration::from_millis(200));

@@ -70,8 +70,8 @@ pub struct ClientSession {
     transport: Transport,
     cipher: PacketCipher,
     route_exception_ipv4: Vec<Ipv4Addr>,
-    // Jazz TURN credentials are tied to a live Jazz guest session. Retaining
-    // the provider keeps that session alive for the lifetime of the transport.
+    // Provider-native transports may retain signaling/session state in the
+    // provider; keep it alive for the lifetime of this authenticated session.
     _provider: Arc<dyn TurnProvider>,
 }
 
@@ -219,9 +219,39 @@ async fn connect_mode(
         info!(provider = provider.name(), "provider relay forced; skipping direct WebRTC probe");
     }
 
+    info!(provider = provider.name(), "connecting provider-native transport if available");
+    if let Some(native) = provider
+        .connect_transport()
+        .await
+        .context("provider-native transport failed")?
+    {
+        let route_exception_ipv4 = native.route_exception_ipv4();
+        let mut transport = Transport::Provider(native);
+        if let Err(err) = probe(&mut transport, &cipher, config.connect_timeout).await {
+            transport.close().await;
+            return Err(err).context("provider-native transport probe failed");
+        }
+        info!(transport = transport.name(), "selecting provider-native transport");
+        authorize(
+            &mut transport,
+            &cipher,
+            config.device_id,
+            config.connect_timeout,
+            mode,
+        )
+        .await?;
+        info!(transport = transport.name(), device_id = %config.device_id, "device authorized");
+        return Ok(ClientSession {
+            transport,
+            cipher,
+            route_exception_ipv4,
+            _provider: provider,
+        });
+    }
+
     if provider.name() == "jazz" && host_is_not_publicly_relayable(&config.server) {
         bail!(
-            "Jazz relay cannot reach ToTS server address {}. This config embeds a local/private server address; regenerate the tots:// config after starting tots-server with --stun or --public-host <PUBLIC_IP_OR_DNS>",
+            "Jazz provider did not expose its native room transport and generic TURN cannot target {}",
             config.server
         );
     }
@@ -255,11 +285,7 @@ async fn connect_mode(
             return Err(err).context("provider-relayed WebRTC setup failed");
         }
     };
-    let mut transport = if provider.name() == "jazz" {
-        Transport::Jazz(relay_webrtc)
-    } else {
-        Transport::TurnWebRtc(relay_webrtc)
-    };
+    let mut transport = Transport::TurnWebRtc(relay_webrtc);
     if let Err(err) = probe(&mut transport, &cipher, config.connect_timeout).await {
         transport.close().await;
         return Err(err).context("provider-relayed WebRTC probe failed");

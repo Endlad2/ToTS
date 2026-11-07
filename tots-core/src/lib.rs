@@ -17,5 +17,5 @@ pub use client::{
 };
 pub use config_uri::{TotsConfig, TOTS_CONFIG_SCHEME, TOTS_CONFIG_VERSION};
 pub use crypto::PacketCipher;
-pub use provider::{TurnCredentials, TurnProvider, TurnServer};
+pub use provider::{ProviderTransport, TurnCredentials, TurnProvider, TurnServer};
 pub use wire::{Frame, PROTOCOL_VERSION};
