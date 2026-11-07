@@ -40,8 +40,9 @@ pub struct CallSession {
     task: Option<JoinHandle<Result<()>>>,
 }
 
-/// Bidirectional Jazz/LiveKit reliable data plane. Payloads are automatically
-/// wrapped/unwrapped as LiveKit DataPacket protobuf messages.
+/// Bidirectional ToTS carrier over the SaluteJazz media plane. Encrypted ToTS
+/// frames are fragmented into RTP payloads on the published audio track and
+/// reassembled from the subscribed remote track.
 #[derive(Clone)]
 pub struct JazzDataPlane {
     inner: DataPlane,
@@ -50,6 +51,16 @@ pub struct JazzDataPlane {
 impl JazzDataPlane {
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
         self.inner.wait_ready(timeout).await.map_err(Into::into)
+    }
+
+    /// Wait until a remote participant media track is actually subscribed.
+    /// Unlike wait_ready(), this is intentionally not used by create_call():
+    /// the server must be able to issue an invite before the client joins.
+    pub async fn wait_receive_ready(&self, timeout: Duration) -> Result<()> {
+        self.inner
+            .wait_receive_ready(timeout)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn send(&self, payload: &[u8]) -> Result<()> {
@@ -73,7 +84,7 @@ impl CallSession {
         &self.join_url
     }
 
-    /// Получить надёжный Jazz data plane. Сессия должна оставаться живой, пока
+    /// Получить двунаправленный Jazz media data plane. Сессия должна оставаться живой, пока
     /// используется возвращённый объект.
     pub async fn data_plane(&self) -> Result<JazzDataPlane> {
         let media = self

@@ -1,13 +1,26 @@
-use std::{collections::HashSet, net::{IpAddr, Ipv4Addr}, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashSet},
+    net::{IpAddr, Ipv4Addr},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use jazz_session::{join_call, CallSession, JazzDataPlane};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{net::lookup_host, sync::Mutex};
+use tokio::{
+    net::lookup_host,
+    sync::{watch, Mutex},
+    task::JoinHandle,
+    time,
+};
 use tots_core::{ProviderTransport, TurnCredentials, TurnProvider, TurnServer};
+use tracing::{info, warn};
 use url::Url;
+
+const ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JazzProviderData {
@@ -63,24 +76,44 @@ impl JazzProvider {
         let session = join_call(join_link, &self.data.name)
             .await
             .context("join server-created SaluteJazz room")?;
-        let data = session.data_plane().await.context("open Jazz data plane")?;
+        let data = session.data_plane().await.context("open Jazz media data plane")?;
         data.wait_ready(Duration::from_secs(20))
             .await
-            .context("wait for Jazz reliable data channel")?;
-        // Capture route exceptions only after ICE/SCTP is actually usable so
-        // trickled SFU candidates are present in the snapshot before Windows
-        // installs its full-tunnel routes.
-        let snapshot = session.json().await;
-        let route_exception_ipv4 = resolve_jazz_ipv4(&snapshot).await;
+            .context("wait for Jazz publisher/subscriber media path")?;
+        // The room creator can be media-ready before another participant exists.
+        // A client probe must not be sent until Jazz has actually delivered the
+        // server participant's remote media track to this subscriber.
+        data.wait_receive_ready(Duration::from_secs(20))
+            .await
+            .context("wait for remote Jazz media track")?;
+        info!("Jazz RTP media carrier is ready");
 
-        // The CallSession owns signaling and both PeerConnections. Keep it in
-        // the provider for at least as long as the returned data plane exists.
+        // Wait until both Jazz PeerConnections are actually ready before taking
+        // the first route snapshot. This captures signaling/TURN names as well as
+        // the concrete SFU addresses present in SDP/trickle ICE candidates.
+        let snapshot = session.json().await;
+        let initial_routes = discover_jazz_routes(&snapshot, join_link).await;
+        log_jazz_routes(&initial_routes);
+        let route_exception_ipv4 = initial_routes.ipv4.clone();
+        let (route_tx, route_updates) = watch::channel(route_exception_ipv4.clone());
+
+        // CallSession owns signaling and both PeerConnections. Put it behind the
+        // shared slot before starting the watcher so the watcher and close() use
+        // the same lifetime owner.
         *self.session.lock().await = Some(session);
+
+        let monitor_session = self.session.clone();
+        let monitor_join_link = join_link.to_string();
+        let monitor = tokio::spawn(async move {
+            monitor_jazz_routes(monitor_session, monitor_join_link, route_tx, initial_routes).await;
+        });
 
         Ok(JazzNativeTransport {
             data,
             route_exception_ipv4,
+            route_updates,
             session: self.session.clone(),
+            route_monitor: Mutex::new(Some(monitor)),
         })
     }
 }
@@ -88,7 +121,9 @@ impl JazzProvider {
 struct JazzNativeTransport {
     data: JazzDataPlane,
     route_exception_ipv4: Vec<Ipv4Addr>,
+    route_updates: watch::Receiver<Vec<Ipv4Addr>>,
     session: Arc<Mutex<Option<CallSession>>>,
+    route_monitor: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[async_trait]
@@ -98,14 +133,18 @@ impl ProviderTransport for JazzNativeTransport {
     }
 
     async fn send(&self, packet: Vec<u8>) -> Result<()> {
-        self.data.send(&packet).await.context("send Jazz DataPacket")
+        self.data.send(&packet).await.context("send ToTS frame over Jazz RTP media")
     }
 
     async fn recv(&self) -> Result<Vec<u8>> {
-        self.data.recv().await.context("receive Jazz DataPacket")
+        self.data.recv().await.context("receive ToTS frame over Jazz RTP media")
     }
 
     async fn close(&self) {
+        if let Some(monitor) = self.route_monitor.lock().await.take() {
+            monitor.abort();
+            let _ = monitor.await;
+        }
         let session = { self.session.lock().await.take() };
         if let Some(session) = session {
             let _ = session.close().await;
@@ -114,6 +153,10 @@ impl ProviderTransport for JazzNativeTransport {
 
     fn route_exception_ipv4(&self) -> Vec<Ipv4Addr> {
         self.route_exception_ipv4.clone()
+    }
+
+    fn route_exception_updates(&self) -> Option<watch::Receiver<Vec<Ipv4Addr>>> {
+        Some(self.route_updates.clone())
     }
 }
 
@@ -128,55 +171,145 @@ impl TurnProvider for JazzProvider {
     }
 
     async fn get_credentials(&self) -> Result<TurnCredentials> {
-        bail!("Jazz uses its native room/SFU data transport; raw TURN credentials are not a generic ToTS relay")
+        bail!("Jazz uses its native room/SFU media transport; raw TURN credentials are not a generic ToTS relay")
     }
 }
 
-async fn resolve_jazz_ipv4(snapshot: &Value) -> Vec<Ipv4Addr> {
-    let mut endpoints: Vec<(String, u16)> = Vec::new();
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct JazzRoutes {
+    domains: Vec<String>,
+    ipv4: Vec<Ipv4Addr>,
+}
 
-    if let Some(raw) = snapshot.pointer("/call/connector_url").and_then(Value::as_str) {
-        if let Ok(url) = Url::parse(raw) {
-            if let Some(host) = url.host_str() {
-                endpoints.push((host.to_string(), url.port_or_known_default().unwrap_or(443)));
-            }
+async fn monitor_jazz_routes(
+    session: Arc<Mutex<Option<CallSession>>>,
+    join_link: String,
+    route_tx: watch::Sender<Vec<Ipv4Addr>>,
+    initial: JazzRoutes,
+) {
+    let mut last = initial;
+    loop {
+        time::sleep(ROUTE_REFRESH_INTERVAL).await;
+        let snapshot = {
+            let guard = session.lock().await;
+            let Some(session) = guard.as_ref() else {
+                return;
+            };
+            session.json().await
+        };
+        let current = discover_jazz_routes(&snapshot, &join_link).await;
+
+        for domain in current.domains.iter().filter(|domain| !last.domains.contains(domain)) {
+            info!(domain = %domain, "Jazz direct-route domain discovered");
         }
+        for ip in current.ipv4.iter().filter(|ip| !last.ipv4.contains(ip)) {
+            info!(%ip, "Jazz direct-route IPv4 discovered");
+        }
+
+        // Publish the full current set rather than a delta. The Windows route
+        // guard deduplicates it and this also lets a newly-created receiver pick
+        // up the latest known set immediately through watch::Receiver::borrow().
+        // Publish on every refresh. Besides keeping late receivers current, this
+        // lets the Windows route installer retry a transient failed route add
+        // without requiring Jazz to change endpoints again.
+        if route_tx.send(current.ipv4.clone()).is_err() {
+            return;
+        }
+        last = current;
+    }
+}
+
+fn log_jazz_routes(routes: &JazzRoutes) {
+    for domain in &routes.domains {
+        info!(domain = %domain, "Jazz direct-route domain discovered");
+    }
+    for ip in &routes.ipv4 {
+        info!(%ip, "Jazz direct-route IPv4 discovered");
+    }
+}
+
+async fn discover_jazz_routes(snapshot: &Value, join_link: &str) -> JazzRoutes {
+    let mut endpoints = BTreeSet::<(String, u16)>::new();
+    collect_url_endpoints(snapshot, &mut endpoints);
+    if let Some(endpoint) = parse_web_endpoint(join_link) {
+        endpoints.insert(endpoint);
     }
 
-    if let Some(servers) = snapshot.pointer("/webrtc/ice_servers").and_then(Value::as_array) {
-        for entry in servers {
-            for raw in ice_urls(entry) {
-                if let Some((host, port)) = parse_ice_endpoint(raw) {
-                    endpoints.push((host, port));
-                }
-            }
-        }
-    }
-
+    let mut domains = BTreeSet::new();
     let mut result = HashSet::new();
     for (host, port) in endpoints {
-        if let Ok(addrs) = lookup_host((host.as_str(), port)).await {
-            for addr in addrs {
-                if let IpAddr::V4(ip) = addr.ip() {
-                    if is_route_exception(ip) {
-                        result.insert(ip);
+        if let Ok(ip) = host.parse::<Ipv4Addr>() {
+            if is_route_exception(ip) {
+                result.insert(ip);
+            }
+            continue;
+        }
+        // IPv6 literals are deliberately ignored because the ToTS full-tunnel
+        // takeover is IPv4-only. Keep DNS names for observability and resolve
+        // their A records for /32 bypass routes.
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            continue;
+        }
+        domains.insert(host.clone());
+        match lookup_host((host.as_str(), port)).await {
+            Ok(addrs) => {
+                for addr in addrs {
+                    if let IpAddr::V4(ip) = addr.ip() {
+                        if is_route_exception(ip) {
+                            result.insert(ip);
+                        }
                     }
                 }
             }
+            Err(error) => {
+                warn!(domain = %host, %error, "could not refresh Jazz direct-route DNS");
+            }
         }
     }
 
-    // Once Windows installs the ToTS /1 routes, the already-established Jazz
-    // ICE sockets must keep reaching the SFU on the original gateway. The SFU
-    // addresses are carried in trickle candidates/SDP and are not necessarily
-    // the same addresses as the configured TURN hosts.
+    // The concrete SFU address can differ from connector/TURN DNS. It appears in
+    // local/remote SDP and trickled ICE candidates, so collect it recursively.
     collect_candidate_ipv4(snapshot, &mut result);
 
-    let mut result: Vec<_> = result.into_iter().collect();
-    result.sort();
-    result
+    let mut ipv4: Vec<_> = result.into_iter().collect();
+    ipv4.sort();
+    JazzRoutes {
+        domains: domains.into_iter().collect(),
+        ipv4,
+    }
 }
 
+fn collect_url_endpoints(value: &Value, endpoints: &mut BTreeSet<(String, u16)>) {
+    match value {
+        Value::String(text) => {
+            for raw in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                if let Some(endpoint) = parse_web_endpoint(raw).or_else(|| parse_ice_endpoint(raw)) {
+                    endpoints.insert(endpoint);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_url_endpoints(item, endpoints);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                collect_url_endpoints(item, endpoints);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_web_endpoint(raw: &str) -> Option<(String, u16)> {
+    let url = Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        return None;
+    }
+    let host = url.host_str()?.to_string();
+    Some((host, url.port_or_known_default().unwrap_or(443)))
+}
 
 fn is_route_exception(ip: Ipv4Addr) -> bool {
     !(ip.is_unspecified()
@@ -340,6 +473,27 @@ mod tests {
         assert_eq!(creds.servers.len(), 1);
         assert_eq!(creds.servers[0].host, "relay.example.test");
         assert_eq!(creds.servers[0].port, 3478);
+    }
+
+
+    #[test]
+    fn collects_jazz_route_hosts_from_signaling_snapshot() {
+        let snapshot = json!({
+            "call": {"connector_url": "wss://connector.example.test/media?token=secret"},
+            "webrtc": {"ice_servers": [{
+                "urls": [
+                    "turn:turn.example.test:3478?transport=udp",
+                    "stun:stun.example.test:3478"
+                ]
+            }]},
+            "nested": {"endpoint": "https://api.example.test/path?q=hidden"}
+        });
+        let mut endpoints = BTreeSet::new();
+        collect_url_endpoints(&snapshot, &mut endpoints);
+        assert!(endpoints.contains(&("connector.example.test".to_string(), 443)));
+        assert!(endpoints.contains(&("turn.example.test".to_string(), 3478)));
+        assert!(endpoints.contains(&("stun.example.test".to_string(), 3478)));
+        assert!(endpoints.contains(&("api.example.test".to_string(), 443)));
     }
 
     #[test]

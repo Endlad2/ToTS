@@ -432,8 +432,8 @@ async fn create_config(
                 )
             })?;
         // Do not hand a client an invite until the server side has an actual
-        // usable Jazz data channel. This removes a race where the first ToTS
-        // Probe could be published before the server participant was ready.
+        // usable Jazz publisher/subscriber media path. The room creator cannot
+        // wait for a remote track yet because the client has not joined.
         let server_data = session.data_plane().await.map_err(|err| {
             (
                 StatusCode::BAD_GATEWAY,
@@ -446,7 +446,7 @@ async fn create_config(
             .map_err(|err| {
                 (
                     StatusCode::BAD_GATEWAY,
-                    format!("SaluteJazz server data channel did not open: {err}"),
+                    format!("SaluteJazz server media path did not open: {err}"),
                 )
             })?;
         let join_link = session.join_url().to_string();
@@ -607,7 +607,7 @@ async fn run_jazz_session(
     let data = session.data_plane().await.context("get Jazz data plane")?;
     data.wait_ready(std::time::Duration::from_secs(30))
         .await
-        .context("wait for Jazz reliable data channel")?;
+        .context("wait for Jazz publisher/subscriber media path")?;
     info!(%device_id, "Jazz room data transport is ready");
     let result = serve_jazz_data_plane(state, device_id, data).await;
     let _ = session.close().await;
@@ -628,7 +628,7 @@ async fn serve_jazz_data_plane(
         let frame = match state.cipher.open(&packet) {
             Ok(frame) => frame,
             Err(err) => {
-                warn!(%expected_device_id, %err, "discarding undecryptable Jazz DataPacket");
+                warn!(%expected_device_id, %err, "discarding undecryptable Jazz RTP-carried packet");
                 continue;
             }
         };

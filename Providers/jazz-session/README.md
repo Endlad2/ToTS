@@ -1,14 +1,15 @@
 # jazz-session
 
 Rust-библиотека для создания гостевой встречи SaluteJazz и входа по ссылке.
-Возвращает живую сессию, двунаправленный LiveKit/Jazz `_reliable` data plane и
+Возвращает живую сессию, двунаправленный ToTS data plane поверх Jazz RTP media и
 JSON с приглашением, ICE/TURN-конфигурацией, полными SDP, ICE-кандидатами и
 параметрами ICE/DTLS для publisher и subscriber.
 
 Это самостоятельная реализация гостевого протокола, без браузера, Node.js,
-официального SDK и ключа SDK. Камера и микрофон не открываются. Для переговоров
-publisher создаётся локальная выключенная Opus-дорожка; звук с устройства не
-захватывается и RTP с аудио не отправляется.
+официального SDK и ключа SDK. Камера и микрофон не открываются. Publisher
+создаёт синтетическую Opus RTP-дорожку: звук с устройства не захватывается, а
+RTP payload используется как двунаправленный carrier для зашифрованных ToTS
+пакетов.
 
 ## Подключение
 
@@ -45,9 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let guest_data = guest.json().await;
     let _json_string = serde_json::to_string(&guest_data)?;
 
-    // `_reliable` data channel uses LiveKit DataPacket framing internally.
+    // ToTS payload is fragmented into RTP payloads on the Jazz audio media track.
     let guest_plane = guest.data_plane().await?;
     guest_plane.wait_ready(std::time::Duration::from_secs(10)).await?;
+    guest_plane.wait_receive_ready(std::time::Duration::from_secs(10)).await?;
     guest_plane.send(b"hello").await?;
 
     // Сохраните оба объекта, пока используете соответствующие медиасессии.
@@ -65,8 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   в существующую встречу по HTTPS-приглашению с `psw`.
 - `session.json().await -> serde_json::Value` возвращает текущий снимок.
 - `session.data_plane().await -> Result<JazzDataPlane>` открывает доступ к
-  `_reliable` data channel; `send()`/`recv()` автоматически кодируют и декодируют
-  LiveKit `DataPacket`/`UserPacket` protobuf.
+  `AUDIO/MICROPHONE` RTP media track; `send()`/`recv()` автоматически фрагментируют и
+  собирают ToTS payload, не полагаясь на неподдерживаемый Jazz DataChannel.
 - `session.close().await -> Result<()>` отправляет `leave` и закрывает
   WebSocket, publisher и subscriber. Метод потребляет объект сессии.
 - `Drop` инициирует такое же завершение в фоне. Для гарантированного ожидания

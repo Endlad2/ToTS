@@ -20,7 +20,7 @@ That produced errors such as:
 TURN permission/channel bind failed for YOUR_PUBLIC_IP:50000
 ```
 
-Those TURN credentials are scoped to the Jazz/LiveKit WebRTC session. They are
+Those TURN credentials are scoped to the Jazz WebRTC media session. They are
 not a general-purpose UDP proxy to arbitrary Internet peers.
 
 ## New Jazz data path
@@ -34,9 +34,14 @@ For every server-issued Jazz config:
 3. `tots-client` joins that same room.
 4. Both endpoints perform Jazz `rtc:config`, `rtc:join`, track publication,
    publisher/subscriber SDP and trickle ICE.
-5. ToTS encrypted frames are wrapped as LiveKit `DataPacket` messages and sent
-   through Jazz's `_reliable` WebRTC data channel.
-6. The server decrypts the ToTS frame and forwards `Frame::Data` either to the
+5. ToTS encrypted frames are fragmented into RTP payloads and sent through the
+   real Jazz `AUDIO/MICROPHONE` media track. The decompiled Jazz client leaves
+   `onDataChannel()` empty, so the SFU data-channel path is not used.
+6. Jazz signaling/ICE/TURN/SFU domains and public IPv4 candidates are monitored
+   continuously. On Windows full-tunnel mode, newly discovered IPv4 endpoints
+   receive `/32` routes through the original physical gateway so Jazz cannot
+   route recursively through `tots0`.
+7. The server decrypts the ToTS frame and forwards `Frame::Data` either to the
    Linux TUN gateway (`AuthTun`) or to the legacy UDP backend (`Auth`).
 
 `UDP/50000` is therefore **not part of the Jazz path anymore**. It is kept for
@@ -57,8 +62,10 @@ TURN permission to this address.
 
 ## Create a new Jazz config
 
-Old Jazz URIs must be regenerated because they do not contain the server-created
-room invite required by the new transport.
+Jazz URIs from the old generic-TURN implementation must be regenerated because
+they do not contain the server-created room invite. URIs from the immediately
+previous native-room build already contain `provider_data.join_link` and remain
+schema-compatible with this RTP carrier.
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8787/v1/configs \
@@ -88,10 +95,13 @@ The old CLI form is still supported, but native Jazz requires the server-issued
 workflow.
 
 The client resolves and pins Jazz signaling/ICE/SFU IPv4 endpoints before the
-full-tunnel `/1` routes are installed. This prevents the live Jazz connection
-from routing into `tots0` after takeover. Jazz ICE is restricted to UDP/IPv4 and
-filters Windows APIPA (`169.254.0.0/16`) addresses so disconnected/link-local
-adapters are not handed to the ICE socket binder.
+full-tunnel `/1` routes are installed, then refreshes the Jazz signaling/SDP/ICE
+snapshot every two seconds. Newly discovered public IPv4 endpoints receive `/32`
+routes through the original gateway. Domains and public routeable addresses are
+logged without printing the secret invite URL or TURN credentials. This prevents
+the live Jazz connection from routing into `tots0` after takeover. Jazz ICE is
+restricted to UDP/IPv4 and filters Windows APIPA (`169.254.0.0/16`) addresses so
+disconnected/link-local adapters are not handed to the ICE socket binder.
 
 ## Expected healthy logs
 
@@ -106,6 +116,8 @@ Client:
 ```text
 provider relay forced; skipping direct WebRTC probe provider="jazz"
 connecting provider-native transport if available provider="jazz"
+Jazz direct-route domain discovered domain=...
+Jazz direct-route IPv4 discovered ip=...
 selecting provider-native transport transport="jazz"
 device authorized transport="jazz" device_id=...
 ToTS TUN interface is up ... transport="jazz"

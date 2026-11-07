@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +14,8 @@ use tots_core::{
 use tots_provider_jazz::{JazzProvider, JazzProviderData};
 use tots_provider_vk::{VkProvider, VkProviderData};
 use tracing::info;
+#[cfg(windows)]
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tun_rs::DeviceBuilder;
 use uuid::Uuid;
@@ -68,7 +72,7 @@ struct Cli {
     #[arg(long)]
     tun_prefix: Option<u8>,
 
-    /// TUN MTU. Keep this below the ToTS DataChannel message ceiling.
+    /// TUN MTU. Keep this below the ToTS encrypted transport payload ceiling.
     #[arg(long)]
     tun_mtu: Option<u16>,
 
@@ -323,6 +327,7 @@ async fn run_tun(
             cli.webrtc_port,
             &cli.tun_dns,
             session.route_exception_ipv4(),
+            session.route_exception_updates(),
         ).await?)
     } else {
         info!(
@@ -370,7 +375,8 @@ async fn run_tun(
 struct FullTunnelRouteGuard {
     tun_index: u32,
     original_index: u32,
-    added_host_routes: Vec<Ipv4Addr>,
+    added_host_routes: Arc<tokio::sync::Mutex<HashSet<Ipv4Addr>>>,
+    route_update_task: Option<tokio::task::JoinHandle<()>>,
     added_low_half: bool,
     added_high_half: bool,
 }
@@ -386,6 +392,7 @@ impl FullTunnelRouteGuard {
         server_port: u16,
         dns_servers: &[Ipv4Addr],
         route_exceptions: &[Ipv4Addr],
+        route_updates: Option<tokio::sync::watch::Receiver<Vec<Ipv4Addr>>>,
     ) -> Result<Self> {
         use tokio::net::lookup_host;
         use tokio::process::Command;
@@ -428,15 +435,21 @@ impl FullTunnelRouteGuard {
 
         let mut protected_ips = vec![server_ip];
         protected_ips.extend_from_slice(route_exceptions);
+        if let Some(receiver) = route_updates.as_ref() {
+            let latest = receiver.borrow().clone();
+            protected_ips.extend(latest);
+        }
         protected_ips.sort();
         protected_ips.dedup();
 
-        let mut added_host_routes = Vec::new();
+        let added_host_routes = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let known_host_routes = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         for ip in &protected_ips {
             let prefix = format!("{ip}/32");
             if add_windows_route(&prefix, original_index, gateway.trim(), 1).await? {
-                added_host_routes.push(*ip);
+                added_host_routes.lock().await.insert(*ip);
             }
+            known_host_routes.lock().await.insert(*ip);
         }
 
         let added_low_half = add_windows_route("0.0.0.0/1", tun_index, "0.0.0.0", 5).await?;
@@ -472,10 +485,52 @@ impl FullTunnelRouteGuard {
         // for stripped-down Windows images.
         let _ = Command::new("route.exe").arg("PRINT").output().await;
 
+        let route_update_task = route_updates.map(|mut receiver| {
+            let gateway = gateway.trim().to_string();
+            let added_host_routes = added_host_routes.clone();
+            let known_host_routes = known_host_routes.clone();
+            tokio::spawn(async move {
+                loop {
+                    // Use the current full snapshot. The Jazz provider republishes
+                    // it periodically, so failed New-NetRoute calls are retried.
+                    let latest = receiver.borrow_and_update().clone();
+                    for ip in latest {
+                        let already_known = known_host_routes.lock().await.contains(&ip);
+                        if already_known {
+                            continue;
+                        }
+                        let prefix = format!("{ip}/32");
+                        match add_windows_route(&prefix, original_index, &gateway, 1).await {
+                            Ok(added) => {
+                                known_host_routes.lock().await.insert(ip);
+                                if added {
+                                    added_host_routes.lock().await.insert(ip);
+                                }
+                                info!(
+                                    %ip,
+                                    original_gateway = %gateway,
+                                    original_interface = original_index,
+                                    created = added,
+                                    "Jazz direct bypass route installed"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(%ip, %error, "failed to install Jazz direct bypass route; will retry");
+                            }
+                        }
+                    }
+                    if receiver.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+        });
+
         Ok(Self {
             tun_index,
             original_index,
             added_host_routes,
+            route_update_task,
             added_low_half,
             added_high_half,
         })
@@ -488,12 +543,17 @@ impl FullTunnelRouteGuard {
         _server_port: u16,
         _dns_servers: &[Ipv4Addr],
         _route_exceptions: &[Ipv4Addr],
+        _route_updates: Option<tokio::sync::watch::Receiver<Vec<Ipv4Addr>>>,
     ) -> Result<Self> {
         bail!("--tun-default-route is currently implemented for Windows only")
     }
 
     #[cfg(windows)]
-    async fn cleanup(self) {
+    async fn cleanup(mut self) {
+        if let Some(task) = self.route_update_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
         let _ = run_powershell(&format!(
             "Set-DnsClientServerAddress -InterfaceIndex {} -ResetServerAddresses -ErrorAction SilentlyContinue",
             self.tun_index
@@ -505,7 +565,8 @@ impl FullTunnelRouteGuard {
         if self.added_high_half {
             let _ = remove_windows_route("128.0.0.0/1", self.tun_index).await;
         }
-        for ip in self.added_host_routes {
+        let added_host_routes: Vec<_> = self.added_host_routes.lock().await.iter().copied().collect();
+        for ip in added_host_routes {
             let prefix = format!("{ip}/32");
             let _ = remove_windows_route(&prefix, self.original_index).await;
         }

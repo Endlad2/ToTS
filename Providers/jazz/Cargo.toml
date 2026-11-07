@@ -10,6 +10,7 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 tots-core = { path = "../../tots-core" }
 jazz-session = { path = "../jazz-session" }
 url.workspace = true

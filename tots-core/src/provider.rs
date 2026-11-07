@@ -3,6 +3,7 @@ use std::{net::Ipv4Addr, sync::Arc};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnServer {
@@ -30,6 +31,14 @@ pub trait ProviderTransport: Send + Sync {
     async fn close(&self) {}
     fn route_exception_ipv4(&self) -> Vec<Ipv4Addr> {
         Vec::new()
+    }
+
+    /// Optional live updates for endpoints that must bypass a client-side
+    /// full-tunnel route. Provider-native transports can discover new SFU/TURN
+    /// addresses after ICE restarts or DNS changes, so a one-shot list is not
+    /// always sufficient.
+    fn route_exception_updates(&self) -> Option<watch::Receiver<Vec<Ipv4Addr>>> {
+        None
     }
 }
 

@@ -1,17 +1,20 @@
 use bytes::Bytes;
 use serde_json::{json, Value};
-use std::{net::IpAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use webrtc::{
     api::{
         media_engine::{MediaEngine, MIME_TYPE_OPUS},
         setting_engine::SettingEngine,
         APIBuilder,
-    },
-    data_channel::{
-        data_channel_init::RTCDataChannelInit,
-        data_channel_state::RTCDataChannelState,
-        RTCDataChannel,
     },
     ice::{
         candidate::candidate_base::unmarshal_candidate,
@@ -21,18 +24,33 @@ use webrtc::{
     ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
     peer_connection::{
         configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription,
+        peer_connection_state::RTCPeerConnectionState,
         RTCPeerConnection,
     },
+    rtp::{header::Header as RtpHeader, packet::Packet as RtpPacket},
     rtp_transceiver::{
         rtp_codec::RTCRtpCodecCapability, rtp_transceiver_direction::RTCRtpTransceiverDirection,
         RTCRtpTransceiverInit,
     },
-    track::track_local::track_local_static_rtp::TrackLocalStaticRTP,
+    track::{
+        track_local::{track_local_static_rtp::TrackLocalStaticRTP, TrackLocalWriter},
+        track_remote::TrackRemote,
+    },
 };
 
-const RELIABLE_LABEL: &str = "_reliable";
-const LOSSY_LABEL: &str = "_lossy";
-const MAX_USER_PACKET: usize = 15 * 1024;
+// SaluteJazz' Android client does not use WebRTC DataChannel for participant
+// data; its PeerConnection observer leaves onDataChannel() empty. The SFU may
+// therefore accept SCTP locally without forwarding those messages to the other
+// participant. Carry ToTS bytes over the media plane that Jazz actually
+// forwards: the published AUDIO/MICROPHONE RTP stream.
+const RTP_TOTS_MAGIC: &[u8; 4] = b"TOTS";
+const RTP_TOTS_VERSION: u8 = 1;
+const RTP_TOTS_HEADER: usize = 23;
+const RTP_TOTS_CHUNK: usize = 1000;
+const MAX_MEDIA_MESSAGE: usize = 32 * 1024;
+const MAX_MEDIA_FRAGMENTS: usize = 64;
+const REASSEMBLY_TTL: Duration = Duration::from_secs(15);
+const RTP_CLOCK_STEP: u32 = 960; // 20 ms at 48 kHz
 
 #[derive(Debug, thiserror::Error)]
 #[error("Не удалось обработать медиасессию")]
@@ -40,20 +58,28 @@ pub(crate) struct MediaError;
 
 #[derive(Clone)]
 pub(crate) struct DataPlane {
-    publisher_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
-    subscriber_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
+    outgoing_track: Arc<RwLock<Option<Arc<TrackLocalStaticRTP>>>>,
     incoming: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     ready: Arc<Notify>,
+    publisher_connected: Arc<AtomicBool>,
+    subscriber_connected: Arc<AtomicBool>,
+    incoming_track_ready: Arc<AtomicBool>,
+    source_id: u64,
+    next_message_id: Arc<AtomicU32>,
+    tx_clock: Arc<Mutex<(u16, u32)>>,
 }
 
 impl DataPlane {
     pub(crate) async fn wait_ready(&self, timeout: std::time::Duration) -> Result<(), MediaError> {
         let wait = async {
             loop {
-                // Register the waiter before checking channel state so an
-                // on_open notification cannot be lost between the check and await.
+                // Register the waiter before checking readiness so a state
+                // notification cannot be lost between the check and await.
                 let notified = self.ready.notified();
-                if self.open_send_channel().await.is_some() {
+                if self.publisher_connected.load(Ordering::SeqCst)
+                    && self.subscriber_connected.load(Ordering::SeqCst)
+                    && self.outgoing_track.read().await.is_some()
+                {
                     return Ok(());
                 }
                 notified.await;
@@ -64,27 +90,57 @@ impl DataPlane {
             .map_err(|_| MediaError)?
     }
 
-    async fn open_send_channel(&self) -> Option<Arc<RTCDataChannel>> {
-        // Match the LiveKit/Jazz client: prefer the publisher-side _reliable
-        // channel. The subscriber channel is a fallback when the SFU exposes a
-        // bidirectional incoming channel before the publisher one is open.
-        for slot in [&self.publisher_channel, &self.subscriber_channel] {
-            if let Some(channel) = slot.read().await.clone() {
-                if channel.ready_state() == RTCDataChannelState::Open {
-                    return Some(channel);
+    pub(crate) async fn wait_receive_ready(&self, timeout: std::time::Duration) -> Result<(), MediaError> {
+        let wait = async {
+            loop {
+                let notified = self.ready.notified();
+                if self.publisher_connected.load(Ordering::SeqCst)
+                    && self.subscriber_connected.load(Ordering::SeqCst)
+                    && self.outgoing_track.read().await.is_some()
+                    && self.incoming_track_ready.load(Ordering::SeqCst)
+                {
+                    return Ok(());
                 }
+                notified.await;
             }
-        }
-        None
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| MediaError)?
     }
 
     pub(crate) async fn send(&self, payload: &[u8]) -> Result<(), MediaError> {
-        if payload.len() > MAX_USER_PACKET {
+        if payload.is_empty() || payload.len() > MAX_MEDIA_MESSAGE {
             return Err(MediaError);
         }
-        let channel = self.open_send_channel().await.ok_or(MediaError)?;
-        let packet = Bytes::from(encode_livekit_data_packet(payload)?);
-        channel.send(&packet).await.map_err(|_| MediaError)?;
+        let track = self
+            .outgoing_track
+            .read()
+            .await
+            .clone()
+            .ok_or(MediaError)?;
+        let message_id = self.next_message_id.fetch_add(1, Ordering::Relaxed);
+        let fragments = encode_rtp_fragments(self.source_id, message_id, payload)?;
+        let mut clock = self.tx_clock.lock().await;
+        let timestamp = clock.1;
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            let packet = RtpPacket {
+                header: RtpHeader {
+                    version: 2,
+                    marker: index + 1 == fragments_len(payload),
+                    sequence_number: clock.0,
+                    timestamp,
+                    ..Default::default()
+                },
+                payload: Bytes::from(fragment),
+            };
+            clock.0 = clock.0.wrapping_add(1);
+            let written = track.write_rtp(&packet).await.map_err(|_| MediaError)?;
+            if written == 0 {
+                return Err(MediaError);
+            }
+        }
+        clock.1 = clock.1.wrapping_add(RTP_CLOCK_STEP);
         Ok(())
     }
 
@@ -93,6 +149,111 @@ impl DataPlane {
             Some(payload) if !payload.is_empty() => Ok(payload),
             _ => Err(MediaError),
         }
+    }
+}
+
+fn fragments_len(payload: &[u8]) -> usize {
+    payload.len().div_ceil(RTP_TOTS_CHUNK)
+}
+
+fn encode_rtp_fragments(
+    source_id: u64,
+    message_id: u32,
+    payload: &[u8],
+) -> Result<Vec<Vec<u8>>, MediaError> {
+    let count = fragments_len(payload);
+    if count == 0 || count > MAX_MEDIA_FRAGMENTS || payload.len() > u16::MAX as usize {
+        return Err(MediaError);
+    }
+    let total_len = payload.len() as u16;
+    let mut result = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = index * RTP_TOTS_CHUNK;
+        let end = (start + RTP_TOTS_CHUNK).min(payload.len());
+        let mut out = Vec::with_capacity(RTP_TOTS_HEADER + end - start);
+        out.extend_from_slice(RTP_TOTS_MAGIC);
+        out.push(RTP_TOTS_VERSION);
+        out.extend_from_slice(&source_id.to_be_bytes());
+        out.extend_from_slice(&message_id.to_be_bytes());
+        out.extend_from_slice(&(index as u16).to_be_bytes());
+        out.extend_from_slice(&(count as u16).to_be_bytes());
+        out.extend_from_slice(&total_len.to_be_bytes());
+        out.extend_from_slice(&payload[start..end]);
+        result.push(out);
+    }
+    Ok(result)
+}
+
+struct Reassembly {
+    created: Instant,
+    total_len: usize,
+    fragments: Vec<Option<Vec<u8>>>,
+    received: usize,
+}
+
+#[derive(Default)]
+struct Reassembler {
+    messages: HashMap<(u64, u32), Reassembly>,
+}
+
+impl Reassembler {
+    fn push(&mut self, local_source_id: u64, packet: &[u8]) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        self.messages
+            .retain(|_, value| now.duration_since(value.created) <= REASSEMBLY_TTL);
+        if self.messages.len() > 128 {
+            self.messages.clear();
+        }
+        if packet.len() < RTP_TOTS_HEADER || &packet[..4] != RTP_TOTS_MAGIC {
+            return None;
+        }
+        if packet[4] != RTP_TOTS_VERSION {
+            return None;
+        }
+        let source_id = u64::from_be_bytes(packet[5..13].try_into().ok()?);
+        if source_id == local_source_id {
+            return None;
+        }
+        let message_id = u32::from_be_bytes(packet[13..17].try_into().ok()?);
+        let index = u16::from_be_bytes(packet[17..19].try_into().ok()?) as usize;
+        let count = u16::from_be_bytes(packet[19..21].try_into().ok()?) as usize;
+        let total_len = u16::from_be_bytes(packet[21..23].try_into().ok()?) as usize;
+        if count == 0
+            || count > MAX_MEDIA_FRAGMENTS
+            || index >= count
+            || total_len == 0
+            || total_len > MAX_MEDIA_MESSAGE
+            || packet.len() - RTP_TOTS_HEADER > RTP_TOTS_CHUNK
+        {
+            return None;
+        }
+        let key = (source_id, message_id);
+        let entry = self.messages.entry(key).or_insert_with(|| Reassembly {
+            created: now,
+            total_len,
+            fragments: vec![None; count],
+            received: 0,
+        });
+        if entry.total_len != total_len || entry.fragments.len() != count {
+            self.messages.remove(&key);
+            return None;
+        }
+        if entry.fragments[index].is_none() {
+            entry.fragments[index] = Some(packet[RTP_TOTS_HEADER..].to_vec());
+            entry.received += 1;
+        }
+        if entry.received != count {
+            return None;
+        }
+        let entry = self.messages.remove(&key)?;
+        let mut result = Vec::with_capacity(entry.total_len);
+        for fragment in entry.fragments {
+            result.extend_from_slice(fragment.as_deref()?);
+        }
+        if result.len() != entry.total_len {
+            return None;
+        }
+        Some(result)
     }
 }
 
@@ -109,10 +270,12 @@ impl Peer {
         servers: Vec<RTCIceServer>,
         target: &'static str,
         outgoing: mpsc::UnboundedSender<Value>,
-        subscriber_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
-        publisher_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
         incoming: mpsc::Sender<Vec<u8>>,
+        reassembler: Arc<Mutex<Reassembler>>,
         ready: Arc<Notify>,
+        connected: Arc<AtomicBool>,
+        incoming_track_ready: Arc<AtomicBool>,
+        local_source_id: u64,
     ) -> Result<Self, MediaError> {
         let mut engine = MediaEngine::default();
         engine.register_default_codecs().map_err(|_| MediaError)?;
@@ -157,20 +320,49 @@ impl Peer {
             })
         }));
 
-        let channel_slot = subscriber_channel.clone();
-        let publisher_slot = publisher_channel.clone();
-        let incoming_tx = incoming.clone();
         let ready_notify = ready.clone();
-        pc.on_data_channel(Box::new(move |dc| {
-            attach_data_channel(
-                dc,
-                channel_slot.clone(),
-                publisher_slot.clone(),
-                incoming_tx.clone(),
-                ready_notify.clone(),
-            );
-            Box::pin(async {})
+        pc.on_peer_connection_state_change(Box::new(move |state| {
+            let connected = connected.clone();
+            let ready_notify = ready_notify.clone();
+            Box::pin(async move {
+                let is_connected = state == RTCPeerConnectionState::Connected;
+                connected.store(is_connected, Ordering::SeqCst);
+                if is_connected {
+                    ready_notify.notify_waiters();
+                }
+            })
         }));
+
+        if target == "SUBSCRIBER" {
+            pc.on_track(Box::new(move |track: Arc<TrackRemote>, _, _| {
+                let incoming = incoming.clone();
+                let reassembler = reassembler.clone();
+                let incoming_track_ready = incoming_track_ready.clone();
+                let ready = ready.clone();
+                Box::pin(async move {
+                    incoming_track_ready.store(true, Ordering::SeqCst);
+                    ready.notify_waiters();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 2048];
+                        loop {
+                            let packet = match track.read(&mut buf).await {
+                                Ok((packet, _)) => packet,
+                                Err(_) => break,
+                            };
+                            let completed = reassembler
+                                .lock()
+                                .await
+                                .push(local_source_id, &packet.payload);
+                            if let Some(payload) = completed {
+                                if incoming.send(payload).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                })
+            }));
+        }
 
         Ok(Self {
             pc,
@@ -225,58 +417,6 @@ impl Peer {
             "connection_state": self.pc.connection_state().to_string(),
         })
     }
-}
-
-fn attach_data_channel(
-    dc: Arc<RTCDataChannel>,
-    slot: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
-    other_slot: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
-    incoming: mpsc::Sender<Vec<u8>>,
-    ready: Arc<Notify>,
-) {
-    if dc.label() != RELIABLE_LABEL {
-        return;
-    }
-
-    let opened = dc.clone();
-    let opened_slot = slot.clone();
-    let opened_ready = ready.clone();
-    dc.on_open(Box::new(move || {
-        Box::pin(async move {
-            *opened_slot.write().await = Some(opened);
-            opened_ready.notify_waiters();
-        })
-    }));
-
-    let closed_incoming = incoming.clone();
-    dc.on_message(Box::new(move |message| {
-        let incoming = incoming.clone();
-        Box::pin(async move {
-            if let Ok(payload) = decode_livekit_data_packet(&message.data) {
-                let _ = incoming.send(payload).await;
-            }
-        })
-    }));
-
-    let closed_slot = slot;
-    dc.on_close(Box::new(move || {
-        let closed_slot = closed_slot.clone();
-        let other_slot = other_slot.clone();
-        let closed_incoming = closed_incoming.clone();
-        Box::pin(async move {
-            *closed_slot.write().await = None;
-            let other_open = other_slot
-                .read()
-                .await
-                .as_ref()
-                .is_some_and(|channel| channel.ready_state() == RTCDataChannelState::Open);
-            if !other_open {
-                // Encrypted ToTS packets are never empty, so an empty item is
-                // a private close sentinel once both reliable paths are gone.
-                let _ = closed_incoming.send(Vec::new()).await;
-            }
-        })
-    }));
 }
 
 fn configuration(value: &Value) -> Result<Vec<RTCIceServer>, MediaError> {
@@ -354,35 +494,48 @@ impl Media {
         outgoing: mpsc::UnboundedSender<Value>,
     ) -> Result<Self, MediaError> {
         let servers = configuration(ice_servers)?;
-        let publisher_channel = Arc::new(RwLock::new(None));
-        let subscriber_channel = Arc::new(RwLock::new(None));
         let ready = Arc::new(Notify::new());
+        let publisher_connected = Arc::new(AtomicBool::new(false));
+        let subscriber_connected = Arc::new(AtomicBool::new(false));
+        let incoming_track_ready = Arc::new(AtomicBool::new(false));
+        let outgoing_track = Arc::new(RwLock::new(None));
         let (incoming_tx, incoming_rx) = mpsc::channel(2048);
+        let reassembler = Arc::new(Mutex::new(Reassembler::default()));
+        let source_id = (uuid::Uuid::new_v4().as_u128() & u128::from(u64::MAX)) as u64;
         let data = DataPlane {
-            publisher_channel: publisher_channel.clone(),
-            subscriber_channel: subscriber_channel.clone(),
+            outgoing_track: outgoing_track.clone(),
             incoming: Arc::new(Mutex::new(incoming_rx)),
             ready: ready.clone(),
+            publisher_connected: publisher_connected.clone(),
+            subscriber_connected: subscriber_connected.clone(),
+            incoming_track_ready: incoming_track_ready.clone(),
+            source_id,
+            next_message_id: Arc::new(AtomicU32::new(1)),
+            tx_clock: Arc::new(Mutex::new((1, 0))),
         };
 
         let publisher = Peer::new(
             servers.clone(),
             "PUBLISHER",
             outgoing.clone(),
-            subscriber_channel.clone(),
-            publisher_channel.clone(),
             incoming_tx.clone(),
+            reassembler.clone(),
             ready.clone(),
+            publisher_connected,
+            incoming_track_ready.clone(),
+            source_id,
         )
         .await?;
         let subscriber = match Peer::new(
             servers,
             "SUBSCRIBER",
             outgoing,
-            subscriber_channel.clone(),
-            publisher_channel.clone(),
-            incoming_tx.clone(),
+            incoming_tx,
+            reassembler,
             ready.clone(),
+            subscriber_connected,
+            incoming_track_ready,
+            source_id,
         )
         .await
         {
@@ -392,44 +545,6 @@ impl Media {
                 return Err(error);
             }
         };
-
-        // Jazz/LiveKit uses these publisher-side channels. The reliable one is
-        // our actual ToTS carrier; the lossy channel is created because the
-        // Jazz publisher SDP is expected to advertise both standard channels.
-        let lossy = publisher
-            .pc
-            .create_data_channel(
-                LOSSY_LABEL,
-                Some(RTCDataChannelInit {
-                    ordered: Some(false),
-                    max_retransmits: Some(1),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|_| MediaError)?;
-        // Ignore payloads arriving over _lossy. It only makes the publisher
-        // negotiation match Jazz/LiveKit clients.
-        lossy.on_message(Box::new(|_| Box::pin(async {})));
-
-        let reliable = publisher
-            .pc
-            .create_data_channel(
-                RELIABLE_LABEL,
-                Some(RTCDataChannelInit {
-                    ordered: Some(true),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|_| MediaError)?;
-        attach_data_channel(
-            reliable,
-            publisher_channel,
-            subscriber_channel,
-            incoming_tx,
-            ready,
-        );
 
         Ok(Self {
             publisher,
@@ -467,6 +582,8 @@ impl Media {
             cid.to_owned(),
             sid.to_owned(),
         ));
+        *self.data.outgoing_track.write().await = Some(track.clone());
+        self.data.ready.notify_waiters();
         self.publisher
             .pc
             .add_transceiver_from_track(
@@ -559,96 +676,6 @@ impl Media {
     }
 }
 
-fn write_varint(mut value: usize, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push(((value & 0x7f) as u8) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-fn encode_livekit_data_packet(payload: &[u8]) -> Result<Vec<u8>, MediaError> {
-    if payload.len() > MAX_USER_PACKET {
-        return Err(MediaError);
-    }
-    // LiveKit protobuf:
-    // DataPacket.user = field 2 (wire type 2)
-    // UserPacket.payload = field 2 (wire type 2)
-    let mut user = Vec::with_capacity(payload.len() + 8);
-    user.push(0x12);
-    write_varint(payload.len(), &mut user);
-    user.extend_from_slice(payload);
-
-    let mut packet = Vec::with_capacity(user.len() + 8);
-    packet.push(0x12);
-    write_varint(user.len(), &mut packet);
-    packet.extend_from_slice(&user);
-    Ok(packet)
-}
-
-fn read_varint(data: &[u8], cursor: &mut usize) -> Result<u64, MediaError> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    while *cursor < data.len() && shift <= 63 {
-        let byte = data[*cursor];
-        *cursor += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-        shift += 7;
-    }
-    Err(MediaError)
-}
-
-fn find_length_delimited<'a>(data: &'a [u8], wanted: u64) -> Result<&'a [u8], MediaError> {
-    let mut cursor = 0usize;
-    while cursor < data.len() {
-        let key = read_varint(data, &mut cursor)?;
-        let field = key >> 3;
-        let wire = key & 7;
-        match wire {
-            0 => {
-                let _ = read_varint(data, &mut cursor)?;
-            }
-            1 => {
-                cursor = cursor.checked_add(8).ok_or(MediaError)?;
-                if cursor > data.len() {
-                    return Err(MediaError);
-                }
-            }
-            2 => {
-                let len = usize::try_from(read_varint(data, &mut cursor)?).map_err(|_| MediaError)?;
-                let end = cursor.checked_add(len).ok_or(MediaError)?;
-                if end > data.len() {
-                    return Err(MediaError);
-                }
-                if field == wanted {
-                    return Ok(&data[cursor..end]);
-                }
-                cursor = end;
-            }
-            5 => {
-                cursor = cursor.checked_add(4).ok_or(MediaError)?;
-                if cursor > data.len() {
-                    return Err(MediaError);
-                }
-            }
-            _ => return Err(MediaError),
-        }
-    }
-    Err(MediaError)
-}
-
-fn decode_livekit_data_packet(data: &[u8]) -> Result<Vec<u8>, MediaError> {
-    let user = find_length_delimited(data, 2)?;
-    let payload = find_length_delimited(user, 2)?;
-    if payload.len() > MAX_USER_PACKET {
-        return Err(MediaError);
-    }
-    Ok(payload.to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,12 +687,15 @@ mod tests {
     }
 
     #[test]
-    fn livekit_user_packet_round_trip() {
-        let payloads = vec![Vec::new(), b"hello".to_vec(), vec![7u8; 1300]];
-        for payload in payloads {
-            let encoded = encode_livekit_data_packet(&payload).unwrap();
-            assert_eq!(decode_livekit_data_packet(&encoded).unwrap(), payload);
-        }
+    fn rtp_tots_fragment_round_trip() {
+        let source_id = 0x1020_3040_5060_7080;
+        let payload = vec![7u8; 2501];
+        let fragments = encode_rtp_fragments(source_id, 42, &payload).unwrap();
+        assert_eq!(fragments.len(), 3);
+        let mut reassembler = Reassembler::default();
+        assert!(reassembler.push(99, &fragments[2]).is_none());
+        assert!(reassembler.push(99, &fragments[0]).is_none());
+        assert_eq!(reassembler.push(99, &fragments[1]).unwrap(), payload);
     }
 
     #[tokio::test]
@@ -683,7 +713,8 @@ mod tests {
         assert!(sdp.contains("a=fingerprint:"));
         assert!(sdp.contains("a=sendonly"));
         assert!(sdp.contains("server-stream"));
-        assert!(sdp.contains("m=application"));
+        assert!(sdp.contains("m=audio"));
+        assert!(!sdp.contains("m=application"));
         let answer = subscriber.description(&offer).await.unwrap().unwrap();
         assert_eq!(answer["method"], "rtc:answer");
         let candidates =

@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use rand::Rng;
-use tokio::net::{lookup_host, UdpSocket};
-use tokio::time::timeout;
+use tokio::{net::{lookup_host, UdpSocket}, sync::watch};
+use tokio::time::{timeout, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -70,6 +70,7 @@ pub struct ClientSession {
     transport: Transport,
     cipher: PacketCipher,
     route_exception_ipv4: Vec<Ipv4Addr>,
+    route_exception_updates: Option<watch::Receiver<Vec<Ipv4Addr>>>,
     // Provider-native transports may retain signaling/session state in the
     // provider; keep it alive for the lifetime of this authenticated session.
     _provider: Arc<dyn TurnProvider>,
@@ -87,10 +88,14 @@ impl ClientSession {
         &self.route_exception_ipv4
     }
 
+    pub fn route_exception_updates(&self) -> Option<watch::Receiver<Vec<Ipv4Addr>>> {
+        self.route_exception_updates.clone()
+    }
+
     pub async fn send_payload(&self, payload: &[u8]) -> Result<()> {
         if payload.len() > MAX_DATA_PAYLOAD {
             bail!(
-                "payload is {} bytes, exceeding ToTS DataChannel limit of {} bytes",
+                "payload is {} bytes, exceeding ToTS transport limit of {} bytes",
                 payload.len(),
                 MAX_DATA_PAYLOAD
             );
@@ -202,6 +207,7 @@ async fn connect_mode(
                             transport: direct,
                             cipher,
                             route_exception_ipv4: Vec::new(),
+                            route_exception_updates: None,
                             _provider: provider,
                         });
                     }
@@ -226,6 +232,7 @@ async fn connect_mode(
         .context("provider-native transport failed")?
     {
         let route_exception_ipv4 = native.route_exception_ipv4();
+        let route_exception_updates = native.route_exception_updates();
         let mut transport = Transport::Provider(native);
         if let Err(err) = probe(&mut transport, &cipher, config.connect_timeout).await {
             transport.close().await;
@@ -245,6 +252,7 @@ async fn connect_mode(
             transport,
             cipher,
             route_exception_ipv4,
+            route_exception_updates,
             _provider: provider,
         });
     }
@@ -306,6 +314,7 @@ async fn connect_mode(
         transport,
         cipher,
         route_exception_ipv4,
+        route_exception_updates: None,
         _provider: provider,
     })
 }
@@ -340,27 +349,41 @@ pub async fn run(config: ClientConfig, provider: Arc<dyn TurnProvider>) -> Resul
 
 async fn probe(transport: &mut Transport, cipher: &PacketCipher, wait: Duration) -> Result<()> {
     let nonce: u64 = rand::thread_rng().gen();
-    transport
-        .send(cipher.seal(&Frame::Probe {
-            version: PROTOCOL_VERSION,
-            nonce,
-        })?)
-        .await?;
-    let packet = timeout(wait, transport.recv())
-        .await
-        .context("transport probe timeout")??;
-    match cipher.open(&packet)? {
-        Frame::ProbeAck { version, nonce: n }
-            if version == PROTOCOL_VERSION && n == nonce =>
-        {
-            Ok(())
+    let probe_packet = cipher.seal(&Frame::Probe {
+        version: PROTOCOL_VERSION,
+        nonce,
+    })?;
+    let deadline = Instant::now() + wait;
+    const RETRY: Duration = Duration::from_millis(600);
+
+    // Provider-native media transports are datagram-like. In particular, the
+    // first RTP packet can race the remote subscriber track becoming active.
+    // Re-send the idempotent Probe until the overall connection deadline rather
+    // than turning one dropped first packet into a full connection failure.
+    loop {
+        transport.send(probe_packet.clone()).await?;
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("transport probe timeout");
         }
-        Frame::ProbeAck { version, .. } => bail!(
-            "ToTS protocol mismatch: client version {}, server version {}",
-            PROTOCOL_VERSION,
-            version
-        ),
-        other => Err(anyhow!("unexpected probe reply: {other:?}")),
+        let slice = (deadline - now).min(RETRY);
+        match timeout(slice, transport.recv()).await {
+            Err(_) => continue,
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(packet)) => match cipher.open(&packet)? {
+                Frame::ProbeAck { version, nonce: n }
+                    if version == PROTOCOL_VERSION && n == nonce =>
+                {
+                    return Ok(());
+                }
+                Frame::ProbeAck { version, .. } => bail!(
+                    "ToTS protocol mismatch: client version {}, server version {}",
+                    PROTOCOL_VERSION,
+                    version
+                ),
+                other => return Err(anyhow!("unexpected probe reply: {other:?}")),
+            },
+        }
     }
 }
 
