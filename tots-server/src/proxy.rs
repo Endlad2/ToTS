@@ -26,6 +26,8 @@ pub fn start_quic_proxy() -> Result<(VirtualDatagramBridge, JoinHandle<Result<()
 }
 
 fn build_server_endpoint(socket: Arc<VirtualUdpSocket>) -> Result<Endpoint> {
+    // This is an end-entity TLS certificate (CA=FALSE) signed by the
+    // embedded ToTS nested-QUIC CA trusted by the client.
     const CERT_DER: &[u8] = include_bytes!("quic_cert.der");
     const KEY_DER: &[u8] = include_bytes!("quic_key.der");
     let cert = CertificateDer::from(CERT_DER);

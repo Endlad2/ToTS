@@ -29,7 +29,7 @@ pub const PROXY_PROTOCOL_VERSION: u8 = 1;
 pub const PROXY_CMD_CONNECT: u8 = 1;
 pub const PROXY_CMD_UDP_ASSOCIATE: u8 = 3;
 
-const CERT_DER: &[u8] = include_bytes!("quic_cert.der");
+const QUIC_CA_CERT_DER: &[u8] = include_bytes!("quic_ca_cert.der");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProxyTarget {
@@ -177,9 +177,9 @@ impl AsyncUdpSocket for VirtualUdpSocket {
 }
 
 pub fn quic_client_endpoint(socket: Arc<VirtualUdpSocket>) -> Result<Endpoint> {
-    let cert = CertificateDer::from(CERT_DER);
+    let ca_cert = CertificateDer::from(QUIC_CA_CERT_DER);
     let mut roots = RootCertStore::empty();
-    roots.add(cert).context("trust embedded ToTS QUIC certificate")?;
+    roots.add(ca_cert).context("trust embedded ToTS nested QUIC root CA")?;
     let client_config = QuicClientConfig::with_root_certificates(Arc::new(roots))
         .context("build ToTS QUIC client TLS config")?;
     let mut endpoint = Endpoint::new_with_abstract_socket(
