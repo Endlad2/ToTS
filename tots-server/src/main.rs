@@ -407,6 +407,8 @@ async fn create_config(
     // self-consistent URI even when the request omitted `provider: jazz`.
     let provider = if req.transport.eq_ignore_ascii_case("jazz") {
         "jazz".to_string()
+    } else if req.transport.eq_ignore_ascii_case("max") {
+        "max".to_string()
     } else {
         req.provider.clone()
     };

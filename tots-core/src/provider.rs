@@ -5,6 +5,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayScope {
+    /// Credentials may be used as ordinary RFC 5766 TURN credentials for an explicitly configured peer.
+    GenericTurn,
+    /// Credentials are bound to a provider call/session and must not be repurposed as a generic UDP relay.
+    ProviderSession,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnServer {
     pub host: String,
@@ -45,6 +53,12 @@ pub trait ProviderTransport: Send + Sync {
 #[async_trait]
 pub trait TurnProvider: Send + Sync {
     fn name(&self) -> &'static str;
+
+    /// Whether credentials from this provider are ordinary TURN credentials
+    /// or are bound to the provider's own call/media session.
+    fn relay_scope(&self) -> RelayScope {
+        RelayScope::GenericTurn
+    }
 
     /// Connect a provider-native transport when the service requires its own
     /// room/SFU signaling path. Generic TURN providers return None.

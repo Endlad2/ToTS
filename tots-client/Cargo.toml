@@ -16,3 +16,5 @@ uuid.workspace = true
 tots-core = { path = "../tots-core" }
 tots-provider-vk = { path = "../Providers/vk" }
 tots-provider-jazz = { path = "../Providers/jazz" }
+
+tots-provider-max = { path = "../Providers/max" }

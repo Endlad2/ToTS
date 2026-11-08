@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tots_core::{TurnCredentials, TurnProvider, TurnServer};
+use tots_core::{RelayScope, TurnCredentials, TurnProvider, TurnServer};
 use tracing::{debug, warn};
 use url::Url;
 use uuid::Uuid;
@@ -310,6 +310,10 @@ impl VkProvider {
 impl TurnProvider for VkProvider {
     fn name(&self) -> &'static str {
         "vk"
+    }
+
+    fn relay_scope(&self) -> RelayScope {
+        RelayScope::ProviderSession
     }
 
     async fn get_credentials(&self) -> Result<TurnCredentials> {

@@ -16,7 +16,7 @@ use tokio::{
     task::JoinHandle,
     time,
 };
-use tots_core::{ProviderTransport, TurnCredentials, TurnProvider, TurnServer};
+use tots_core::{ProviderTransport, RelayScope, TurnCredentials, TurnProvider, TurnServer};
 use tracing::{info, warn};
 use url::Url;
 
@@ -164,6 +164,10 @@ impl ProviderTransport for JazzNativeTransport {
 impl TurnProvider for JazzProvider {
     fn name(&self) -> &'static str {
         "jazz"
+    }
+
+    fn relay_scope(&self) -> RelayScope {
+        RelayScope::ProviderSession
     }
 
     async fn connect_transport(&self) -> Result<Option<Arc<dyn ProviderTransport>>> {

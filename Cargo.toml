@@ -6,6 +6,7 @@ members = [
   "tots-server",
   "Providers/vk",
   "Providers/jazz",
+  "Providers/max",
   "Providers/jazz-session",
 ]
 

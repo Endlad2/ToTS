@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::transport::{Transport, TurnTransport, WebRtcTransport};
-use crate::{Frame, PacketCipher, TurnCredentials, TurnProvider, PROTOCOL_VERSION};
+use crate::{Frame, PacketCipher, RelayScope, TurnCredentials, TurnProvider, PROTOCOL_VERSION};
 
 pub const DEFAULT_LOCAL_PORT: u16 = 7000;
 pub const DEFAULT_WEBRTC_PORT: u16 = 8443;
@@ -261,6 +261,15 @@ async fn connect_mode(
         bail!(
             "Jazz provider did not expose its native room transport and generic TURN cannot target {}",
             config.server
+        );
+    }
+
+    if provider.relay_scope() == RelayScope::ProviderSession {
+        bail!(
+            "provider '{}' exposes call-scoped ICE/TURN state; generic TURN fallback to {}:{} is disabled. Use a standards-compliant provider-native WebRTC transport or an ordinary TURN service you control",
+            provider.name(),
+            config.server,
+            config.turn_port
         );
     }
 

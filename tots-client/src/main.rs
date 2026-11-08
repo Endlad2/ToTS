@@ -12,6 +12,7 @@ use tots_core::{
     DEFAULT_TURN_PORT, DEFAULT_WEBRTC_PORT, MAX_DATA_PAYLOAD,
 };
 use tots_provider_jazz::{JazzProvider, JazzProviderData};
+use tots_provider_max::{MaxProvider, MaxProviderData};
 use tots_provider_vk::{VkProvider, VkProviderData};
 use tracing::info;
 #[cfg(windows)]
@@ -43,7 +44,7 @@ struct Cli {
 
     /// Transport selection: auto prefers direct WebRTC, turn forces the selected
     /// provider relay, and jazz forces the SaluteJazz room/SFU data transport.
-    #[arg(long, value_parser = ["auto", "turn", "jazz"])]
+    #[arg(long, value_parser = ["auto", "turn", "jazz", "max"])]
     transport: Option<String>,
 
     /// Provider-specific JSON object. Jazz accepts {"join_link":"...","name":"..."};
@@ -125,13 +126,13 @@ async fn main() -> Result<()> {
     let cli = resolve_cli(Cli::parse())?;
     let transport_preference = match cli.transport.as_str() {
         "auto" => TransportPreference::Auto,
-        "turn" | "jazz" => TransportPreference::ProviderRelay,
+        "turn" | "jazz" | "max" => TransportPreference::ProviderRelay,
         other => bail!("unsupported transport '{other}'"),
     };
-    let effective_provider = if cli.transport == "jazz" {
-        "jazz"
-    } else {
-        cli.provider.as_str()
+    let effective_provider = match cli.transport.as_str() {
+        "jazz" => "jazz",
+        "max" => "max",
+        _ => cli.provider.as_str(),
     };
     let provider: Arc<dyn TurnProvider> = match effective_provider {
         "vk" => {
@@ -144,7 +145,12 @@ async fn main() -> Result<()> {
                 .context("parse provider_data as Jazz JSON")?;
             Arc::new(JazzProvider::new(data)?)
         }
-        other => bail!("unsupported provider '{other}'; supported providers are 'vk' and 'jazz'"),
+        "max" => {
+            let data: MaxProviderData = serde_json::from_value(cli.provider_data.clone())
+                .context("parse provider_data as MAX JSON")?;
+            Arc::new(MaxProvider::new(data)?)
+        }
+        other => bail!("unsupported provider '{other}'; supported providers are 'vk', 'jazz', and 'max'"),
     };
 
     let config = ClientConfig {
