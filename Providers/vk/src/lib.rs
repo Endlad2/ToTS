@@ -1,10 +1,19 @@
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::{process::Command, time::timeout};
 use tots_core::{RelayScope, TurnCredentials, TurnProvider, TurnServer};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -22,6 +31,10 @@ const FALLBACK_APPS: &[(&str, &str)] = &[
     ("51453752", "4UyuCUsdK8pVCNoeQuGi"),
     ("3140623", "VeWdmVclDCtn6ihuP1nt"),
 ];
+
+const CAPTCHA_HELPER_BYTES: &[u8] = include_bytes!(env!("VK_CAPTCHA_HELPER_PATH"));
+const CAPTCHA_HELPER_TOKEN_PREFIX: &str = "TOTS_CAPTCHA_SUCCESS_TOKEN=";
+const CAPTCHA_HELPER_TIMEOUT: Duration = Duration::from_secs(620);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VkProviderData {
@@ -46,7 +59,9 @@ pub struct VkProviderData {
     #[serde(default)]
     pub client_secret: Option<String>,
 
-    /// User-obtained VK success token. The crate never auto-solves CAPTCHA.
+    /// Optional pre-obtained VK success token. If absent and VK requests a
+    /// challenge, ToTS launches the embedded interactive helper and waits for
+    /// the user to complete the CAPTCHA in its browser window.
     #[serde(default)]
     pub captcha_success_token: Option<String>,
 
@@ -116,7 +131,7 @@ impl VkProvider {
                 Ok(creds) => return Ok(creds),
                 Err(err) => {
                     let text = format!("{err:#}");
-                    if text.contains("CAPTCHA_REQUIRED") {
+                    if text.contains("CAPTCHA") || text.contains("captcha helper") {
                         return Err(err);
                     }
                     warn!(client_id, error = %err, "VK app credential attempt failed");
@@ -206,23 +221,26 @@ impl VkProvider {
         }
 
         let challenge = parse_captcha(err);
-        let Some(success_token) = self.data.captcha_success_token.as_deref() else {
-            bail!(
-                "CAPTCHA_REQUIRED redirect_uri={} session_token={} captcha_sid={}; solve it interactively and pass provider_data.captcha_success_token",
-                challenge.redirect_uri,
-                challenge.session_token,
-                challenge.captcha_sid
-            );
+        validate_captcha_redirect(&challenge)?;
+        let success_token = match self
+            .data
+            .captcha_success_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            Some(token) => token.to_string(),
+            None => self.solve_captcha_interactively(&challenge).await?,
         };
 
         if challenge.captcha_sid.is_empty() {
-            form.push(("success_token", success_token.to_string()));
+            form.push(("success_token", success_token));
         } else {
             form.extend([
                 ("captcha_key", String::new()),
                 ("captcha_sid", challenge.captcha_sid.clone()),
                 ("is_sound_captcha", "0".to_string()),
-                ("success_token", success_token.to_string()),
+                ("success_token", success_token),
                 ("captcha_ts", challenge.captcha_ts.clone()),
                 (
                     "captcha_attempt",
@@ -241,6 +259,38 @@ impl VkProvider {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| anyhow!("VK token retry after user CAPTCHA token failed: {retry}"))
+    }
+
+    async fn solve_captcha_interactively(&self, challenge: &CaptchaChallenge) -> Result<String> {
+        validate_captcha_redirect(challenge)?;
+        let helper = TempCaptchaHelper::materialize()?;
+        info!(
+            host = %Url::parse(&challenge.redirect_uri).ok().and_then(|url| url.host_str().map(str::to_string)).unwrap_or_default(),
+            "VK CAPTCHA required; opening embedded interactive helper"
+        );
+
+        let mut command = Command::new(helper.path());
+        command
+            .env("TOTS_VK_CAPTCHA_URL", &challenge.redirect_uri)
+            .arg("--timeout")
+            .arg("600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+
+        let output = timeout(CAPTCHA_HELPER_TIMEOUT, command.output())
+            .await
+            .context("VK captcha helper timed out")?
+            .context("launch embedded VK captcha helper")?;
+        if !output.status.success() {
+            bail!("VK captcha helper exited with status {}", output.status);
+        }
+
+        let token = parse_captcha_helper_token(&output.stdout)
+            .context("VK captcha helper returned no success token")?;
+        info!("VK CAPTCHA completed; resuming anonymous call-token request");
+        Ok(token)
     }
 
     async fn fetch_ok_session(&self) -> Result<String> {
@@ -468,11 +518,12 @@ impl TurnProvider for VkProvider {
     }
 
     fn relay_scope(&self) -> RelayScope {
-        // VK/MAX Calls credentials are used by the reference flow as ordinary
-        // RFC TURN allocations to the ToTS peer. Keep them in the generic TURN
-        // path; Jazz remains provider-session scoped because its TURN service
-        // rejects arbitrary peer permissions.
-        RelayScope::GenericTurn
+        // VK Calls credentials belong to a provider call session. Route them
+        // through the WebRTC ICE stack so allocation/permission/channel state
+        // is established before DTLS/SCTP/DataChannel traffic starts. This
+        // avoids sending ToTS application frames directly through a fresh TURN
+        // allocation.
+        RelayScope::ProviderSession
     }
 
     async fn get_credentials(&self) -> Result<TurnCredentials> {
@@ -508,9 +559,90 @@ impl TurnProvider for VkProvider {
             ("vk.ru".to_string(), 443),
             ("api.vk.ru".to_string(), 443),
             ("login.vk.ru".to_string(), 443),
+            ("id.vk.ru".to_string(), 443),
             ("calls.okcdn.ru".to_string(), 443),
         ]
     }
+}
+
+struct TempCaptchaHelper {
+    path: PathBuf,
+}
+
+impl TempCaptchaHelper {
+    fn materialize() -> Result<Self> {
+        if CAPTCHA_HELPER_BYTES.is_empty() {
+            bail!("embedded VK captcha helper is empty");
+        }
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let path = std::env::temp_dir().join(format!(
+            "tots-vk-captcha-{}-{}{}",
+            std::process::id(),
+            Uuid::new_v4().simple(),
+            suffix
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("create temporary VK captcha helper {}", path.display()))?;
+        file.write_all(CAPTCHA_HELPER_BYTES)
+            .context("write embedded VK captcha helper")?;
+        file.flush().context("flush embedded VK captcha helper")?;
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .context("mark VK captcha helper executable")?;
+        }
+
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempCaptchaHelper {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path) {
+            debug!(path = %self.path.display(), %error, "could not remove temporary VK captcha helper");
+        }
+    }
+}
+
+fn parse_captcha_helper_token(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(CAPTCHA_HELPER_TOKEN_PREFIX))
+        .map(str::trim)
+        .find(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+fn validate_captcha_redirect(challenge: &CaptchaChallenge) -> Result<()> {
+    if challenge.redirect_uri.trim().is_empty() || challenge.session_token.trim().is_empty() {
+        bail!("VK CAPTCHA response is missing redirect_uri/session_token");
+    }
+    let url = Url::parse(&challenge.redirect_uri).context("parse VK CAPTCHA redirect_uri")?;
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let allowed = host == "id.vk.ru"
+        || host == "vk.ru"
+        || host == "vk.com"
+        || host.ends_with(".vk.ru")
+        || host.ends_with(".vk.com");
+    if url.scheme() != "https"
+        || !allowed
+        || url.username() != ""
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+    {
+        bail!("VK CAPTCHA redirect_uri is not an allowed HTTPS VK endpoint");
+    }
+    Ok(())
 }
 
 async fn parse_json(response: Response) -> Result<Value> {
@@ -706,5 +838,24 @@ mod tests {
         assert_eq!(s.host, "turn.example.org");
         assert_eq!(s.port, 3478);
         assert!(parse_turn_url("turns:turn.example.org:5349?transport=tcp").is_none());
+    }
+
+    #[test]
+    fn captcha_helper_token_is_machine_readable() {
+        let out = b"noise\nTOTS_CAPTCHA_SUCCESS_TOKEN=abc123\n";
+        assert_eq!(parse_captcha_helper_token(out).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn captcha_redirect_is_restricted_to_vk_https() {
+        let challenge = CaptchaChallenge {
+            redirect_uri: "https://id.vk.ru/captcha?session_token=abc".to_string(),
+            session_token: "abc".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_captcha_redirect(&challenge).is_ok());
+        let mut bad = challenge.clone();
+        bad.redirect_uri = "https://example.org/captcha?session_token=abc".to_string();
+        assert!(validate_captcha_redirect(&bad).is_err());
     }
 }
