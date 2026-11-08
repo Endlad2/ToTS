@@ -259,47 +259,64 @@ async fn connect_mode(
 
     if provider.name() == "jazz" && host_is_not_publicly_relayable(&config.server) {
         bail!(
-            "Jazz provider did not expose its native room transport and generic TURN cannot target {}",
+            "Jazz provider did not expose its native room transport and fallback cannot target {}",
+            config.server
+        );
+    }
+    if provider.relay_scope() == RelayScope::ProviderSession
+        && provider.name() != "jazz"
+        && host_is_not_publicly_relayable(&config.server)
+    {
+        bail!(
+            "provider '{}' uses relay-only WebRTC ICE, but server '{}' is not a publicly relayable address; set tots-server --public-host to its public IP/DNS and regenerate the config",
+            provider.name(),
             config.server
         );
     }
 
-    if provider.relay_scope() == RelayScope::ProviderSession {
-        bail!(
-            "provider '{}' exposes call-scoped ICE/TURN state; generic TURN fallback to {}:{} is disabled. Use a standards-compliant provider-native WebRTC transport or an ordinary TURN service you control",
-            provider.name(),
-            config.server,
-            config.turn_port
-        );
-    }
-
-    info!(provider = provider.name(), "requesting provider TURN credentials");
+    info!(provider = provider.name(), "requesting provider TURN/ICE credentials");
     let creds = provider
         .get_credentials()
         .await
-        .context("TURN provider failed")?;
-    let route_exception_ipv4 = resolve_relay_ipv4(&creds).await;
-    let mut signaling = TurnTransport::connect(
-        &creds,
-        &config.server,
-        config.turn_port,
-        config.connect_timeout,
-    )
-    .await
-    .context("provider TURN signaling allocation failed")?;
+        .context("TURN/ICE provider failed")?;
+    let route_exception_ipv4 = resolve_provider_ipv4(provider.as_ref(), &creds).await;
 
-    let relay_webrtc = match WebRtcTransport::connect_via_turn(
-        &creds,
-        &mut signaling,
-        &cipher,
-        config.connect_timeout,
-    )
-    .await
-    {
-        Ok(transport) => transport,
-        Err(err) => {
-            signaling.close().await;
-            return Err(err).context("provider-relayed WebRTC setup failed");
+    let relay_webrtc = if provider.relay_scope() == RelayScope::ProviderSession {
+        info!(
+            provider = provider.name(),
+            "using provider session credentials as WebRTC ICE relay only"
+        );
+        WebRtcTransport::connect_via_turn_ice_http(
+            &config.server,
+            config.webrtc_port,
+            &creds,
+            config.connect_timeout,
+        )
+        .await
+        .context("provider-session WebRTC ICE relay setup failed")?
+    } else {
+        let mut signaling = TurnTransport::connect(
+            &creds,
+            &config.server,
+            config.turn_port,
+            config.connect_timeout,
+        )
+        .await
+        .context("provider TURN signaling allocation failed")?;
+
+        match WebRtcTransport::connect_via_turn(
+            &creds,
+            &mut signaling,
+            &cipher,
+            config.connect_timeout,
+        )
+        .await
+        {
+            Ok(transport) => transport,
+            Err(err) => {
+                signaling.close().await;
+                return Err(err).context("provider-relayed WebRTC setup failed");
+            }
         }
     };
     let mut transport = Transport::TurnWebRtc(relay_webrtc);
@@ -418,29 +435,65 @@ async fn authorize(
     }
 }
 
-async fn resolve_relay_ipv4(creds: &TurnCredentials) -> Vec<Ipv4Addr> {
+async fn resolve_provider_ipv4(
+    provider: &dyn TurnProvider,
+    creds: &TurnCredentials,
+) -> Vec<Ipv4Addr> {
+    let mut endpoints: Vec<(String, u16)> = creds
+        .servers
+        .iter()
+        .map(|server| (server.host.clone(), server.port))
+        .collect();
+    endpoints.extend(provider.route_exception_hosts());
+
     let mut unique = HashSet::new();
-    for server in &creds.servers {
-        if let Ok(ip) = server.host.parse::<IpAddr>() {
+    let mut seen_hosts = HashSet::new();
+    for (host, port) in endpoints {
+        if !seen_hosts.insert((host.clone(), port)) {
+            continue;
+        }
+        if let Ok(ip) = host.parse::<IpAddr>() {
             if let IpAddr::V4(ip) = ip {
-                unique.insert(ip);
+                if is_route_exception(ip) {
+                    info!(provider = provider.name(), %ip, "provider direct-route IPv4 discovered");
+                    unique.insert(ip);
+                }
             }
             continue;
         }
-        match lookup_host((server.host.as_str(), server.port)).await {
+
+        info!(provider = provider.name(), domain = %host, port, "provider direct-route domain discovered");
+        match lookup_host((host.as_str(), port)).await {
             Ok(addrs) => {
                 for addr in addrs {
                     if let IpAddr::V4(ip) = addr.ip() {
-                        unique.insert(ip);
+                        if is_route_exception(ip) && unique.insert(ip) {
+                            info!(provider = provider.name(), %ip, "provider direct-route IPv4 discovered");
+                        }
                     }
                 }
             }
-            Err(err) => warn!(host = %server.host, port = server.port, %err, "could not pre-resolve relay for full-tunnel route pinning"),
+            Err(err) => warn!(
+                provider = provider.name(),
+                host = %host,
+                port,
+                %err,
+                "could not pre-resolve provider endpoint for full-tunnel route pinning"
+            ),
         }
     }
     let mut result: Vec<_> = unique.into_iter().collect();
     result.sort();
     result
+}
+
+fn is_route_exception(ip: Ipv4Addr) -> bool {
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast())
 }
 #[cfg(test)]
 mod relay_host_tests {

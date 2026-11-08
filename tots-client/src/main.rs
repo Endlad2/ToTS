@@ -43,12 +43,11 @@ struct Cli {
     provider: Option<String>,
 
     /// Transport selection: auto prefers direct WebRTC, turn forces the selected
-    /// provider relay, and jazz forces the SaluteJazz room/SFU data transport.
-    #[arg(long, value_parser = ["auto", "turn", "jazz", "max"])]
+    /// provider relay. vk/max force their provider-scoped WebRTC-over-TURN path; jazz forces the SaluteJazz room/SFU data transport.
+    #[arg(long, value_parser = ["auto", "turn", "vk", "jazz", "max"])]
     transport: Option<String>,
 
-    /// Provider-specific JSON object. Jazz accepts {"join_link":"...","name":"..."};
-    /// join_link may be omitted to create a temporary guest call automatically.
+    /// Provider-specific JSON object. VK accepts join_link or access_token; MAX accepts access_token + group_id; Jazz accepts {"join_link":"...","name":"..."} and can auto-create a temporary guest call.
     #[arg(long)]
     provider_data: Option<String>,
 
@@ -126,10 +125,11 @@ async fn main() -> Result<()> {
     let cli = resolve_cli(Cli::parse())?;
     let transport_preference = match cli.transport.as_str() {
         "auto" => TransportPreference::Auto,
-        "turn" | "jazz" | "max" => TransportPreference::ProviderRelay,
+        "turn" | "vk" | "jazz" | "max" => TransportPreference::ProviderRelay,
         other => bail!("unsupported transport '{other}'"),
     };
     let effective_provider = match cli.transport.as_str() {
+        "vk" => "vk",
         "jazz" => "jazz",
         "max" => "max",
         _ => cli.provider.as_str(),

@@ -9,6 +9,8 @@ use url::Url;
 use uuid::Uuid;
 
 const API_VERSION: &str = "5.282";
+const ACCOUNT_API_VERSION: &str = "5.285";
+const DEFAULT_ACCOUNT_APP_ID: &str = "6287487";
 
 // Public application credentials present in the repository supplied by the user.
 // Prefer explicitly passing client_id/client_secret in provider_data so these can
@@ -26,6 +28,19 @@ pub struct VkProviderData {
     /// Full `https://vk.ru/call/join/<code>` URL or just `<code>`.
     #[serde(default)]
     pub join_link: String,
+
+    /// Optional authenticated VK access token. When present, ToTS can create
+    /// (or attach to) a Calls conversation and request its ICE/TURN parameters
+    /// without relying on the anonymous join-link flow.
+    #[serde(default, alias = "token")]
+    pub access_token: Option<String>,
+    /// Optional existing Calls conversation UUID for the authenticated path.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    /// VK application id used by messages.getCallToken (defaults to 6287487).
+    #[serde(default)]
+    pub app_id: Option<String>,
+
     #[serde(default)]
     pub client_id: Option<String>,
     #[serde(default)]
@@ -62,7 +77,21 @@ struct CaptchaChallenge {
 
 impl VkProvider {
     pub fn new(data: VkProviderData) -> Result<Self> {
-        let link_code = extract_join_code(&data.join_link)?;
+        let has_override = data.turn_username.is_some()
+            && data.turn_password.is_some()
+            && data.turn_urls.as_ref().is_some_and(|urls| !urls.is_empty());
+        let has_account = data
+            .access_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+        let link_code = if data.join_link.trim().is_empty() {
+            if !has_override && !has_account {
+                bail!("VK provider_data.join_link or provider_data.access_token is required");
+            }
+            String::new()
+        } else {
+            extract_join_code(&data.join_link)?
+        };
         let http = Client::builder()
             .cookie_store(true)
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36")
@@ -99,7 +128,10 @@ impl VkProvider {
     }
 
     async fn fetch_chain(&self, client_id: &str, client_secret: &str) -> Result<TurnCredentials> {
-        // Warm the join page/cookie jar like the reference implementation.
+        if self.link_code.is_empty() {
+            bail!("VK anonymous flow requires provider_data.join_link");
+        }
+        // Warm the join page/cookie jar like the browser flow.
         let _ = self
             .http
             .get(format!("https://vk.ru/call/join/{}", self.link_code))
@@ -238,6 +270,9 @@ impl VkProvider {
     }
 
     async fn fetch_turn_credentials(&self, token2: &str, session_key: &str) -> Result<TurnCredentials> {
+        if self.link_code.is_empty() {
+            bail!("VK anonymous flow requires provider_data.join_link");
+        }
         let value = self
             .post_form(
                 "https://calls.okcdn.ru/fb.do".to_string(),
@@ -254,41 +289,161 @@ impl VkProvider {
                 ],
             )
             .await?;
+        parse_turn_credentials(&value, "VK")
+    }
 
-        let ts = value
-            .get("turn_server")
-            .ok_or_else(|| anyhow!("turn_server missing from VK/OK response: {value}"))?;
-        let username = ts
-            .get("username")
+    async fn get_via_account(&self, access_token: &str) -> Result<TurnCredentials> {
+        let app_id = self
+            .data
+            .app_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(DEFAULT_ACCOUNT_APP_ID);
+
+        let conversation_id = if let Some(existing) = self
+            .data
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            existing.to_string()
+        } else {
+            let creator = self.open_account_session(access_token, app_id).await?;
+            self.start_account_conversation(&creator.0, &creator.1, app_id)
+                .await?
+        };
+
+        // Obtain ICE/TURN parameters through a fresh Calls session.
+        let (api_url, session_key) = self.open_account_session(access_token, app_id).await?;
+        let value = self
+            .post_form(
+                api_url,
+                vec![
+                    ("conversationId", conversation_id),
+                    ("method", "vchat.getConversationParams".to_string()),
+                    ("format", "JSON".to_string()),
+                    ("application_key", "CGMMEJLGDIHBABABA".to_string()),
+                    ("session_key", session_key),
+                ],
+            )
+            .await
+            .context("VK vchat.getConversationParams")?;
+        ensure_api_ok(&value, "VK vchat.getConversationParams")?;
+        parse_turn_credentials(&value, "VK")
+    }
+
+    async fn open_account_session(
+        &self,
+        access_token: &str,
+        app_id: &str,
+    ) -> Result<(String, String)> {
+        let token_url = format!(
+            "https://api.vk.ru/method/messages.getCallToken?v={ACCOUNT_API_VERSION}&client_id={app_id}"
+        );
+        let token_value = self
+            .post_form(
+                token_url,
+                vec![
+                    ("env", "production".to_string()),
+                    ("access_token", access_token.to_string()),
+                ],
+            )
+            .await
+            .context("VK messages.getCallToken")?;
+        ensure_api_ok(&token_value, "VK messages.getCallToken")?;
+        let response = token_value
+            .get("response")
+            .ok_or_else(|| anyhow!("VK messages.getCallToken response missing"))?;
+        let call_token = response
+            .get("token")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("turn_server.username missing"))?
-            .to_string();
-        let password = ts
-            .get("credential")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("turn_server.credential missing"))?
-            .to_string();
-        let urls = ts
-            .get("urls")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow!("turn_server.urls missing"))?;
-        let mut servers = Vec::new();
-        for value in urls {
-            if let Some(raw) = value.as_str() {
-                if let Some(server) = parse_turn_url(raw) {
-                    servers.push(server);
-                }
-            }
-        }
-        if servers.is_empty() {
-            bail!("VK returned no UDP TURN URLs usable by this build");
-        }
-        debug!(count = servers.len(), "VK TURN credentials acquired");
-        Ok(TurnCredentials {
-            username,
-            password,
-            servers,
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("VK messages.getCallToken token missing"))?;
+        let api_url = validate_calls_api_url(
+            response
+                .get("api_base_url")
+                .and_then(Value::as_str)
+                .unwrap_or("https://calls.okcdn.ru/fb.do"),
+        )?;
+
+        let device_id = Uuid::new_v4().to_string();
+        let session_data = serde_json::json!({
+            "auth_token": call_token,
+            "version": 3,
+            "device_id": device_id,
+            "client_version": "1.0.1"
         })
+        .to_string();
+        let login = self
+            .post_form(
+                api_url.clone(),
+                vec![
+                    ("session_data", session_data),
+                    ("device_id", device_id),
+                    ("verification_supported", "true".to_string()),
+                    ("verification_supported_v", "1".to_string()),
+                    ("client", "test".to_string()),
+                    ("gen_token", "true".to_string()),
+                    ("method", "auth.anonymLogin".to_string()),
+                    ("format", "JSON".to_string()),
+                    ("application_key", "CGMMEJLGDIHBABABA".to_string()),
+                ],
+            )
+            .await
+            .context("VK Calls auth.anonymLogin")?;
+        ensure_api_ok(&login, "VK Calls auth.anonymLogin")?;
+        let session_key = login
+            .get("session_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("VK Calls session_key missing"))?
+            .to_string();
+        Ok((api_url, session_key))
+    }
+
+    async fn start_account_conversation(
+        &self,
+        api_url: &str,
+        session_key: &str,
+        app_id: &str,
+    ) -> Result<String> {
+        let conversation_id = Uuid::new_v4().to_string();
+        let payload = serde_json::json!({
+            "is_video": true,
+            "with_join_link": true,
+            "join_by_link": true,
+            "community_user_id": 0,
+            "caller_app_id": app_id.parse::<u64>().unwrap_or(6287487)
+        })
+        .to_string();
+        let value = self
+            .post_form(
+                api_url.to_string(),
+                vec![
+                    ("conversationId", conversation_id.clone()),
+                    ("isVideo", "true".to_string()),
+                    ("protocolVersion", "5".to_string()),
+                    ("createJoinLink", "true".to_string()),
+                    ("payload", payload),
+                    ("onlyAdminCanShareMovie", "false".to_string()),
+                    ("externalIds", String::new()),
+                    ("method", "vchat.startConversation".to_string()),
+                    ("format", "JSON".to_string()),
+                    ("application_key", "CGMMEJLGDIHBABABA".to_string()),
+                    ("session_key", session_key.to_string()),
+                ],
+            )
+            .await
+            .context("VK vchat.startConversation")?;
+        ensure_api_ok(&value, "VK vchat.startConversation")?;
+        Ok(value
+            .get("id")
+            .or_else(|| value.get("conversationId"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&conversation_id)
+            .to_string())
     }
 
     async fn post_form(&self, url: String, form: Vec<(&str, String)>) -> Result<Value> {
@@ -313,7 +468,11 @@ impl TurnProvider for VkProvider {
     }
 
     fn relay_scope(&self) -> RelayScope {
-        RelayScope::ProviderSession
+        // VK/MAX Calls credentials are used by the reference flow as ordinary
+        // RFC TURN allocations to the ToTS peer. Keep them in the generic TURN
+        // path; Jazz remains provider-session scoped because its TURN service
+        // rejects arbitrary peer permissions.
+        RelayScope::GenericTurn
     }
 
     async fn get_credentials(&self) -> Result<TurnCredentials> {
@@ -332,7 +491,25 @@ impl TurnProvider for VkProvider {
                 servers,
             });
         }
+        if let Some(access_token) = self
+            .data
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return self.get_via_account(access_token).await;
+        }
         self.get_via_vk().await
+    }
+
+    fn route_exception_hosts(&self) -> Vec<(String, u16)> {
+        vec![
+            ("vk.ru".to_string(), 443),
+            ("api.vk.ru".to_string(), 443),
+            ("login.vk.ru".to_string(), 443),
+            ("calls.okcdn.ru".to_string(), 443),
+        ]
     }
 }
 
@@ -397,10 +574,95 @@ fn value_to_string(v: Option<&Value>) -> String {
     }
 }
 
+fn ensure_api_ok(value: &Value, action: &str) -> Result<()> {
+    if let Some(error) = value.get("error") {
+        if !error.is_null() && error != &Value::Bool(false) {
+            bail!("{action} error: {error}");
+        }
+    }
+    if let Some(code) = value.get("error_code") {
+        let nonzero = match code {
+            Value::Number(number) => number.as_i64().unwrap_or_default() != 0,
+            Value::String(text) => text != "0" && !text.is_empty(),
+            _ => false,
+        };
+        if nonzero {
+            bail!("{action} error_code={code}: {}", value.get("error_msg").and_then(Value::as_str).unwrap_or("API error"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_calls_api_url(raw: &str) -> Result<String> {
+    let mut url = Url::parse(raw).context("parse VK Calls api_base_url")?;
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let allowed_host = host == "okcdn.ru" || host.ends_with(".okcdn.ru") || host == "api.ok.ru";
+    if url.scheme() != "https"
+        || !allowed_host
+        || url.username() != ""
+        || url.password().is_some()
+        || url.port_or_known_default() != Some(443)
+    {
+        bail!("VK Calls api_base_url is not an allowed HTTPS Calls endpoint");
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    if url.path().is_empty() || url.path() == "/" {
+        url.set_path("/fb.do");
+    }
+    if url.path() != "/fb.do" {
+        bail!("VK Calls api_base_url path must be /fb.do");
+    }
+    Ok(url.to_string())
+}
+
+fn parse_turn_credentials(value: &Value, provider: &str) -> Result<TurnCredentials> {
+    let ts = value
+        .get("turn_server")
+        .or_else(|| value.pointer("/response/turn_server"))
+        .or_else(|| value.get("turn_servers").and_then(Value::as_array).and_then(|items| items.first()))
+        .or_else(|| value.get("iceServers").and_then(Value::as_array).and_then(|items| items.first()))
+        .ok_or_else(|| anyhow!("{provider} turn_server missing: {value}"))?;
+    let username = ts
+        .get("username")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{provider} turn_server.username missing"))?
+        .to_string();
+    let password = ts
+        .get("credential")
+        .or_else(|| ts.get("password"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{provider} turn_server.credential missing"))?
+        .to_string();
+
+    let mut servers = Vec::new();
+    if let Some(urls) = ts.get("urls").and_then(Value::as_array) {
+        servers.extend(urls.iter().filter_map(Value::as_str).filter_map(parse_turn_url));
+    } else if let Some(url) = ts.get("urls").and_then(Value::as_str) {
+        if let Some(server) = parse_turn_url(url) {
+            servers.push(server);
+        }
+    } else if let Some(url) = ts.get("url").and_then(Value::as_str) {
+        if let Some(server) = parse_turn_url(url) {
+            servers.push(server);
+        }
+    }
+
+    if servers.is_empty() {
+        bail!("{provider} returned no UDP TURN URLs usable by this build");
+    }
+    debug!(count = servers.len(), provider = provider, "provider TURN/ICE credentials acquired");
+    Ok(TurnCredentials {
+        username,
+        password,
+        servers,
+    })
+}
+
 fn parse_turn_url(raw: &str) -> Option<TurnServer> {
     let raw = raw.trim();
     if raw.starts_with("turns:") {
-        return None; // turnclient 0.5 is UDP-only; no TURN/TLS in this MVP.
+        return None; // This transport currently pins provider WebRTC relay to TURN/UDP.
     }
     let rest = raw.strip_prefix("turn:")?;
     let (authority, query) = rest.split_once('?').unwrap_or((rest, ""));

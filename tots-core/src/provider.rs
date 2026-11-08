@@ -69,4 +69,12 @@ pub trait TurnProvider: Send + Sync {
     /// Obtain ordinary TURN credentials. Used only when connect_transport()
     /// returns None.
     async fn get_credentials(&self) -> Result<TurnCredentials>;
+
+    /// Provider control-plane hosts that may still be needed while a full-tunnel
+    /// route is active (token refresh, call/session APIs, WebSocket signaling).
+    /// The client resolves these before installing the TUN default route and pins
+    /// the resulting IPv4 addresses through the original physical gateway.
+    fn route_exception_hosts(&self) -> Vec<(String, u16)> {
+        Vec::new()
+    }
 }

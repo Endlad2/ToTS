@@ -71,10 +71,67 @@ impl WebRtcTransport {
         finish_peer(prepared, answer, connect_timeout).await
     }
 
-    /// Builds a genuine WebRTC DataChannel whose ICE candidates are forced to
-    /// the provider TURN servers. SDP signaling itself is carried over a small
-    /// temporary raw TURN allocation to the server's `turn_port`, so the
-    /// direct HTTP signaling path is not required for fallback mode.
+    /// Builds a standards-compliant WebRTC DataChannel using the provider's
+    /// TURN servers only as ICE relays. SDP signaling is ordinary HTTP to the
+    /// ToTS server, so no application payload is sent through the provider TURN
+    /// allocation before ICE/DTLS/SCTP are established.
+    pub async fn connect_via_turn_ice_http(
+        server: &str,
+        port: u16,
+        creds: &TurnCredentials,
+        connect_timeout: Duration,
+    ) -> Result<Self> {
+        let urls: Vec<String> = creds
+            .servers
+            .iter()
+            .map(|s| {
+                if s.host.contains(':') {
+                    format!("turn:[{}]:{}?transport=udp", s.host, s.port)
+                } else {
+                    format!("turn:{}:{}?transport=udp", s.host, s.port)
+                }
+            })
+            .collect();
+        if urls.is_empty() {
+            return Err(anyhow!("provider returned no TURN servers for WebRTC ICE"));
+        }
+
+        let config = RTCConfigurationBuilder::default()
+            .with_ice_servers(vec![RTCIceServer {
+                urls,
+                username: creds.username.clone(),
+                credential: creds.password.clone(),
+            }])
+            .with_ice_transport_policy(RTCIceTransportPolicy::Relay)
+            .build();
+
+        let mut prepared = prepare_peer(config).await?;
+        let local = make_local_offer(&prepared.pc, &mut prepared.gather_rx, connect_timeout).await?;
+
+        let url_host = match server.parse::<IpAddr>() {
+            Ok(IpAddr::V6(_)) => format!("[{server}]"),
+            _ => server.to_string(),
+        };
+        let url = format!("http://{url_host}:{port}/webrtc/offer");
+        let answer: RTCSessionDescription = timeout(
+            connect_timeout,
+            reqwest::Client::new().post(url).json(&local).send(),
+        )
+        .await
+        .context("provider-relayed WebRTC signaling timeout")??
+        .error_for_status()
+        .context("provider-relayed WebRTC signaling HTTP error")?
+        .json()
+        .await
+        .context("decode provider-relayed WebRTC answer")?;
+
+        finish_peer(prepared, answer, connect_timeout).await
+    }
+
+    /// Generic TURN fallback. SDP signaling itself is carried over a temporary
+    /// TURN allocation to the server's `turn_port`; this is kept only for
+    /// ordinary RFC TURN providers and is never used for provider call/session
+    /// credentials such as VK/MAX/Jazz.
     pub async fn connect_via_turn(
         creds: &TurnCredentials,
         signaling: &mut TurnTransport,

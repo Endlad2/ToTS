@@ -409,6 +409,8 @@ async fn create_config(
         "jazz".to_string()
     } else if req.transport.eq_ignore_ascii_case("max") {
         "max".to_string()
+    } else if req.transport.eq_ignore_ascii_case("vk") {
+        "vk".to_string()
     } else {
         req.provider.clone()
     };
