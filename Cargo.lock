@@ -3464,6 +3464,7 @@ dependencies = [
 name = "tots-client"
 version = "0.1.0"
 dependencies = [
+ "quinn",
  "anyhow",
  "clap",
  "serde_json",
@@ -3482,6 +3483,7 @@ dependencies = [
 name = "tots-core"
 version = "0.1.0"
 dependencies = [
+ "quinn",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
@@ -3552,6 +3554,7 @@ dependencies = [
 name = "tots-server"
 version = "0.1.0"
 dependencies = [
+ "quinn",
  "anyhow",
  "async-trait",
  "axum",

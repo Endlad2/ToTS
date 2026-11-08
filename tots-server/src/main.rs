@@ -1,4 +1,5 @@
 mod gateway;
+mod proxy;
 mod stun;
 
 use std::{
@@ -41,7 +42,7 @@ use webrtc::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "tots-server", version, about = "ToTS VPN relay/server")]
+#[command(name = "tots-server", version, about = "ToTS WebRTC/QUIC proxy relay server")]
 struct Cli {
     /// Address written into generated client configs when --stun is not used.
     #[arg(long, default_value = "127.0.0.1")]
@@ -71,7 +72,7 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_WEBRTC_PORT)]
     webrtc_port: u16,
 
-    /// UDP target port reached by a client through its provider TURN relay.
+    /// Legacy/generic TURN bootstrap target port. Normal SOCKS5-over-QUIC data runs inside the provider/WebRTC carrier.
     #[arg(long, default_value_t = DEFAULT_TURN_PORT)]
     turn_port: u16,
 
@@ -479,12 +480,14 @@ async fn create_config(
         provider_data,
         transport: req.transport,
         local_port: req.local_port,
-        tun: req.tun,
+        // New configs are SOCKS5-over-QUIC. TUN fields remain in the URI only for
+        // backward compatibility with older clients.
+        tun: false,
         tun_name: req.tun_name,
         tun_address: req.tun_address,
         tun_prefix: req.tun_prefix,
         tun_mtu: req.tun_mtu,
-        tun_default_route: req.tun_default_route,
+        tun_default_route: false,
         tun_dns: req.tun_dns,
         webrtc_port: state.webrtc_port,
         turn_port: state.turn_port,
@@ -626,6 +629,7 @@ async fn serve_jazz_data_plane(
     let backend: Arc<Mutex<Option<Arc<UdpSocket>>>> = Arc::new(Mutex::new(None));
     let tun_session: Arc<Mutex<Option<(TunGateway, mpsc::Sender<Vec<u8>>)>>> =
         Arc::new(Mutex::new(None));
+    let mut proxy_inbound: Option<mpsc::UnboundedSender<Vec<u8>>> = None;
 
     loop {
         let packet = data.recv().await.context("receive Jazz ToTS packet")?;
@@ -701,8 +705,36 @@ async fn serve_jazz_data_plane(
                 )
                 .await?;
             }
+            Frame::AuthProxy { device_id } => {
+                let valid = device_id == expected_device_id
+                    && state.devices.read().await.contains(&device_id);
+                let (ok, message) = if valid {
+                    *backend.lock().await = None;
+                    *tun_session.lock().await = None;
+                    match proxy::start_quic_proxy() {
+                        Ok((bridge, _task)) => {
+                            proxy_inbound = Some(bridge.inbound.clone());
+                            spawn_proxy_to_jazz(bridge.outbound, data.clone(), state.cipher.clone());
+                            (true, "ok".to_string())
+                        }
+                        Err(err) => (false, format!("cannot start nested QUIC proxy: {err}")),
+                    }
+                } else {
+                    (false, "invalid device_id for this Jazz room".to_string())
+                };
+                send_jazz_frame(
+                    &data,
+                    &state.cipher,
+                    Frame::AuthResult { ok, message },
+                )
+                .await?;
+            }
             Frame::Data { payload } => {
-                if let Some((gateway, return_tx)) = tun_session.lock().await.clone() {
+                if let Some(inbound) = proxy_inbound.clone() {
+                    if inbound.send(payload).is_err() {
+                        proxy_inbound = None;
+                    }
+                } else if let Some((gateway, return_tx)) = tun_session.lock().await.clone() {
                     if let Err(err) = gateway.forward_from_client(&payload, return_tx).await {
                         warn!(%expected_device_id, %err, "discarding invalid Jazz TUN payload");
                     }
@@ -726,6 +758,21 @@ async fn serve_jazz_data_plane(
             | Frame::Pong { .. } => {}
         }
     }
+}
+
+fn spawn_proxy_to_jazz(
+    mut packets: mpsc::UnboundedReceiver<Vec<u8>>,
+    data: jazz_session::JazzDataPlane,
+    cipher: PacketCipher,
+) {
+    tokio::spawn(async move {
+        while let Some(payload) = packets.recv().await {
+            if let Err(err) = send_jazz_frame(&data, &cipher, Frame::Data { payload }).await {
+                warn!(%err, "failed to return nested QUIC datagram over Jazz");
+                break;
+            }
+        }
+    });
 }
 
 fn spawn_tun_to_jazz(
@@ -927,6 +974,18 @@ async fn run_turn_ingress(state: AppState) -> Result<()> {
                         return Err(err.into());
                     }
                 }
+            }
+            Frame::AuthProxy { .. } => {
+                send_udp_frame(
+                    &socket,
+                    source,
+                    &state.cipher,
+                    Frame::AuthResult {
+                        ok: false,
+                        message: "SOCKS5/QUIC proxy auth must run inside the WebRTC/provider data carrier".to_string(),
+                    },
+                )
+                .await?;
             }
             Frame::SignalOffer { sdp_json } => {
                 let offer: RTCSessionDescription = match serde_json::from_str(&sdp_json) {
@@ -1143,6 +1202,7 @@ async fn serve_data_channel(state: AppState, data_channel: Arc<dyn DataChannel>)
     let backend: Arc<Mutex<Option<Arc<UdpSocket>>>> = Arc::new(Mutex::new(None));
     let tun_session: Arc<Mutex<Option<(TunGateway, mpsc::Sender<Vec<u8>>)>>> =
         Arc::new(Mutex::new(None));
+    let mut proxy_inbound: Option<mpsc::UnboundedSender<Vec<u8>>> = None;
 
     while let Some(event) = data_channel.poll().await {
         match event {
@@ -1226,8 +1286,39 @@ async fn serve_data_channel(state: AppState, data_channel: Arc<dyn DataChannel>)
                         )
                         .await?;
                     }
+                    Frame::AuthProxy { device_id } => {
+                        let valid = state.devices.read().await.contains(&device_id);
+                        let (ok, message) = if valid {
+                            *backend.lock().await = None;
+                            *tun_session.lock().await = None;
+                            match proxy::start_quic_proxy() {
+                                Ok((bridge, _task)) => {
+                                    proxy_inbound = Some(bridge.inbound.clone());
+                                    spawn_proxy_to_data_channel(
+                                        bridge.outbound,
+                                        data_channel.clone(),
+                                        state.cipher.clone(),
+                                    );
+                                    (true, "ok".to_string())
+                                }
+                                Err(err) => (false, format!("cannot start nested QUIC proxy: {err}")),
+                            }
+                        } else {
+                            (false, "invalid device_id".to_string())
+                        };
+                        send_data_channel_frame(
+                            &data_channel,
+                            &state.cipher,
+                            Frame::AuthResult { ok, message },
+                        )
+                        .await?;
+                    }
                     Frame::Data { payload } => {
-                        if let Some((gateway, return_tx)) = tun_session.lock().await.clone() {
+                        if let Some(inbound) = proxy_inbound.clone() {
+                            if inbound.send(payload).is_err() {
+                                proxy_inbound = None;
+                            }
+                        } else if let Some((gateway, return_tx)) = tun_session.lock().await.clone() {
                             if let Err(err) = gateway.forward_from_client(&payload, return_tx).await {
                                 warn!(%err, "discarding invalid WebRTC TUN payload");
                             }
@@ -1264,6 +1355,21 @@ async fn serve_data_channel(state: AppState, data_channel: Arc<dyn DataChannel>)
     Ok(())
 }
 
+
+fn spawn_proxy_to_data_channel(
+    mut packets: mpsc::UnboundedReceiver<Vec<u8>>,
+    data_channel: Arc<dyn DataChannel>,
+    cipher: PacketCipher,
+) {
+    tokio::spawn(async move {
+        while let Some(payload) = packets.recv().await {
+            if let Err(err) = send_data_channel_frame(&data_channel, &cipher, Frame::Data { payload }).await {
+                warn!(%err, "failed to return nested QUIC datagram over WebRTC");
+                break;
+            }
+        }
+    });
+}
 
 fn spawn_tun_to_data_channel(
     mut packets: mpsc::Receiver<Vec<u8>>,

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Frame {
@@ -22,4 +22,7 @@ pub enum Frame {
     /// Explicit layer-3 TUN session. Appended to preserve the discriminants of
     /// all protocol-v1 frames while protocol version 2 negotiates support.
     AuthTun { device_id: Uuid },
+
+    /// Authenticated SOCKS5/QUIC proxy session. Data frames carry QUIC datagrams.
+    AuthProxy { device_id: Uuid },
 }

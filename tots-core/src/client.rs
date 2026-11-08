@@ -61,11 +61,12 @@ impl Default for ClientConfig {
 enum SessionMode {
     LegacyPayload,
     Tun,
+    Proxy,
 }
 
-/// An authenticated ToTS data session. It exposes raw payload datagrams so
-/// front-ends can attach either the legacy local UDP/KCP socket or a real TUN
-/// interface without re-implementing transport selection/authentication.
+/// An authenticated ToTS data session. It exposes raw payload datagrams so the
+/// SOCKS5/QUIC front-end and explicit legacy UDP/TUN front-ends can share the
+/// same transport selection and authentication logic.
 pub struct ClientSession {
     transport: Transport,
     cipher: PacketCipher,
@@ -142,6 +143,15 @@ pub async fn connect_tun(
     provider: Arc<dyn TurnProvider>,
 ) -> Result<ClientSession> {
     connect_mode(config, provider, SessionMode::Tun).await
+}
+
+/// Establishes an authenticated SOCKS5/QUIC proxy session. The outer ToTS
+/// transport carries QUIC datagrams; the server performs TCP/UDP egress.
+pub async fn connect_proxy(
+    config: &ClientConfig,
+    provider: Arc<dyn TurnProvider>,
+) -> Result<ClientSession> {
+    connect_mode(config, provider, SessionMode::Proxy).await
 }
 
 fn host_is_not_publicly_relayable(host: &str) -> bool {
@@ -423,6 +433,7 @@ async fn authorize(
     let frame = match mode {
         SessionMode::LegacyPayload => Frame::Auth { device_id },
         SessionMode::Tun => Frame::AuthTun { device_id },
+        SessionMode::Proxy => Frame::AuthProxy { device_id },
     };
     transport.send(cipher.seal(&frame)?).await?;
     let packet = timeout(wait, transport.recv())

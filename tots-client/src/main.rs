@@ -1,3 +1,5 @@
+mod socks5;
+
 #[cfg(windows)]
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -22,7 +24,7 @@ use tun_rs::DeviceBuilder;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
-#[command(name = "tots-client", version, about = "ToTS VPN client")]
+#[command(name = "tots-client", version, about = "ToTS SOCKS5-over-QUIC client")]
 struct Cli {
     /// Self-contained server-issued config: tots://<base64-json>.
     /// Values explicitly supplied on the command line override the URI values.
@@ -51,12 +53,12 @@ struct Cli {
     #[arg(long)]
     provider_data: Option<String>,
 
-    /// Legacy local UDP/KCP-facing port. Ignored when --tun is enabled.
-    #[arg(long)]
+    /// Local SOCKS5 TCP port (127.0.0.1:<port>). In explicit --tun compatibility mode this is unused.
+    #[arg(long, visible_alias = "socks-port")]
     local_port: Option<u16>,
 
-    /// Create a real layer-3 TUN interface and tunnel raw IP packets instead of
-    /// opening the legacy local UDP/KCP-facing socket.
+    /// Legacy compatibility only: create the old layer-3 TUN interface.
+    /// New configs run SOCKS5-over-QUIC by default and ignore the URI tun flag.
     #[arg(long, default_value_t = false)]
     tun: bool,
 
@@ -167,7 +169,8 @@ async fn main() -> Result<()> {
     if cli.tun {
         run_tun(config, provider, &cli).await
     } else {
-        tots_core::run(config, provider).await
+        let socks_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cli.local_port);
+        socks5::run_socks5_quic(config, provider, socks_bind).await
     }
 }
 
@@ -212,7 +215,9 @@ fn resolve_cli(cli: Cli) -> Result<ResolvedCli> {
         .local_port
         .or_else(|| uri_config.as_ref().map(|c| c.local_port))
         .unwrap_or(DEFAULT_LOCAL_PORT);
-    let tun = cli.tun || uri_config.as_ref().map(|c| c.tun).unwrap_or(false);
+    // `tun` in older tots:// URIs is intentionally ignored. TUN is now an
+    // explicit compatibility switch; the default data plane is SOCKS5 over QUIC.
+    let tun = cli.tun;
     let tun_name = cli
         .tun_name
         .or_else(|| uri_config.as_ref().map(|c| c.tun_name.clone()))
