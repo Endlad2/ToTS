@@ -1,19 +1,13 @@
 [workspace]
 resolver = "2"
-members = [
-  "tots-core",
-  "tots-client",
-  "tots-server",
-  "Providers/vk",
-  "Providers/jazz",
-  "Providers/max",
-  "Providers/jazz-session",
-]
+members = ["tots-core", "tots-client", "tots-ios", "tots-server"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
+rust-version = "1.82"
+repository = "https://github.com/YOUR_GITHUB_ORG/ToTS"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -22,23 +16,31 @@ axum = "0.8"
 base64 = "0.22"
 bytes = "1"
 chacha20poly1305 = "0.10"
-clap = { version = "4", features = ["derive", "env"] }
-futures = "0.3"
-hex = "0.4"
-postcard = { version = "1", features = ["alloc"] }
-quinn = { version = "0.11.12", default-features = true }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+crc32fast = "1"
+dashmap = "6"
+hmac = "0.12"
+md-5 = "0.10"
+parking_lot = "0.12"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tun-rs = { version = "2.8.16", features = ["async"] }
-turnclient = "0.5"
+tun = { version = "0.8", features = ["async"] }
+url = "2.5"
 uuid = { version = "1", features = ["v4", "serde"] }
-webrtc = "0.21.1"
-url = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

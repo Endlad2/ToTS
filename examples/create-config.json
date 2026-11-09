@@ -1,0 +1,10 @@
+{
+  "provider": "vk",
+  "provider_data": {
+    "vk_call_links": ["https://vk.ru/call/join/REPLACE_ME"],
+    "vk_token": null
+  },
+  "password": "replace-with-a-long-random-password",
+  "device_id": "00000000-0000-4000-8000-000000000001",
+  "valid_days": 30
+}

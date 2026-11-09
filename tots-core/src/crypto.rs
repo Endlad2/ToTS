@@ -1,90 +1,37 @@
-use anyhow::{anyhow, Context, Result};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
-    ChaCha20Poly1305, Nonce,
-};
-use rand::RngCore;
+use crate::{Error, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20poly1305::{aead::{Aead, Payload}, KeyInit, XChaCha20Poly1305, XNonce};
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
-
-use crate::Frame;
-
-const NONCE_LEN: usize = 12;
-const AAD: &[u8] = b"TOTS/1";
+use uuid::Uuid;
 
 #[derive(Clone)]
-pub struct PacketCipher {
-    cipher: ChaCha20Poly1305,
-}
+pub struct PacketCrypto { key: [u8; 32] }
 
-impl PacketCipher {
-    pub fn new(password: &str) -> Self {
-        let digest = Sha256::digest(password.as_bytes());
-        let cipher = ChaCha20Poly1305::new_from_slice(&digest)
-            .expect("SHA-256 always produces a 32-byte key");
-        Self { cipher }
+impl PacketCrypto {
+    pub fn derive(password: &str, device: Uuid) -> Result<Self> {
+        let mut salt = Sha256::new();
+        salt.update(b"ToTS v1 packet key");
+        salt.update(device.as_bytes());
+        let salt = salt.finalize();
+        let mut key = [0u8; 32];
+        let params = Params::new(64 * 1024, 3, 1, Some(32)).map_err(|_| Error::Crypto)?;
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password_into(password.as_bytes(), &salt[..16], &mut key)
+            .map_err(|_| Error::Crypto)?;
+        Ok(Self { key })
     }
 
-    pub fn seal(&self, frame: &Frame) -> Result<Vec<u8>> {
-        let plaintext = postcard::to_allocvec(frame).context("serialize ToTS frame")?;
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = self
-            .cipher
-            .encrypt(
-                nonce,
-                chacha20poly1305::aead::Payload {
-                    msg: &plaintext,
-                    aad: AAD,
-                },
-            )
-            .map_err(|_| anyhow!("ChaCha20-Poly1305 encryption failed"))?;
-
-        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-        out.extend_from_slice(&nonce_bytes);
-        out.extend_from_slice(&ciphertext);
-        Ok(out)
+    pub fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Result<([u8; 24], Vec<u8>)> {
+        let mut nonce = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce);
+        let cipher = XChaCha20Poly1305::new((&self.key).into());
+        let ciphertext = cipher.encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad }).map_err(|_| Error::Crypto)?;
+        Ok((nonce, ciphertext))
     }
 
-    pub fn open(&self, packet: &[u8]) -> Result<Frame> {
-        if packet.len() <= NONCE_LEN {
-            return Err(anyhow!("encrypted packet too short"));
-        }
-        let (nonce_bytes, ciphertext) = packet.split_at(NONCE_LEN);
-        let nonce = Nonce::from_slice(nonce_bytes);
-        let plaintext = self
-            .cipher
-            .decrypt(
-                nonce,
-                chacha20poly1305::aead::Payload {
-                    msg: ciphertext,
-                    aad: AAD,
-                },
-            )
-            .map_err(|_| anyhow!("ChaCha20-Poly1305 authentication failed"))?;
-        postcard::from_bytes(&plaintext).context("decode ToTS frame")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip() {
-        let cipher = PacketCipher::new("01234567890123456789012345678901");
-        let frame = Frame::Data {
-            payload: vec![1, 2, 3, 4],
-        };
-        let packet = cipher.seal(&frame).unwrap();
-        assert_eq!(cipher.open(&packet).unwrap(), frame);
-    }
-
-    #[test]
-    fn tamper_is_rejected() {
-        let cipher = PacketCipher::new("secret");
-        let mut packet = cipher.seal(&Frame::Ping { nonce: 7 }).unwrap();
-        *packet.last_mut().unwrap() ^= 1;
-        assert!(cipher.open(&packet).is_err());
+    pub fn open(&self, aad: &[u8], nonce: &[u8; 24], ciphertext: &[u8]) -> Result<Vec<u8>> {
+        let cipher = XChaCha20Poly1305::new((&self.key).into());
+        cipher.decrypt(XNonce::from_slice(nonce), Payload { msg: ciphertext, aad }).map_err(|_| Error::Crypto)
     }
 }

@@ -1,3 +1,8 @@
 /target
-*.log
-tots-server-state.json
+*.db
+*.db-shm
+*.db-wal
+.env
+.DS_Store
+.idea/
+.vscode/

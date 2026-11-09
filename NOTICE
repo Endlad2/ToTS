@@ -1,0 +1,5 @@
+ToTS is an independent clean-room implementation licensed under Apache-2.0.
+The source archives supplied as engineering references are NOT vendored into
+this repository. In particular, no MRTT or TUIC source file is included here.
+Interoperability concepts are implemented from public protocol behavior and
+IETF STUN/TURN conventions, with an original ToTS wire format.
