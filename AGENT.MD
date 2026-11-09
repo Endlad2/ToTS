@@ -88,8 +88,8 @@ At least one of `vk_call_links` or `vk_token` must be present. `ice_servers` is 
 - `/scripts/install-server.sh` — release installer/upgrader preserving DB/config.
 - `/scripts/setup-network.sh` — idempotent Linux forwarding/NAT setup.
 - `/systemd/tots-server.service` — systemd unit.
-- `/.github/workflows/ci.yml` — fmt/clippy/test/build.
-- `/.github/workflows/release.yml` — Linux release artifact build.
+- `/.github/workflows/ci.yml` — clippy/test/build (no rustfmt gate).
+- `/.github/workflows/release.yml` — automatic Linux server release on every branch push; tags use `YY.DD.MM.HH.MM` in UTC.
 
 ## Change rules
 

@@ -76,7 +76,6 @@ The server creates a TUN interface for `10.77.0.0/16`. A stable client address i
 ## Build
 
 ```bash
-cargo fmt --all -- --check
 cargo test --workspace
 cargo build --workspace --release
 ```

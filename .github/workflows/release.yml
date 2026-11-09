@@ -1,24 +1,68 @@
 name: Release
 on:
   push:
-    tags: ["v*"]
+    branches: ["**"]
+  workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: dtolnay/rust-toolchain@1.82.0
+
       - run: cargo build -p tots-server --release
-      - name: package
+
+      - name: Package server
         run: |
+          set -euo pipefail
           mkdir dist
           cp target/release/tots-server dist/
           cp scripts/setup-network.sh dist/
           cp systemd/tots-server.service dist/
           cp tots-server/config.example.env dist/
           tar -C dist -czf tots-server-x86_64-unknown-linux-gnu.tar.gz .
-      - uses: softprops/action-gh-release@v2
+
+      - name: Create timestamp tag
+        id: release_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Tag format: YY.DD.MM.HH.MM (UTC), for example 26.09.11.17.18.
+          # If another workflow already claimed the current minute, wait for the
+          # next minute instead of overwriting an existing release tag.
+          while true; do
+            TAG="$(date -u +'%y.%d.%m.%H.%M')"
+
+            git fetch --force --tags origin
+            if git show-ref --verify --quiet "refs/tags/$TAG"; then
+              sleep 2
+              continue
+            fi
+
+            git tag "$TAG" "$GITHUB_SHA"
+            if git push origin "refs/tags/$TAG"; then
+              break
+            fi
+
+            git tag -d "$TAG" >/dev/null 2>&1 || true
+            sleep 2
+          done
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: ToTS ${{ steps.release_tag.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
           files: tots-server-x86_64-unknown-linux-gnu.tar.gz
