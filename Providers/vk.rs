@@ -61,7 +61,7 @@ impl Provider for VkProvider {
         for link in &links {
             let hash = join_hash(link)
                 .ok_or_else(|| Error::Provider("invalid VK call link".into()))?;
-            let (servers, meta) = ice_from_join_link(&client, hash).await?;
+            let (servers, meta) = ice_from_join_link(&client, &hash).await?;
             ice.extend(servers);
             signalling.push(meta);
         }
@@ -160,29 +160,59 @@ async fn start_call(client: &Client, token: &str) -> Result<(String, String)> {
     Ok((call_id, join))
 }
 
-fn join_hash(value: &str) -> Option<&str> {
-    let v = value.trim().trim_end_matches('/');
+fn join_hash(value: &str) -> Option<String> {
+    let mut v = value.trim();
+
+    // Be forgiving when a link was copied from a Markdown-rendered message as
+    // [https://vk.ru/call/join/HASH](https://vk.ru/call/join/HASH).
+    if v.starts_with('[') && v.ends_with(')') {
+        if let Some(split) = v.find("](") {
+            v = &v[1..split];
+        }
+    }
+
+    let v = v.trim().trim_end_matches('/');
     if v.is_empty() {
         return None;
     }
-    if let Some(i) = v.to_ascii_lowercase().find("/call/join/") {
-        let h = &v[i + "/call/join/".len()..];
-        return h.split(['?', '#']).next().filter(|s| !s.is_empty());
+
+    let hash = if let Some(i) = v.to_ascii_lowercase().find("/call/join/") {
+        &v[i + "/call/join/".len()..]
+    } else {
+        v
+    };
+    let hash = hash.split(['?', '#']).next()?.trim_end_matches('/');
+
+    if hash.is_empty()
+        || !hash
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
     }
-    Some(v)
+
+    Some(hash.to_owned())
 }
 
-async fn get_json(client: &Client, url: Url) -> Result<Value> {
-    client
-        .get(url)
+async fn vk_method_json(client: &Client, url: Url, step: &str) -> Result<Value> {
+    // VK Calls' anonymous flow is implemented as POST requests. API errors are
+    // usually returned with HTTP 200, so inspect the JSON body as well.
+    let value: Value = client
+        .post(url)
         .send()
         .await
-        .map_err(|e| Error::Provider(e.to_string()))?
+        .map_err(|e| Error::Provider(format!("{step}: {e}")))?
         .error_for_status()
-        .map_err(|e| Error::Provider(e.to_string()))?
+        .map_err(|e| Error::Provider(format!("{step}: {e}")))?
         .json()
         .await
-        .map_err(|e| Error::Provider(e.to_string()))
+        .map_err(|e| Error::Provider(format!("{step}: invalid JSON: {e}")))?;
+
+    if let Some(error) = value.get("error") {
+        return Err(Error::Provider(format!("{step} failed: {error}")));
+    }
+
+    Ok(value)
 }
 
 fn str_at<'a>(v: &'a Value, p: &str) -> Result<&'a str> {
@@ -203,7 +233,7 @@ async fn ice_from_join_link(client: &Client, hash: &str) -> Result<(Vec<IceServe
         .append_pair("device_id", &device)
         .append_pair("anonymName", &name)
         .append_pair("lang", "en");
-    let r1 = get_json(client, u).await?;
+    let r1 = vk_method_json(client, u, "auth.getAnonymToken").await?;
     let anonymous = str_at(&r1, "/response/token")?.to_owned();
     let mut u = Url::parse(&format!("{VK_CALLS_API}/messages.getCallPreview")).unwrap();
     u.query_pairs_mut()
@@ -214,12 +244,16 @@ async fn ice_from_join_link(client: &Client, hash: &str) -> Result<(Vec<IceServe
         .append_pair("fields", "first_name,last_name,photo_200")
         .append_pair("lang", "en")
         .append_pair("link", &link);
-    let r2 = get_json(client, u).await?;
-    let user_id = r2
-        .pointer("/response/user_id")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| Error::Provider("missing user_id".into()))?
-        .to_string();
+    let r2 = vk_method_json(client, u, "messages.getCallPreview").await?;
+    let user_id = match r2.pointer("/response/user_id") {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        _ => {
+            return Err(Error::Provider(format!(
+                "messages.getCallPreview returned no user_id: {r2}"
+            )))
+        }
+    };
     let secret = str_at(&r2, "/response/secret")?.to_owned();
     let mut u = Url::parse(&format!("{VK_CALLS_API}/messages.getAnonymCallToken")).unwrap();
     u.query_pairs_mut()
@@ -231,7 +265,7 @@ async fn ice_from_join_link(client: &Client, hash: &str) -> Result<(Vec<IceServe
         .append_pair("user_id", &user_id)
         .append_pair("secret", &secret)
         .append_pair("lang", "en");
-    let r3 = get_json(client, u).await?;
+    let r3 = vk_method_json(client, u, "messages.getAnonymCallToken").await?;
     let ok_token = str_at(&r3, "/response/token")?.to_owned();
     let session_data = json!({"version":2,"device_id":Uuid::new_v4().to_string(),"client_version":"1.0.1"}).to_string();
     let login: Value = client
