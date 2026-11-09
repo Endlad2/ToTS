@@ -6,7 +6,7 @@ members = ["tots-core", "tots-client", "tots-ios", "tots-server"]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.82"
+rust-version = "1.85"
 repository = "https://github.com/YOUR_GITHUB_ORG/ToTS"
 
 [workspace.dependencies]

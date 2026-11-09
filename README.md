@@ -5,7 +5,7 @@ ToTS is a Rust workspace for carrying L3 VPN traffic over provider-assisted UDP 
 ## Workspace
 
 - `tots-core` — reusable protocol, crypto, provider, TURN/STUN, probing and session code.
-- `tots-client` — desktop/Linux and Android-friendly CLI binary. Android can pass an already-open VPN fd.
+- `tots-client` — desktop Windows/Linux and Android-friendly CLI binary. Android can pass an already-open VPN fd.
 - `tots-ios` — `staticlib`/`cdylib` C ABI around config parsing and packet codec; intended for a NetworkExtension host.
 - `tots-server` — Linux server, local management API, SQLite config DB and dual UDP ingress.
 - `Providers/` — provider adapters compiled into `tots-core`; currently VK.
@@ -57,7 +57,7 @@ tots-client \
   --provider-data '{"vk_call_links":["https://vk.ru/call/join/..."]}'
 ```
 
-On Android, create the VPN interface in `VpnService` and pass its fd with `--tun-fd`.
+On Android, create the VPN interface in `VpnService` and pass its fd with `--tun-fd`. On Windows, run the client as Administrator and keep `wintun.dll` next to `tots-client.exe`; official release ZIPs include the matching AMD64 DLL.
 
 ## Network model
 
@@ -79,6 +79,17 @@ The server creates a TUN interface for `10.77.0.0/16`. A stable client address i
 cargo test --workspace
 cargo build --workspace --release
 ```
+
+## CI and releases
+
+CI uses the current stable Rust toolchain. The workspace MSRV metadata is `1.85`, because current transitive networking dependencies use Rust Edition 2024 and cannot be parsed by Cargo 1.82.
+
+Every push to any branch (and manual `workflow_dispatch`) builds both release artifacts before publishing:
+
+- `tots-server-x86_64-unknown-linux-gnu.tar.gz`
+- `tots-client-x86_64-pc-windows-msvc.zip` (includes `tots-client.exe` and official `wintun.dll`)
+
+The Git tag and GitHub Release name use `YY.DD.MM.HH.MM` in UTC.
 
 ## Production notes
 

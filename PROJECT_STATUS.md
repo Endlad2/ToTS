@@ -10,7 +10,7 @@ Implemented:
 - separate server UDP ingress ports for the direct/provider-assisted path and TURN-relayed path;
 - TUN dataplane, Android raw VPN-fd support and iOS C ABI/staticlib surface;
 - loopback config API, SQLite persistence, `tots://BASE64URL(JSON)` configs, expiry/revoke handling;
-- GitHub Actions CI/release workflow, systemd unit and preserving/upgrading install script.
+- GitHub Actions CI/release workflow (Linux server + Windows x86_64 client release artifacts), systemd unit and preserving/upgrading install script.
 
 Known gap before calling the WebRTC side production-complete:
 - the direct `webrtc_port` path currently performs ToTS transport directly over UDP after provider bootstrap/path probing. A full RFC 5764 DTLS-SRTP media layer / PeerConnection termination is not yet wired into the dataplane. `ProviderBootstrap.signalling` and ICE/STUN data are retained specifically so that layer can be added without changing the public config format.

@@ -7,27 +7,102 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: tots-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  linux:
+  linux-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Linux server
+        run: cargo build -p tots-server --release
+
+      - name: Package Linux server
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/tots-server dist/
+          cp scripts/setup-network.sh dist/
+          cp systemd/tots-server.service dist/
+          cp tots-server/config.example.env dist/
+          tar -C dist -czf tots-server-x86_64-unknown-linux-gnu.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-server
+          path: tots-server-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+
+  windows-client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Windows client
+        run: cargo build -p tots-client --release
+
+      - name: Download and verify Wintun
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          $archive = Join-Path $PWD "wintun-0.14.1.zip"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          $expected = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+          if ($actual -ne $expected) {
+            throw "Wintun SHA-256 mismatch: expected $expected, got $actual"
+          }
+          Expand-Archive -Path $archive -DestinationPath ".wintun" -Force
+
+      - name: Package Windows client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path "dist-win" -Force | Out-Null
+          Copy-Item "target\release\tots-client.exe" "dist-win\tots-client.exe"
+          Copy-Item ".wintun\wintun\bin\amd64\wintun.dll" "dist-win\wintun.dll"
+          if (Test-Path ".wintun\wintun\LICENSE.txt") {
+            Copy-Item ".wintun\wintun\LICENSE.txt" "dist-win\WINTUN-LICENSE.txt"
+          }
+          @"
+          ToTS Windows client
+          ===================
+
+          Run tots-client.exe as Administrator.
+          Keep wintun.dll in the same directory as tots-client.exe.
+
+          Example:
+            tots-client.exe --config "tots://..."
+          "@ | Set-Content -Encoding UTF8 "dist-win\README-WINDOWS.txt"
+          Compress-Archive -Path "dist-win\*" -DestinationPath "tots-client-x86_64-pc-windows-msvc.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-client
+          path: tots-client-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [linux-server, windows-client]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@1.82.0
-
-      - run: cargo build -p tots-server --release
-
-      - name: Package server
-        run: |
-          set -euo pipefail
-          mkdir dist
-          cp target/release/tots-server dist/
-          cp scripts/setup-network.sh dist/
-          cp systemd/tots-server.service dist/
-          cp tots-server/config.example.env dist/
-          tar -C dist -czf tots-server-x86_64-unknown-linux-gnu.tar.gz .
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
 
       - name: Create timestamp tag
         id: release_tag
@@ -36,8 +111,8 @@ jobs:
           set -euo pipefail
 
           # Tag format: YY.DD.MM.HH.MM (UTC), for example 26.09.11.17.18.
-          # If another workflow already claimed the current minute, wait for the
-          # next minute instead of overwriting an existing release tag.
+          # If another workflow already claimed the current minute, wait until
+          # a free minute tag is available instead of overwriting a release.
           while true; do
             TAG="$(date -u +'%y.%d.%m.%H.%M')"
 
@@ -65,4 +140,6 @@ jobs:
           name: ToTS ${{ steps.release_tag.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: tots-server-x86_64-unknown-linux-gnu.tar.gz
+          files: |
+            release-assets/tots-server-x86_64-unknown-linux-gnu.tar.gz
+            release-assets/tots-client-x86_64-pc-windows-msvc.zip

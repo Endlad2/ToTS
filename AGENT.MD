@@ -79,7 +79,7 @@ At least one of `vk_call_links` or `vk_token` must be present. `ice_servers` is 
 - `/tots-core/src/transport/turn.rs` — TURN/UDP path.
 - `/tots-core/src/transport/probe.rs` — path RTT/health probes.
 - `/tots-client/src/main.rs` — CLI orchestration.
-- `/tots-client/src/tun_io.rs` — Linux TUN and Android fd loops.
+- `/tots-client/src/tun_io.rs` — cross-platform TUN loop; Unix/Android may use an externally supplied fd, Windows uses Wintun through the `tun` crate.
 - `/tots-ios/src/lib.rs` — C ABI for NetworkExtension hosts.
 - `/tots-server/src/main.rs` — server lifecycle.
 - `/tots-server/src/api.rs` — local config API.
@@ -88,8 +88,8 @@ At least one of `vk_call_links` or `vk_token` must be present. `ice_servers` is 
 - `/scripts/install-server.sh` — release installer/upgrader preserving DB/config.
 - `/scripts/setup-network.sh` — idempotent Linux forwarding/NAT setup.
 - `/systemd/tots-server.service` — systemd unit.
-- `/.github/workflows/ci.yml` — clippy/test/build (no rustfmt gate).
-- `/.github/workflows/release.yml` — automatic Linux server release on every branch push; tags use `YY.DD.MM.HH.MM` in UTC.
+- `/.github/workflows/ci.yml` — stable-Rust Linux clippy/test/build plus Windows client compile check (no rustfmt gate).
+- `/.github/workflows/release.yml` — automatic Linux server + Windows x86_64 client release on every branch push; Windows package includes verified official Wintun; tags use `YY.DD.MM.HH.MM` in UTC.
 
 ## Change rules
 
