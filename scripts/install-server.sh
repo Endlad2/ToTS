@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-REPO="${TOTS_REPO:-YOUR_GITHUB_ORG/ToTS}"
+REPO="Endlad2/ToTS"
 ASSET="${TOTS_ASSET:-tots-server-x86_64-unknown-linux-gnu.tar.gz}"
 PREFIX="${TOTS_PREFIX:-/usr/local}"
 STATE=/var/lib/tots
@@ -18,7 +18,7 @@ ts=$(date +%Y%m%d-%H%M%S)
 [[ -f "$ETC/server.env" ]] && cp -a "$ETC/server.env" "$ETC/server.env.backup-$ts"
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-api="https://api.github.com/repos/$REPO/releases/latest"
+api="https://api.github.com/repos/${REPO}/releases/latest"
 url=$(curl -fsSL "$api" | ASSET="$ASSET" python3 -c 'import json,sys,os; d=json.load(sys.stdin); a=os.environ["ASSET"]; print(next(x["browser_download_url"] for x in d["assets"] if x["name"]==a))')
 curl -fL "$url" -o "$tmp/pkg.tar.gz"
 tar -xzf "$tmp/pkg.tar.gz" -C "$tmp"
