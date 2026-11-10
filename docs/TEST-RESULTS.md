@@ -2,6 +2,8 @@
 
 Date zone: Europe/Moscow (UTC+03:00). These results distinguish automated checks, elevated TUN checks and actual provider VPN egress. No private config URI, invite or credential is included.
 
+> **Historical evidence notice.** The live VPN results below were recorded against the immediately preceding single-worker snapshot. They prove the inherited TUN/VK/Jazz dataplane fixes that this revision preserves, but they are not a test claim for the new multi-worker/recovery code. The current revision still needs CI/runtime verification after build.
+
 ## Build and automated checks
 
 | Check | Recorded result |
@@ -26,7 +28,7 @@ After that fix, the ignored TUN test was run elevated and passed all three cases
 
 ## Live VK VPN — passed
 
-The Windows client ran with `--relay-only --tun-default-route --run-for-seconds 75`, using a private config file. Direct VPS UDP was excluded from path selection.
+The Windows client ran with `--relay-only --tun-default-route --run-for-seconds 75`, using a private server-issued configuration URI. Direct VPS UDP was excluded from path selection.
 
 - Selected VK TURN endpoint: `90.156.236.96:19302`.
 - Windows TUN virtual address: `10.77.190.210`.
@@ -43,7 +45,7 @@ All three responses matched the VPS address. The timed run exited with code **0*
 
 ## Live Jazz VPN — passed
 
-The final Windows release client and deployed Linux release server passed the Jazz Internet-egress check. The client used a private config file with `--relay-only --tun-default-route --run-for-seconds 90`; direct VPS UDP was excluded.
+The final Windows release client and deployed Linux release server passed the Jazz Internet-egress check. The client used a private server-issued configuration URI with `--relay-only --tun-default-route --run-for-seconds 90`; direct VPS UDP was excluded.
 
 - Selected path: `jazz-rtp`, healthy RTT **662 ms** at `2026-11-10T09:19:47Z`.
 - Windows TUN virtual address: `10.77.125.188`.

@@ -1,6 +1,20 @@
 use crate::{Error, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+pub const MAX_ACK_RANGES: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AckRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl AckRange {
+    pub fn contains(self, packet_id: u32) -> bool {
+        self.start <= packet_id && packet_id <= self.end
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     Data {
@@ -11,9 +25,14 @@ pub enum Frame {
         original_len: u16,
         payload: Bytes,
     },
+    /// Legacy single-packet ACK. Kept for wire compatibility.
     Ack {
         packet_id: u32,
         recv_micros: u32,
+    },
+    /// QUIC-style compact acknowledgement ranges. Ranges are inclusive.
+    AckRanges {
+        ranges: Vec<AckRange>,
     },
     Heartbeat {
         counter: u64,
@@ -36,6 +55,7 @@ impl Frame {
         let mut out = BytesMut::with_capacity(
             64 + match self {
                 Self::Data { payload, .. } => payload.len(),
+                Self::AckRanges { ranges } => ranges.len() * 8,
                 _ => 0,
             },
         );
@@ -82,6 +102,14 @@ impl Frame {
             Self::Dissociate { assoc_id } => {
                 out.put_u8(0x06);
                 out.put_u16(*assoc_id);
+            }
+            Self::AckRanges { ranges } => {
+                out.put_u8(0x07);
+                out.put_u8(ranges.len().min(MAX_ACK_RANGES) as u8);
+                for range in ranges.iter().take(MAX_ACK_RANGES) {
+                    out.put_u32(range.start);
+                    out.put_u32(range.end);
+                }
             }
         }
         out.to_vec()
@@ -158,6 +186,24 @@ impl Frame {
                     assoc_id: b.get_u16(),
                 })
             }
+            0x07 => {
+                need!(1);
+                let count = b.get_u8() as usize;
+                if count == 0 || count > MAX_ACK_RANGES {
+                    return Err(Error::Packet("bad ack range count".into()));
+                }
+                need!(count * 8);
+                let mut ranges = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let start = b.get_u32();
+                    let end = b.get_u32();
+                    if start > end {
+                        return Err(Error::Packet("bad ack range".into()));
+                    }
+                    ranges.push(AckRange { start, end });
+                }
+                Ok(Self::AckRanges { ranges })
+            }
             _ => Err(Error::Packet(format!("unknown frame type {kind:#x}"))),
         }
     }
@@ -166,6 +212,7 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn data_roundtrip() {
         let f = Frame::Data {
@@ -175,6 +222,17 @@ mod tests {
             frag_id: 1,
             original_len: 2000,
             payload: Bytes::from_static(b"abc"),
+        };
+        assert_eq!(Frame::decode(&f.encode()).unwrap(), f);
+    }
+
+    #[test]
+    fn ack_ranges_roundtrip() {
+        let f = Frame::AckRanges {
+            ranges: vec![
+                AckRange { start: 90, end: 100 },
+                AckRange { start: 70, end: 80 },
+            ],
         };
         assert_eq!(Frame::decode(&f.encode()).unwrap(), f);
     }

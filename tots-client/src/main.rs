@@ -1,24 +1,21 @@
 mod routes;
 mod tun_io;
+mod workers;
+
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tots_core::{
-    config::{ConnectionConfig, ProviderName},
-    providers::make_provider,
-    session::SessionEngine,
-    transport::{probe, turn::TurnUdpPath, DatagramPath, DirectUdpPath},
-};
-use tracing::{info, warn};
+use std::{sync::Arc, time::Duration};
+use tots_core::config::{ConnectionConfig, ProviderName};
+use tracing::info;
 use uuid::Uuid;
+use workers::WorkerManager;
 
 #[derive(Parser, Debug)]
 #[command(name = "tots-client", version, about = "ToTS desktop/Android client")]
 struct Args {
-    #[arg(long, conflicts_with = "config_file")]
-    config: Option<String>,
+    /// Server-issued tots:// URI.
     #[arg(long)]
-    config_file: Option<std::path::PathBuf>,
+    config: Option<String>,
     #[arg(long)]
     peer: Option<String>,
     #[arg(long)]
@@ -29,20 +26,25 @@ struct Args {
     password: Option<String>,
     #[arg(long)]
     device_id: Option<Uuid>,
+    /// Preferred provider. provider_data may also contain fallback providers.
     #[arg(long, default_value = "vk")]
     provider: String,
+    /// JSON object, preferably {"vk":{...},"jazz":{...}}.
     #[arg(long)]
     provider_data: Option<String>,
+    /// Number of independent transport workers.
+    #[arg(long = "n", default_value_t = 1)]
+    n: usize,
     #[arg(long)]
     tun_fd: Option<i32>,
     #[arg(long, default_value = "tots0")]
     tun_name: String,
     #[arg(long, default_value_t = 1200)]
     mtu: usize,
-    /// Exclude direct VPS traffic from path selection.
+    /// Exclude the direct VPS path and use provider relay/native transport only.
     #[arg(long)]
     relay_only: bool,
-    /// Check the encrypted provider path without opening a TUN device.
+    /// Check that at least one encrypted worker is healthy without opening a TUN device.
     #[arg(long)]
     probe_only: bool,
     /// Route all IPv4 Internet traffic through the TUN (Windows).
@@ -54,11 +56,6 @@ struct Args {
 }
 
 fn config_from_args(a: &Args) -> Result<ConnectionConfig> {
-    if let Some(file) = &a.config_file {
-        return Ok(ConnectionConfig::decode_uri(
-            std::fs::read_to_string(file)?.trim(),
-        )?);
-    }
     if let Some(uri) = &a.config {
         return Ok(ConnectionConfig::decode_uri(uri)?);
     }
@@ -86,94 +83,73 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = config_from_args(&args)?;
     cfg.validate()?;
-    let provider = make_provider(&cfg.provider)?;
-    info!("fetching provider bootstrap");
-    let boot = provider.bootstrap(&cfg.provider_data).await?;
-    let run_result: Result<()> = async {
-        let engine = Arc::new(SessionEngine::new(cfg.clone())?);
-        let peer_ip = cfg.peer_ip()?;
-        let mut candidates: Vec<Arc<dyn DatagramPath>> = Vec::new();
-        if let Some(path) = provider.connect_native(&cfg.provider_data).await? {
-            candidates.push(path);
-        } else {
-            if !args.relay_only {
-                let direct: Arc<dyn DatagramPath> = Arc::new(
-                    DirectUdpPath::connect("direct-ice", SocketAddr::new(peer_ip, cfg.webrtc_port))
-                        .await?,
-                );
-                candidates.push(direct);
-            }
-            for creds in &boot.turn {
-                for url in creds
-                    .urls
-                    .iter()
-                    .filter(|url| url.starts_with("turn:") && !url.contains("transport=tcp"))
-                {
-                    let mut single = creds.clone();
-                    single.urls = vec![url.clone()];
-                    match TurnUdpPath::connect(&single, SocketAddr::new(peer_ip, cfg.turn_port))
-                        .await
-                    {
-                        Ok(p) => {
-                            candidates.push(Arc::new(p));
-                        }
-                        Err(e) => warn!("TURN candidate failed: {e}"),
-                    }
-                }
-            }
-        }
-        let mut best: Option<(Duration, Arc<dyn DatagramPath>)> = None;
-        for p in candidates {
-            match probe::probe(&engine, p.clone(), Duration::from_secs(3)).await {
-                Ok(r) => {
-                    info!(path=%r.path,rtt_ms=r.rtt.as_millis(),"path healthy");
-                    if best.as_ref().is_none_or(|(d, _)| r.rtt < *d) {
-                        best = Some((r.rtt, p));
-                    }
-                }
-                Err(e) => warn!(path=%p.name(),"probe failed: {e}"),
-            }
-        }
-        let path = best.context("no healthy ToTS path")?.1;
-        info!(path=%path.name(),virtual_ip=%cfg.virtual_ipv4(),"selected path");
-        if args.probe_only {
-            path.close().await?;
-            return Ok(());
-        }
-        let mut tun = tun_io::open(&cfg, &args.tun_name, args.tun_fd).await?;
-        let routes = if args.tun_default_route {
-            let mut protected = path.route_ips();
-            if let std::net::IpAddr::V4(ip) = peer_ip {
-                protected.push(ip);
-            }
-            Some(routes::install(tun_io::index(&tun)?, protected).await?)
-        } else {
-            None
-        };
-        info!(path=%path.name(), "ToTS TUN connected");
-        let deadline = async {
-            if let Some(seconds) = args.run_for_seconds {
-                tokio::time::sleep(Duration::from_secs(seconds)).await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-        let result = tokio::select! {
-            result = tun_io::run(&mut tun, engine, path.clone()) => result,
-            result = tokio::signal::ctrl_c() => result.map_err(Into::into),
-            _ = deadline => Ok(()),
-        };
-        if let Some(routes) = routes {
-            routes.cleanup().await?;
-        }
-        path.close().await?;
-        result
+    let (manager, inbound) = WorkerManager::start(cfg.clone(), args.n, args.relay_only).await?;
+    if let Err(error) = manager.wait_for_healthy(Duration::from_secs(45)).await {
+        manager.shutdown().await;
+        return Err(error);
     }
-    .await;
-    if let Err(e) = provider.cleanup(&cfg.provider_data, &boot).await {
-        warn!("provider cleanup failed: {e}");
+    info!(
+        workers = manager.healthy_count(),
+        workers_target = manager.desired_count(),
+        virtual_ip = %cfg.virtual_ipv4(),
+        "ToTS worker pool ready"
+    );
+    if args.probe_only {
+        manager.log_status();
+        manager.shutdown().await;
+        return Ok(());
     }
-    run_result
+
+    let mut tun = match tun_io::open(&cfg, &args.tun_name, args.tun_fd).await {
+        Ok(tun) => tun,
+        Err(error) => {
+            manager.shutdown().await;
+            return Err(error);
+        }
+    };
+    let routes = if args.tun_default_route {
+        match routes::install(tun_io::index(&tun)?, manager.route_ips().await).await {
+            Ok(routes) => Some(routes),
+            Err(error) => {
+                manager.shutdown().await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    info!(workers = manager.healthy_count(), "ToTS TUN connected");
+
+    let status_manager = Arc::clone(&manager);
+    let status_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            status_manager.log_status();
+        }
+    });
+    let deadline = async {
+        if let Some(seconds) = args.run_for_seconds {
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let result = tokio::select! {
+        result = tun_io::run(&mut tun, manager.clone(), inbound) => result,
+        result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+        _ = deadline => Ok(()),
+    };
+    status_task.abort();
+    if let Some(routes) = routes {
+        routes.cleanup().await?;
+    }
+    manager.shutdown().await;
+    result
 }
 
 #[cfg(test)]
@@ -181,7 +157,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_relay_probe_and_bounded_full_tunnel_flags() {
+    fn accepts_worker_count_and_runtime_flags() {
         let args = Args::try_parse_from([
             "tots-client",
             "--relay-only",
@@ -189,9 +165,13 @@ mod tests {
             "--tun-default-route",
             "--run-for-seconds",
             "30",
+            "--n",
+            "12",
         ])
         .unwrap();
         assert!(args.relay_only && args.probe_only && args.tun_default_route);
         assert_eq!(args.run_for_seconds, Some(30));
+        assert_eq!(args.n, 12);
     }
+
 }

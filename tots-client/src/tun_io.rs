@@ -1,13 +1,8 @@
 #[cfg(unix)]
 use anyhow::bail;
 use anyhow::{Context, Result};
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tots_core::{
-    config::ConnectionConfig,
-    session::{DecodedPacket, SessionEngine},
-    transport::DatagramPath,
-};
+use tots_core::config::ConnectionConfig;
 
 pub enum TunHandle {
     Device(tun::AsyncDevice),
@@ -80,23 +75,26 @@ pub async fn open(cfg: &ConnectionConfig, name: &str, fd: Option<i32>) -> Result
 
 pub async fn run(
     tun: &mut TunHandle,
-    engine: Arc<SessionEngine>,
-    path: Arc<dyn DatagramPath>,
+    manager: std::sync::Arc<crate::workers::WorkerManager>,
+    inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     match tun {
-        TunHandle::Device(dev) => run_io(dev, engine, path).await,
+        TunHandle::Device(dev) => run_io(dev, manager, inbound).await,
         #[cfg(unix)]
-        TunHandle::Fd(file) => run_io(file, engine, path).await,
+        TunHandle::Fd(file) => run_io(file, manager, inbound).await,
     }
 }
 
-async fn run_io<T>(io: T, engine: Arc<SessionEngine>, path: Arc<dyn DatagramPath>) -> Result<()>
+async fn run_io<T>(
+    io: T,
+    manager: std::sync::Arc<crate::workers::WorkerManager>,
+    mut inbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> Result<()>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     let (mut rd, mut wr) = tokio::io::split(io);
-    let tx_engine = engine.clone();
-    let tx_path = path.clone();
+    let tx_manager = manager.clone();
     let tx = async move {
         let mut buf = vec![0u8; 65535];
         loop {
@@ -104,48 +102,22 @@ where
             if n == 0 {
                 break;
             }
-            let assoc = flow_hash(&buf[..n]);
-            let (_, packets) = tx_engine.encapsulate_ip(assoc, &buf[..n])?;
-            for p in packets {
-                tx_path.send(&p).await?;
-            }
+            tx_manager.send_ip(&buf[..n]).await?;
         }
         Ok::<_, anyhow::Error>(())
     };
     let rx = async move {
-        let mut buf = vec![0u8; 65535];
-        loop {
-            let n = path.recv(&mut buf).await?;
-            if let Some(decoded) = engine.decapsulate(&buf[..n])? {
-                match decoded {
-                    DecodedPacket::Ip {
-                        packet_id, bytes, ..
-                    } => {
-                        wr.write_all(&bytes).await?;
-                        let ack = engine.make_ack(packet_id)?;
-                        path.send(&ack).await?;
-                    }
-                    DecodedPacket::Probe { token, sent_micros } => {
-                        path.send(&engine.make_probe_ack(token, sent_micros)?)
-                            .await?;
-                    }
-                    _ => {}
-                }
-            }
+        while let Some(bytes) = inbound.recv().await {
+            wr.write_all(&bytes).await?;
+            manager
+                .stats
+                .tun_rx_bytes
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
+        Err::<(), anyhow::Error>(anyhow::anyhow!("worker inbound queue closed"))
     };
     tokio::select! {r=tx=>r?,r=rx=>r?};
     Ok(())
-}
-fn flow_hash(packet: &[u8]) -> u16 {
-    let mut x: u32 = 0x9e37_79b9;
-    for b in packet.iter().take(64) {
-        x = x.rotate_left(5) ^ (*b as u32);
-        x = x.wrapping_mul(0x85eb_ca6b);
-    }
-    ((x >> 16) ^ x) as u16
 }
 
 #[cfg(all(test, target_os = "windows"))]
@@ -164,7 +136,7 @@ mod tests {
             password: "test-only-password".into(),
             device_id: uuid::Uuid::new_v4(),
             provider: tots_core::config::ProviderName::Vk,
-            provider_data: serde_json::json!({"vk_call_links":["test"]}),
+            provider_data: serde_json::json!({"vk":{"vk_call_links":["test"]}}),
             mtu: 1200,
         };
         for mtu in [1200, 576, 1400] {

@@ -22,12 +22,12 @@ pub struct DirectUdpPath {
 }
 impl DirectUdpPath {
     pub async fn connect(name: impl Into<String>, target: SocketAddr) -> Result<Self> {
-        let bind = if target.is_ipv4() {
-            "0.0.0.0:0"
+        let bind: SocketAddr = if target.is_ipv4() {
+            "0.0.0.0:0".parse().expect("static IPv4 bind")
         } else {
-            "[::]:0"
+            "[::]:0".parse().expect("static IPv6 bind")
         };
-        let s = UdpSocket::bind(bind).await?;
+        let s = super::socket::bind_udp(bind)?;
         s.connect(target).await?;
         Ok(Self {
             name: name.into(),

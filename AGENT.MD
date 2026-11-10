@@ -15,7 +15,7 @@ Provider adapters live in top-level `Providers/` and are included by `tots-core/
 
 ## Packet flow
 
-Client TUN → `SessionEngine::encapsulate_ip` → encrypted ToTS datagram → selected `DatagramPath` → server authenticated dataplane → server TUN → Internet. Return traffic reverses that flow.
+Client TUN → stable five-tuple `FlowManager` → worker scheduler → per-worker `SessionEngine` → congestion/pacing/recovery → encrypted ToTS datagram → worker `DatagramPath` → server authenticated multi-session dataplane → server TUN → Internet. Return traffic reverses that flow.
 
 Keep separate UDP ingress ports:
 
@@ -24,7 +24,7 @@ Keep separate UDP ingress ports:
 
 VK TURN/UDP requires the 12-byte RTP envelope from `transport/rtp.rs` around encrypted ToTS bytes. The server recognizes RTP-wrapped packets and still accepts raw ToTS packets. Jazz uses a real WebRTC RTP media session and bridges its recovered datagrams to the existing server ingress; do not duplicate the packet codec, encryption or TUN routing there.
 
-Probe healthy paths and select by measured RTT. Retry probes every 500 ms with fresh authenticated sequence numbers under the client's overall three-second deadline; packet loss or malformed replies must not reset that deadline. `--relay-only` excludes direct VPS UDP; `--probe-only` verifies the encrypted provider path without TUN. Native Jazz connections use the same `DatagramPath` boundary.
+Each worker probes healthy candidates and selects by measured RTT. Retry probes every 500 ms with fresh authenticated sequence numbers under the client's overall three-second deadline; packet loss or malformed replies must not reset that deadline. A five-second liveness probe detects dead paths; sustained severe RTT degradation also restarts the worker so direct/WebRTC-side and TURN candidates are re-probed. Reconnect keeps the SessionEngine/sequence space so the first authenticated datagram can immediately rebind the server route (0-RTT-like path resumption). `--relay-only` excludes direct VPS/WebRTC-side UDP; `--probe-only` verifies that at least one worker is healthy without TUN. Native Jazz connections use the same `DatagramPath` boundary.
 
 ## Provider and session contract
 
@@ -40,7 +40,9 @@ The client waits for media readiness and a remote track; server room creation wa
 
 Match current Jazz signalling: publish microphone audio with `muted:false`. Discover remote AUDIO track SIDs from `rtc:join.join.otherParticipants` and `rtc:participants:update.update.participants`; skip the local identity, deduplicate subscriptions, and unsubscribe muted tracks. Bound subscription state. Send the confirmed `rtc:track:subscription:change` command rather than relying on automatic subscription.
 
-`provider_data` remains opaque JSON in the public config. VK requires `vk_call_links` or `vk_token`; explicit `ice_servers` supplements bootstrap. For Jazz API creation, `{}` creates a room, and optional `join_link` joins an existing room. The API inserts the invite and secret `connector_url` into the returned config.
+`provider_data` is provider-keyed JSON: `{"vk": {...}, "jazz": {...}}`. `provider` names the preferred provider; additional keys are fallbacks. VK requires `vk_call_links` or `vk_token`; explicit `ice_servers` supplements bootstrap. `jazz: {}` makes the API create a room, and optional `join_link` joins an existing room. The API inserts the invite and secret `connector_url` into `provider_data.jazz`. Legacy flat single-provider rows are accepted only as a migration path.
+
+`--n` controls 1..256 independent client workers. Every worker gets a distinct `session_id`; the server stores multiple sessions per `device_id` and schedules return traffic without the old last-route-wins conflict. A failed worker retries the preferred provider first, then configured fallbacks, then cycles back to the preferred provider. Do not make workers share a SessionEngine.
 
 ## Storage and lifecycle
 
@@ -48,7 +50,7 @@ Match current Jazz signalling: publish microphone audio with `muted:false`. Disc
 
 Persist Jazz invites in provider data. Restart restores active rooms. Revoke or provider replacement closes the previous bridge; periodic expiry maintenance closes expired room bridges. Each bridge owns its task and native path. Serialize lifecycle changes so a delayed restore cannot replace a newer configuration.
 
-Windows `--tun-default-route` uses a guard that owns only its route/DNS changes. Pin VPS/provider IPv4 endpoints through the physical gateway before installing full-tunnel routes. Normal exit, Ctrl+C and `--run-for-seconds` perform cleanup. Do not claim cleanup after force-killing a process. IPv6 routes are not managed; TURN/TCP/TLS is not implemented.
+The client accepts a server-issued URI with `--config tots://...` or explicit CLI fields; it does not load secret configuration from a local config file. Windows `--tun-default-route` uses a guard that owns only its route/DNS changes. Pin VPS/provider IPv4 endpoints through the physical gateway before installing full-tunnel routes. Normal exit, Ctrl+C and `--run-for-seconds` perform cleanup. Do not claim cleanup after force-killing a process. IPv6 routes are not managed; TURN/TCP/TLS is not implemented.
 
 ## Security invariants
 
@@ -66,12 +68,13 @@ Windows `--tun-default-route` uses a guard that owns only its route/DNS changes.
 | --- | --- |
 | `tots-core/src/config.rs` | Public config and URI codec |
 | `tots-core/src/crypto.rs`, `protocol/` | Key derivation, AEAD, original frame/envelope format |
-| `tots-core/src/fragment.rs`, `reassembly.rs`, `flow.rs` | Packet fragmentation, bounded reassembly and flow state |
-| `tots-core/src/session.rs` | Shared packet engine |
-| `tots-core/src/transport/` | Datagram paths, STUN/TURN, RTP envelope and probes |
-| `tots-client/src/main.rs`, `tun_io.rs`, `routes.rs` | Client lifecycle, TUN and Windows routing |
+| `tots-core/src/fragment.rs`, `reassembly.rs`, `flow.rs` | Safe datagram sizing, bounded reassembly, five-tuple associations and reliability classification |
+| `tots-core/src/recovery.rs` | Congestion window, pacing, RTT, ACK processing, loss detection and bounded retransmission |
+| `tots-core/src/session.rs` | Per-worker packet engine, ACK-range tracking and replay/delivery deduplication |
+| `tots-core/src/transport/` | Datagram paths, tuned UDP sockets, STUN/TURN, RTP envelope and probes |
+| `tots-client/src/main.rs`, `tun_io.rs`, `workers.rs`, `routes.rs` | Client lifecycle, TUN, worker pool/failover and Windows routing |
 | `tots-ios/src/lib.rs` | NetworkExtension C ABI |
 | `tots-server/src/api.rs`, `db.rs`, `bridge.rs`, `dataplane.rs` | Config lifecycle, persistence, provider bridge and UDP/TUN routing |
 | `scripts/`, `systemd/` | Installation, Linux NAT and service integration |
 
-Keep public structs serde-compatible unless the config protocol version changes. Test wire formats, config/lifecycle changes and route ownership at their actual boundaries. Record live provider evidence in `docs/TEST-RESULTS.md`; a direct UDP probe or unit test does not prove provider VPN egress. Current recorded checks are 22 workspace tests (5 client, 10 core, 7 server), a separately verified elevated MTU test, and 26 Jazz unit tests plus one doc test. Deliver one archive with source, release binaries, instructions, report and licenses; a PR is not required.
+Keep public structs serde-compatible unless the config protocol version changes. Test wire formats, config/lifecycle changes and route ownership at their actual boundaries. Record live provider evidence in `docs/TEST-RESULTS.md`; a direct UDP probe or unit test does not prove provider VPN egress. Current recorded checks are 22 workspace tests (5 client, 10 core, 7 server), a separately verified elevated MTU test, and 26 Jazz unit tests plus one doc test. Keep release packaging reproducible: GitHub Actions publishes the Linux server and Windows client assets, while source archives keep instructions, reports and licenses. A PR is not required for local source delivery.

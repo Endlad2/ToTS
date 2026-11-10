@@ -7,7 +7,7 @@ Adapters are compiled into `tots-core` through `src/providers/mod.rs`. They retu
 | `vk.rs` | VK Calls bootstrap and TURN/UDP. A 12-byte RTP envelope carries each encrypted ToTS datagram; the server still accepts raw packets. |
 | `jazz.rs` | Real Jazz WebSocket signalling and WebRTC RTP media through the bundled `jazz-session` library. |
 
-VK data requires `vk_call_links` or a `vk_token`; `ice_servers` can supplement bootstrap. For the config API, `provider: "jazz"` with `provider_data: {}` creates a room and provisions a secret client connector. Optional `join_link` uses an existing room. The database retains the invite so restart can restore active server sessions; revoke, expiry and replacement close the old bridge.
+Public config data is keyed by provider: `provider_data.vk` and/or `provider_data.jazz`. `provider` remains the preferred provider. VK data requires `vk_call_links` or a `vk_token`; `ice_servers` can supplement bootstrap. A `jazz: {}` entry makes the config API create a room and provision a secret client connector even when Jazz is only a fallback. Optional `join_link` uses an existing room. The database retains the invite so restart can restore active server sessions; revoke, expiry and replacement close the old bridge.
 
 Jazz's `preconnect_call` separates HTTP provisioning from `join_preconnected`, which connects directly to the supplied WSS endpoint and media servers. This allows VPS-side HTTP provisioning when the PC cannot reach Jazz's HTTP bootstrap. SSH carries no user traffic. Both ends send public RTP keepalives; the adapter filters that exact marker before returning datagrams to ToTS.
 

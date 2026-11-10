@@ -3027,6 +3027,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2 0.10.9",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

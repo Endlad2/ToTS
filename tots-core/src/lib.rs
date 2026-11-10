@@ -8,6 +8,7 @@ pub mod fragment;
 pub mod protocol;
 pub mod providers;
 pub mod reassembly;
+pub mod recovery;
 pub mod session;
 pub mod transport;
 

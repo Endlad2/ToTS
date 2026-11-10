@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 use tots_core::config::{ConnectionConfig, ProviderName};
 use uuid::Uuid;
@@ -18,18 +18,23 @@ pub struct ApiState {
     pub rooms: Arc<dashmap::DashMap<Uuid, NativeBridge>>,
     pub room_changes: Arc<tokio::sync::Mutex<()>>,
 }
+
 #[derive(Deserialize)]
 pub struct CreateRequest {
+    /// Preferred provider. provider_data can contain additional fallbacks.
     pub provider: String,
+    /// New layout: {"vk": {...}, "jazz": {...}}.
     pub provider_data: Value,
     pub password: String,
     pub device_id: Uuid,
     #[serde(default = "days")]
     pub valid_days: i64,
 }
+
 fn days() -> i64 {
     30
 }
+
 #[derive(Serialize)]
 pub struct CreateResponse {
     pub uri: String,
@@ -44,6 +49,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/configs/{id}", delete(revoke))
         .with_state(Arc::new(state))
 }
+
 fn auth(headers: &HeaderMap, s: &ApiState) -> Result<(), StatusCode> {
     let Some(expected) = &s.args.admin_token else {
         return Ok(());
@@ -58,25 +64,27 @@ fn auth(headers: &HeaderMap, s: &ApiState) -> Result<(), StatusCode> {
         Err(StatusCode::UNAUTHORIZED)
     }
 }
+
 async fn create(
     State(s): State<Arc<ApiState>>,
     headers: HeaderMap,
-    Json(mut req): Json<CreateRequest>,
+    Json(req): Json<CreateRequest>,
 ) -> Result<Json<CreateResponse>, (StatusCode, String)> {
     auth(&headers, &s).map_err(|c| (c, "unauthorized".into()))?;
     let provider = ProviderName::parse(&req.provider).map_err(bad)?;
     if req.password.len() < 8 {
         return Err((StatusCode::BAD_REQUEST, "password too short".into()));
     }
-    let room = if provider == tots_core::config::ProviderName::Jazz {
-        if !req.provider_data.is_object() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "provider_data must be an object".into(),
-            ));
-        }
-        let room = if let Some(link) = req
-            .provider_data
+    let mut provider_data = normalize_provider_data(provider, req.provider_data).map_err(bad)?;
+
+    // Provision every configured server-side native provider, even when it is only a fallback.
+    // That lets a VK-primary client fail over workers to Jazz without regenerating the config.
+    let room = if provider_data.get("jazz").is_some() {
+        let jazz = provider_data
+            .get_mut("jazz")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| bad("provider_data.jazz must be an object"))?;
+        let room = if let Some(link) = jazz
             .get("join_link")
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
@@ -92,12 +100,13 @@ async fn create(
         let connector = tots_core::providers::jazz::preconnect(&room.join_link)
             .await
             .map_err(internal)?;
-        req.provider_data["join_link"] = Value::String(room.join_link.clone());
-        req.provider_data["connector_url"] = Value::String(connector);
+        jazz.insert("join_link".into(), Value::String(room.join_link.clone()));
+        jazz.insert("connector_url".into(), Value::String(connector));
         Some(room)
     } else {
         None
     };
+
     let cfg = ConnectionConfig {
         version: 1,
         peer: s.args.public_host.clone(),
@@ -105,18 +114,20 @@ async fn create(
         turn_port: s.args.turn_listen.port(),
         password: req.password.clone(),
         device_id: req.device_id,
-        provider: provider.clone(),
-        provider_data: req.provider_data.clone(),
+        provider,
+        provider_data: provider_data.clone(),
         mtu: 1200,
     };
     cfg.validate().map_err(bad)?;
+
     let changes = s.room_changes.lock().await;
-    let d =
-        s.db.upsert(
+    let d = s
+        .db
+        .upsert(
             req.device_id,
             req.password,
             provider,
-            req.provider_data,
+            provider_data,
             req.valid_days,
         )
         .await
@@ -139,6 +150,7 @@ async fn create(
         expires_at: d.expires_at.to_rfc3339(),
     }))
 }
+
 async fn revoke(
     State(s): State<Arc<ApiState>>,
     headers: HeaderMap,
@@ -163,9 +175,8 @@ pub async fn restore_rooms(state: ApiState) {
     match state.db.active_jazz().await {
         Ok(devices) => {
             for device in devices {
-                let Some(link) = device
-                    .provider_data
-                    .get("join_link")
+                let Some(link) = provider_entry(device.provider, &device.provider_data, ProviderName::Jazz)
+                    .and_then(|data| data.get("join_link"))
                     .and_then(Value::as_str)
                 else {
                     continue;
@@ -197,16 +208,13 @@ pub async fn restore_rooms(state: ApiState) {
                 Ok(Some(device)) => {
                     device.revoked
                         || device.expires_at < chrono::Utc::now()
-                        || device.provider != ProviderName::Jazz
+                        || provider_entry(device.provider, &device.provider_data, ProviderName::Jazz)
+                            .is_none()
                 }
                 Ok(None) => true,
                 Err(_) => false,
             };
-            let removed = if remove {
-                state.rooms.remove(&id)
-            } else {
-                None
-            };
+            let removed = if remove { state.rooms.remove(&id) } else { None };
             drop(changes);
             if let Some((_, bridge)) = removed {
                 bridge.close().await;
@@ -220,11 +228,9 @@ async fn publish_restored_room(state: &ApiState, id: Uuid, link: &str, bridge: N
     let current = state.db.get(id).await.ok().flatten();
     let active = current.is_some_and(|current| {
         !current.revoked
-            && current.provider == ProviderName::Jazz
             && current.expires_at >= chrono::Utc::now()
-            && current
-                .provider_data
-                .get("join_link")
+            && provider_entry(current.provider, &current.provider_data, ProviderName::Jazz)
+                .and_then(|data| data.get("join_link"))
                 .and_then(Value::as_str)
                 == Some(link)
     });
@@ -245,9 +251,37 @@ async fn publish_restored_room(state: &ApiState, id: Uuid, link: &str, bridge: N
     }
 }
 
+fn normalize_provider_data(primary: ProviderName, value: Value) -> Result<Value, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "provider_data must be an object".to_owned())?;
+    if object.contains_key("vk") || object.contains_key("jazz") {
+        return Ok(value);
+    }
+    // Migration path for existing API clients: wrap the old flat object under the primary provider.
+    let mut keyed = Map::new();
+    keyed.insert(primary.as_str().to_owned(), value);
+    Ok(Value::Object(keyed))
+}
+
+fn provider_entry<'a>(
+    primary: ProviderName,
+    data: &'a Value,
+    provider: ProviderName,
+) -> Option<&'a Value> {
+    data.get(provider.as_str()).or_else(|| {
+        if primary == provider && data.get("vk").is_none() && data.get("jazz").is_none() {
+            Some(data)
+        } else {
+            None
+        }
+    })
+}
+
 fn bad<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, e.to_string())
 }
+
 fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
@@ -444,7 +478,7 @@ mod tests {
         for provider in [ProviderName::Jazz, ProviderName::Vk] {
             let fixture = Fixture::new().await;
             let id = Uuid::new_v4();
-            fixture.seed(id, provider.clone(), OLD_LINK).await;
+            fixture.seed(id, provider, OLD_LINK).await;
             if provider == ProviderName::Jazz {
                 fixture.state.db.revoke(id).await.unwrap();
             }

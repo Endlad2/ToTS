@@ -144,8 +144,7 @@ impl Db {
         let p = self.path.clone();
         let ids = task::spawn_blocking(move || -> Result<Vec<String>> {
             let conn = Self::conn(&p)?;
-            let mut query =
-                conn.prepare("SELECT device_id FROM configs WHERE provider='jazz' AND revoked=0")?;
+            let mut query = conn.prepare("SELECT device_id FROM configs WHERE revoked=0")?;
             let rows = query
                 .query_map([], |row| row.get(0))?
                 .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -155,7 +154,11 @@ impl Db {
         let mut devices = Vec::new();
         for id in ids {
             if let Some(device) = self.get(Uuid::parse_str(&id)?).await? {
-                if device.expires_at >= Utc::now() {
+                let has_jazz = device.provider_data.get("jazz").is_some()
+                    || (device.provider == ProviderName::Jazz
+                        && device.provider_data.get("vk").is_none()
+                        && device.provider_data.get("jazz").is_none());
+                if has_jazz && device.expires_at >= Utc::now() {
                     devices.push(device);
                 }
             }

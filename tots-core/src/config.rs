@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::net::IpAddr;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderName {
     Vk,
@@ -22,6 +22,14 @@ impl ProviderName {
             other => Err(Error::Config(format!("unsupported provider {other:?}"))),
         }
     }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vk => "vk",
+            Self::Jazz => "jazz",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,7 +40,10 @@ pub struct ConnectionConfig {
     pub turn_port: u16,
     pub password: String,
     pub device_id: Uuid,
+    /// Preferred provider. Additional providers can be present in `provider_data`.
     pub provider: ProviderName,
+    /// Multi-provider layout: {"vk": {...}, "jazz": {...}}.
+    /// Legacy single-provider objects are still accepted for old server DB rows/config URIs.
     #[serde(default)]
     pub provider_data: Value,
     #[serde(default = "default_mtu")]
@@ -60,39 +71,25 @@ impl ConnectionConfig {
         if !(576..=1400).contains(&self.mtu) {
             return Err(Error::Config("mtu must be 576..=1400".into()));
         }
-        match self.provider {
-            ProviderName::Vk => {
-                let links = self
-                    .provider_data
-                    .get("vk_call_links")
-                    .and_then(Value::as_array)
-                    .map_or(0, |v| v.len());
-                let token = self
-                    .provider_data
-                    .get("vk_token")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if links == 0 && token.trim().is_empty() {
-                    return Err(Error::Config(
-                        "VK provider_data requires vk_call_links or vk_token".into(),
-                    ));
-                }
-            }
-            ProviderName::Unknown => return Err(Error::Config("unknown provider".into())),
-            ProviderName::Jazz => {
-                if self
-                    .provider_data
-                    .get("join_link")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty()
-                {
-                    return Err(Error::Config(
-                        "Jazz requires a server-issued join_link".into(),
-                    ));
-                }
-            }
+        if self.provider == ProviderName::Unknown {
+            return Err(Error::Config("unknown provider".into()));
+        }
+        if !self.provider_data.is_object() {
+            return Err(Error::Config("provider_data must be an object".into()));
+        }
+
+        let order = self.provider_order();
+        if !order.contains(&self.provider) {
+            return Err(Error::Config(format!(
+                "provider_data is missing primary provider {}",
+                self.provider.as_str()
+            )));
+        }
+        for provider in order {
+            let data = self.provider_data_for(provider).ok_or_else(|| {
+                Error::Config(format!("provider_data is missing {}", provider.as_str()))
+            })?;
+            validate_provider(provider, data)?;
         }
         Ok(())
     }
@@ -128,14 +125,92 @@ impl ConnectionConfig {
         let b = 1 + (digest[1] % 253);
         std::net::Ipv4Addr::new(10, 77, a, b)
     }
+
+    /// Returns provider-specific data. New configs are keyed by provider name.
+    /// Old configs with a flat provider_data object continue to work for the primary provider.
+    pub fn provider_data_for(&self, provider: ProviderName) -> Option<&Value> {
+        if let Some(value) = self.provider_data.get(provider.as_str()) {
+            return Some(value);
+        }
+        if provider == self.provider && !self.has_keyed_provider_data() {
+            return Some(&self.provider_data);
+        }
+        None
+    }
+
+    /// Primary provider first, then configured fallbacks in a deterministic order.
+    pub fn provider_order(&self) -> Vec<ProviderName> {
+        let mut out = Vec::with_capacity(2);
+        if self.provider != ProviderName::Unknown
+            && (self.provider_data.get(self.provider.as_str()).is_some()
+                || !self.has_keyed_provider_data())
+        {
+            out.push(self.provider);
+        }
+        for provider in [ProviderName::Vk, ProviderName::Jazz] {
+            if provider != self.provider && self.provider_data.get(provider.as_str()).is_some() {
+                out.push(provider);
+            }
+        }
+        out
+    }
+
+    pub fn has_provider(&self, provider: ProviderName) -> bool {
+        self.provider_data_for(provider).is_some()
+    }
+
+    fn has_keyed_provider_data(&self) -> bool {
+        self.provider_data.get("vk").is_some() || self.provider_data.get("jazz").is_some()
+    }
+}
+
+fn validate_provider(provider: ProviderName, data: &Value) -> Result<()> {
+    if !data.is_object() {
+        return Err(Error::Config(format!(
+            "provider_data.{} must be an object",
+            provider.as_str()
+        )));
+    }
+    match provider {
+        ProviderName::Vk => {
+            let links = data
+                .get("vk_call_links")
+                .and_then(Value::as_array)
+                .map_or(0, |v| v.len());
+            let token = data
+                .get("vk_token")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if links == 0 && token.trim().is_empty() {
+                return Err(Error::Config(
+                    "provider_data.vk requires vk_call_links or vk_token".into(),
+                ));
+            }
+        }
+        ProviderName::Jazz => {
+            if data
+                .get("join_link")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                return Err(Error::Config(
+                    "provider_data.jazz requires a server-issued join_link".into(),
+                ));
+            }
+        }
+        ProviderName::Unknown => return Err(Error::Config("unknown provider".into())),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn uri_roundtrip() {
-        let c = ConnectionConfig {
+
+    fn base(provider_data: Value) -> ConnectionConfig {
+        ConnectionConfig {
             version: 1,
             peer: "203.0.113.2".into(),
             webrtc_port: 7800,
@@ -143,11 +218,27 @@ mod tests {
             password: "12345678".into(),
             device_id: Uuid::nil(),
             provider: ProviderName::Vk,
-            provider_data: serde_json::json!({"vk_call_links":["abc"]}),
+            provider_data,
             mtu: 1200,
-        };
+        }
+    }
+
+    #[test]
+    fn uri_roundtrip_multi_provider() {
+        let c = base(serde_json::json!({
+            "vk":{"vk_call_links":["abc"]},
+            "jazz":{"join_link":"https://example.invalid/call"}
+        }));
         let uri = c.encode_uri().unwrap();
         let d = ConnectionConfig::decode_uri(&uri).unwrap();
         assert_eq!(d.peer, c.peer);
+        assert_eq!(d.provider_order(), vec![ProviderName::Vk, ProviderName::Jazz]);
+    }
+
+    #[test]
+    fn old_flat_provider_data_is_still_accepted() {
+        let c = base(serde_json::json!({"vk_call_links":["abc"]}));
+        c.validate().unwrap();
+        assert!(c.provider_data_for(ProviderName::Vk).is_some());
     }
 }

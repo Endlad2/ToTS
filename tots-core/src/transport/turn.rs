@@ -38,12 +38,12 @@ impl TurnUdpPath {
             .find(|u| u.to_ascii_lowercase().starts_with("turn:"))
             .ok_or_else(|| Error::Transport("no TURN/UDP URL".into()))?;
         let server = parse_turn_udp(url)?;
-        let bind = if server.is_ipv4() {
-            "0.0.0.0:0"
+        let bind: SocketAddr = if server.is_ipv4() {
+            "0.0.0.0:0".parse().expect("static IPv4 bind")
         } else {
-            "[::]:0"
+            "[::]:0".parse().expect("static IPv6 bind")
         };
-        let socket = Arc::new(UdpSocket::bind(bind).await?);
+        let socket = Arc::new(super::socket::bind_udp(bind)?);
         socket.connect(server).await?;
         let unauth = stun::encode(
             stun::ALLOCATE_REQUEST,
