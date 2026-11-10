@@ -19,17 +19,26 @@ pub struct ProviderBootstrap {
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn bootstrap(&self, data: &Value) -> Result<ProviderBootstrap>;
+    async fn connect_native(
+        &self,
+        _data: &Value,
+    ) -> Result<Option<std::sync::Arc<dyn crate::transport::DatagramPath>>> {
+        Ok(None)
+    }
     async fn cleanup(&self, _data: &Value, _bootstrap: &ProviderBootstrap) -> Result<()> {
         Ok(())
     }
 }
 
+#[path = "../../../Providers/jazz.rs"]
+pub mod jazz;
 #[path = "../../../Providers/vk.rs"]
 pub mod vk;
 
 pub fn make_provider(name: &ProviderName) -> Result<Box<dyn Provider>> {
     match name {
-        ProviderName::Vk => Ok(Box::new(vk::VkProvider::default())),
+        ProviderName::Vk => Ok(Box::new(vk::VkProvider)),
+        ProviderName::Jazz => Ok(Box::new(jazz::JazzProvider)),
         ProviderName::Unknown => Err(Error::Provider("unknown provider".into())),
     }
 }

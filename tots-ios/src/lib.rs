@@ -36,7 +36,9 @@ fn empty_buffer() -> TotsBuffer {
 }
 
 #[no_mangle]
-pub extern "C" fn tots_engine_new(uri: *const c_char) -> *mut Handle {
+/// # Safety
+/// A non-null `uri` must point to a valid NUL-terminated string for this call.
+pub unsafe extern "C" fn tots_engine_new(uri: *const c_char) -> *mut Handle {
     if uri.is_null() {
         return ptr::null_mut();
     }
@@ -48,7 +50,9 @@ pub extern "C" fn tots_engine_new(uri: *const c_char) -> *mut Handle {
 }
 
 #[no_mangle]
-pub extern "C" fn tots_engine_free(h: *mut Handle) {
+/// # Safety
+/// A non-null `h` must be an exclusively owned handle returned by `tots_engine_new`.
+pub unsafe extern "C" fn tots_engine_free(h: *mut Handle) {
     if !h.is_null() {
         unsafe {
             drop(Box::from_raw(h));
@@ -57,7 +61,9 @@ pub extern "C" fn tots_engine_free(h: *mut Handle) {
 }
 
 #[no_mangle]
-pub extern "C" fn tots_config_json(uri: *const c_char) -> *mut c_char {
+/// # Safety
+/// A non-null `uri` must point to a valid NUL-terminated string for this call.
+pub unsafe extern "C" fn tots_config_json(uri: *const c_char) -> *mut c_char {
     if uri.is_null() {
         return ptr::null_mut();
     }
@@ -73,8 +79,10 @@ pub extern "C" fn tots_config_json(uri: *const c_char) -> *mut c_char {
 }
 
 /// Returns a length-prefixed batch: repeated `u32_be datagram_len | datagram`.
+/// # Safety
+/// `h` must be live and exclusively borrowed; `data` must be non-null and readable for `len` bytes.
 #[no_mangle]
-pub extern "C" fn tots_engine_encapsulate_ip(
+pub unsafe extern "C" fn tots_engine_encapsulate_ip(
     h: *mut Handle,
     assoc_id: u16,
     data: *const c_uchar,
@@ -100,8 +108,10 @@ pub extern "C" fn tots_engine_encapsulate_ip(
 }
 
 /// Returns one completed inner IP packet, or an empty buffer for a control/incomplete fragment.
+/// # Safety
+/// `h` must be live and exclusively borrowed; `data` must be non-null and readable for `len` bytes.
 #[no_mangle]
-pub extern "C" fn tots_engine_decapsulate(
+pub unsafe extern "C" fn tots_engine_decapsulate(
     h: *mut Handle,
     data: *const c_uchar,
     len: size_t,
@@ -118,7 +128,9 @@ pub extern "C" fn tots_engine_decapsulate(
 }
 
 #[no_mangle]
-pub extern "C" fn tots_buffer_free(buffer: TotsBuffer) {
+/// # Safety
+/// A non-empty buffer must be an unmodified, exclusively owned buffer returned by this library.
+pub unsafe extern "C" fn tots_buffer_free(buffer: TotsBuffer) {
     if !buffer.ptr.is_null() {
         unsafe {
             drop(Vec::from_raw_parts(buffer.ptr, buffer.len, buffer.cap));
@@ -127,7 +139,9 @@ pub extern "C" fn tots_buffer_free(buffer: TotsBuffer) {
 }
 
 #[no_mangle]
-pub extern "C" fn tots_string_free(s: *mut c_char) {
+/// # Safety
+/// A non-null `s` must be an exclusively owned string returned by this library.
+pub unsafe extern "C" fn tots_string_free(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
             drop(CString::from_raw(s));

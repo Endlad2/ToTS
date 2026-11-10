@@ -1,98 +1,78 @@
 # ToTS — Traffic over Turn Server
 
-ToTS is a Rust workspace for carrying L3 VPN traffic over provider-assisted UDP paths. The first provider is VK Calls. A client obtains ICE/TURN material, probes two server entry ports, chooses the healthy/lowest-RTT path, encrypts ToTS packets with the config password, and moves TUN packets through the selected path.
+ToTS carries encrypted L3 VPN packets through VK Calls TURN/UDP or a live SaluteJazz RTP media session. The client probes the available paths, selects a healthy path by RTT, and connects it to a TUN interface. Windows IPv4 Internet egress through both providers has been verified against three IP services, with clean timed exits and full-tunnel route removal. The same Jazz config also passed a reconnect probe. See [test results](docs/TEST-RESULTS.md).
 
 ## Workspace
 
-- `tots-core` — reusable protocol, crypto, provider, TURN/STUN, probing and session code.
-- `tots-client` — desktop Windows/Linux and Android-friendly CLI binary. Android can pass an already-open VPN fd.
-- `tots-ios` — `staticlib`/`cdylib` C ABI around config parsing and packet codec; intended for a NetworkExtension host.
-- `tots-server` — Linux server, local management API, SQLite config DB and dual UDP ingress.
-- `Providers/` — provider adapters compiled into `tots-core`; currently VK.
+- `tots-core`: packet protocol, encryption, fragmentation, probing and transport abstractions.
+- `tots-client`: Windows/Linux CLI and Android VPN-fd support.
+- `tots-ios`: C ABI/static library for a NetworkExtension host.
+- `tots-server`: Linux TUN, UDP ingress, SQLite and the local management API.
+- `Providers/`: VK and Jazz adapters. The bundled MIT-licensed `jazz-session` library is a path dependency excluded from workspace membership, keeping four workspace crates.
 
-## Config URI
+## Server and configuration
 
-The server returns:
-
-```text
-tots://BASE64URL(JSON)
-```
-
-The JSON carries `peer`, `webrtc_port`, `turn_port`, `password`, `device_id`, `provider` and `provider_data`. The client can also receive the same values as explicit CLI flags.
-
-## Server management API
-
-By default the API listens only on `127.0.0.1:9080`.
+The management API defaults to `127.0.0.1:9080`. Create a configuration with `POST /v1/configs`, using a private JSON request file:
 
 ```bash
 curl -sS http://127.0.0.1:9080/v1/configs \
   -H 'content-type: application/json' \
-  -d '{
-    "provider":"vk",
-    "provider_data":{"vk_call_links":["https://vk.ru/call/join/..."]},
-    "password":"change-me",
-    "device_id":"00000000-0000-4000-8000-000000000001",
-    "valid_days":30
-  }'
+  --data-binary @request.private.json
 ```
 
-If `TOTS_ADMIN_TOKEN` is set, add `Authorization: Bearer <token>`.
+The request contains `provider`, `provider_data`, a password of at least eight bytes, `device_id` (UUID), and optional `valid_days` (default 30). If `TOTS_ADMIN_TOKEN` is configured, include its bearer authorization header. Store the returned config URI privately; its contents include credentials.
 
-## Client
+| Provider | `provider_data` |
+| --- | --- |
+| `vk` | Supply `vk_call_links`, or `vk_token` to create a call. Optional `ice_servers` supplements bootstrap. |
+| `jazz` | `{}` creates a room and provisions a client connector on the VPS. Optional `join_link` joins an existing room. |
+
+For Jazz, the API adds the room invite and secret `connector_url` to the returned configuration. The database preserves the invite; server restart rejoins active rooms. Revoke, expiry and provider replacement close the old room bridge. Revoke a device with `DELETE /v1/configs/{device_id}`. The server bridges Jazz packets into its existing authenticated UDP/TUN dataplane.
+
+The server uses `10.77.0.0/16` for virtual addresses. `scripts/setup-network.sh` configures Linux forwarding/NAT; set `TOTS_UPLINK` if automatic uplink detection is unsuitable. Keep the management API on loopback unless remote access is explicitly configured.
+
+## Windows client
+
+Extract the delivery archive and keep `wintun.dll` beside the Windows `tots-client.exe`. Run TUN operations as Administrator. Save only the server-returned config URI in `client.private.txt`, then run:
+
+```powershell
+.\tots-client.exe --config-file .\client.private.txt --relay-only --tun-default-route
+```
+
+Useful options:
+
+| Option | Behavior |
+| --- | --- |
+| `--config-file PATH` | Read the private URI from a file instead of command-line arguments. |
+| `--relay-only` | Exclude the direct VPS UDP path; use provider transport. |
+| `--probe-only` | Verify an encrypted provider path without opening TUN or installing routes. |
+| `--tun-default-route` | Install Windows IPv4 full-tunnel routing and TUN DNS. |
+| `--run-for-seconds N` | End the connected TUN run gracefully after a bounded interval. |
+
+For example, add `--run-for-seconds 75` for a bounded test. The route guard pins the VPS and provider endpoint IPv4 addresses to the physical gateway, then removes its owned routes and restores TUN DNS during normal exit, including Ctrl+C and the timer. Cleanup after force-killing the process is not guaranteed.
+
+IPv6 routing is not managed. Automatic full-tunnel routing is currently Windows-only. On Android, an application can supply its `VpnService` fd with `--tun-fd`; iOS requires a NetworkExtension host.
+
+## Transport and encryption
+
+VK uses TURN/UDP allocation, authentication, permissions and channel binding. Its relay requires a 12-byte RTP envelope around each encrypted ToTS datagram. The server recognizes that envelope while continuing to accept raw ToTS datagrams for the direct/legacy path.
+
+Jazz uses actual WebSocket signalling and WebRTC RTP media through the restored `jazz-session` library. `preconnect_call` performs HTTP provisioning on the VPS; `join_preconnected` lets the PC connect directly to Jazz WSS/media endpoints. SSH is used for setup or private configuration retrieval, never for user traffic. Public media keepalives establish the remote track and are filtered before ToTS packet processing.
+
+The Jazz session publishes audio with `muted:false` and explicitly subscribes to remote unmuted AUDIO tracks, deduplicating updates and unsubscribing when tracks are muted. Encrypted path probes retry every 500 ms with fresh sequence numbers within an overall three-second deadline, allowing for initial packet loss during SFU renegotiation.
+
+ToTS frames use XChaCha20-Poly1305 with an Argon2id-derived key, authenticated envelope metadata and replay protection. Its association IDs, fragmentation, probes and flow control are TUIC-inspired design choices; the wire format is original. TURN/TCP and TURN/TLS are not implemented.
+
+## Build and archive delivery
+
+The delivery is one archive containing source, Windows and Linux release binaries, instructions and the test report, with no private configuration or credentials. To rebuild, use stable Rust. The tested toolchain is Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`.
 
 ```bash
-tots-client --config 'tots://...'
+cargo test --workspace --locked
+cargo test --manifest-path Providers/jazz-session/Cargo.toml --locked
+cargo build --workspace --release --locked
 ```
 
-or:
+Distribute the built Windows executable with its matching official AMD64 `wintun.dll`, and include `LICENSE`, `NOTICE` and the Jazz MIT license. The Linux server package also needs the systemd unit and network setup script. Preserve `/var/lib/tots/tots.db` and `/etc/tots/server.env` when upgrading. Archive delivery does not require a pull request or published release.
 
-```bash
-tots-client \
-  --peer 203.0.113.10 \
-  --webrtc-port 7800 \
-  --turn-port 7801 \
-  --password 'secret' \
-  --device-id 00000000-0000-4000-8000-000000000001 \
-  --provider vk \
-  --provider-data '{"vk_call_links":["https://vk.ru/call/join/..."]}'
-```
-
-On Android, create the VPN interface in `VpnService` and pass its fd with `--tun-fd`. On Windows, run the client as Administrator and keep `wintun.dll` next to `tots-client.exe`; official release ZIPs include the matching AMD64 DLL.
-
-## Network model
-
-The TURN path is implemented as a TURN/UDP allocation + permission + channel binding to the ToTS server's TURN ingress port. The direct entry port is an ICE/STUN-reachability path used by the ToTS session selector. `Providers/vk.rs` also exposes signalling metadata/ICE URLs so a full WebRTC media transport can be enabled without changing the config schema. The current 0.1 implementation intentionally keeps the direct data plane as provider-assisted UDP rather than pretending to be a browser PeerConnection.
-
-ToTS itself adds a TUIC-inspired *design* (not wire compatibility): association IDs, packet IDs, fragmentation/reassembly, heartbeat/probe frames, replay protection and an adaptive in-flight window. Its wire format is original.
-
-## Encryption
-
-Each ToTS datagram is protected by XChaCha20-Poly1305. A 256-bit key is derived from `password` + `device_id` with Argon2id. The envelope contains the UUID/session/sequence needed for demultiplexing; payload and frame metadata are encrypted and authenticated.
-
-## Server routing
-
-The server creates a TUN interface for `10.77.0.0/16`. A stable client address is derived from `device_id`. `scripts/setup-network.sh` enables forwarding/NAT with `nft` when run by systemd. Change `TOTS_UPLINK` if the default route detection is unsuitable.
-
-## Build
-
-```bash
-cargo test --workspace
-cargo build --workspace --release
-```
-
-## CI and releases
-
-CI uses the current stable Rust toolchain. The workspace MSRV metadata is `1.85`, because current transitive networking dependencies use Rust Edition 2024 and cannot be parsed by Cargo 1.82.
-
-Every push to any branch (and manual `workflow_dispatch`) builds both release artifacts before publishing:
-
-- `tots-server-x86_64-unknown-linux-gnu.tar.gz`
-- `tots-client-x86_64-pc-windows-msvc.zip` (includes `tots-client.exe` and official `wintun.dll`)
-
-The Git tag and GitHub Release name use `YY.DD.MM.HH.MM` in UTC.
-
-## Production notes
-
-This is a reference implementation, not an audited VPN. Before exposing it publicly: pin and audit dependencies, add rate limits to the management/API and UDP ingress, rotate provider credentials, add TURN/TCP+TLS fallback if required, and run an independent cryptography/network review.
-
-See `AGENT.MD` for the architecture and file ownership map.
+[AGENT.MD](AGENT.MD) describes architecture and ownership; [PROJECT_STATUS.md](PROJECT_STATUS.md) separates implementation from verified behavior. ToTS is a reference implementation and has not received an independent security audit.

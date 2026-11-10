@@ -1,96 +1,77 @@
 # AGENT.MD — ToTS architecture contract
 
-This file is the source-of-truth for agents modifying the repository.
+This file records the architecture and ownership rules for repository changes.
 
-## Non-negotiable architecture
+## Workspace and ownership
 
-ToTS is split into exactly four workspace crates plus the top-level `Providers/` adapter directory:
+Keep exactly four workspace crates:
 
-1. `tots-core`: reusable library. All protocol, packet codec, crypto, path selection, TURN/STUN and provider abstractions belong here. It must never depend on UI or server storage.
-2. `tots-client`: executable for desktop and Android. It parses CLI/config URI, opens/accepts a TUN fd and wires it to `tots-core`.
-3. `tots-ios`: static library / C ABI. Do not duplicate protocol logic; call `tots-core` only.
-4. `tots-server`: server executable. Owns SQLite, management API, Linux TUN, peer routing and system integration.
-5. `Providers/`: provider-specific acquisition logic. `tots-core/src/providers/mod.rs` includes these adapters. Provider code may fetch signalling/ICE/TURN data but must return provider-neutral structures.
+1. `tots-core`: original packet protocol, AEAD, replay protection, fragmentation, flow control, provider interfaces and transport paths. No UI or server-storage dependencies.
+2. `tots-client`: CLI/config loading, TUN integration and owned Windows route/DNS changes.
+3. `tots-ios`: C ABI/static library calling core logic for a NetworkExtension host.
+4. `tots-server`: SQLite, management API, Linux TUN, provider-room bridges and system integration.
 
-## Wire/data flow
+Provider adapters live in top-level `Providers/` and are included by `tots-core/src/providers/mod.rs`. `Providers/jazz-session` is the bundled MIT path dependency, excluded from workspace membership. Preserve its license and attribution when redistributing source or binaries. Workspace/Jazz Rust-version metadata is `1.89`; stable `1.99.1` was tested.
 
-Client TUN -> `SessionEngine::encapsulate_ip` -> encrypted ToTS datagram -> selected `DatagramPath` -> server UDP ingress -> `SessionEngine::decapsulate` -> server TUN -> Internet. Return traffic reverses the flow.
+## Packet flow
 
-Server has two distinct UDP entry ports:
+Client TUN → `SessionEngine::encapsulate_ip` → encrypted ToTS datagram → selected `DatagramPath` → server authenticated dataplane → server TUN → Internet. Return traffic reverses that flow.
 
-- `webrtc_port` (default 7800): direct/provider-assisted ICE/STUN candidate path.
-- `turn_port` (default 7801): target address for packets relayed through a provider TURN allocation.
+Keep separate UDP ingress ports:
 
-Do not merge these ports. Path selection must probe both when provider data allows it and prefer the lowest measured RTT among healthy paths.
+- `webrtc_port` (default 7800): direct/provider-assisted UDP path; this path itself is not a PeerConnection.
+- `turn_port` (default 7801): provider-relayed ingress, also used locally by the Jazz room bridge.
+
+VK TURN/UDP requires the 12-byte RTP envelope from `transport/rtp.rs` around encrypted ToTS bytes. The server recognizes RTP-wrapped packets and still accepts raw ToTS packets. Jazz uses a real WebRTC RTP media session and bridges its recovered datagrams to the existing server ingress; do not duplicate the packet codec, encryption or TUN routing there.
+
+Probe healthy paths and select by measured RTT. Retry probes every 500 ms with fresh authenticated sequence numbers under the client's overall three-second deadline; packet loss or malformed replies must not reset that deadline. `--relay-only` excludes direct VPS UDP; `--probe-only` verifies the encrypted provider path without TUN. Native Jazz connections use the same `DatagramPath` boundary.
+
+## Provider and session contract
+
+`Provider::bootstrap` returns provider-neutral TURN/STUN/signalling data. `Provider::connect_native` optionally returns an owned `Arc<dyn DatagramPath>`. Each path supplies its provider endpoint `route_ips` and an asynchronous `close` operation.
+
+- `Providers/vk.rs`: anonymous call bootstrap, optional call creation, ICE/TURN acquisition and provider cleanup.
+- `Providers/jazz.rs`: `create_room`, `join_room`, `preconnect`, native client connection, endpoint discovery and session ownership.
+- `Providers/jazz-session`: guest room/signalling/WebRTC implementation, including `preconnect_call` and `join_preconnected`.
+
+Jazz provisioning HTTP may run on the VPS while the PC connects directly to Jazz WSS/media. SSH carries setup/configuration only, never VPN data. The public RTP keepalive marker is filtered before returning ToTS datagrams. Abort its task and close the call on setup failure, normal close and drop.
+
+The client waits for media readiness and a remote track; server room creation waits only for media readiness so a room can exist before a client joins. Keep sessions alive while their paths are in use.
+
+Match current Jazz signalling: publish microphone audio with `muted:false`. Discover remote AUDIO track SIDs from `rtc:join.join.otherParticipants` and `rtc:participants:update.update.participants`; skip the local identity, deduplicate subscriptions, and unsubscribe muted tracks. Bound subscription state. Send the confirmed `rtc:track:subscription:change` command rather than relying on automatic subscription.
+
+`provider_data` remains opaque JSON in the public config. VK requires `vk_call_links` or `vk_token`; explicit `ice_servers` supplements bootstrap. For Jazz API creation, `{}` creates a room, and optional `join_link` joins an existing room. The API inserts the invite and secret `connector_url` into the returned config.
+
+## Storage and lifecycle
+
+`tots-server/src/db.rs` owns SQLite. The default database is `/var/lib/tots/tots.db`; preserve it and `/etc/tots/server.env` on upgrades. The management API defaults to loopback.
+
+Persist Jazz invites in provider data. Restart restores active rooms. Revoke or provider replacement closes the previous bridge; periodic expiry maintenance closes expired room bridges. Each bridge owns its task and native path. Serialize lifecycle changes so a delayed restore cannot replace a newer configuration.
+
+Windows `--tun-default-route` uses a guard that owns only its route/DNS changes. Pin VPS/provider IPv4 endpoints through the physical gateway before installing full-tunnel routes. Normal exit, Ctrl+C and `--run-for-seconds` perform cleanup. Do not claim cleanup after force-killing a process. IPv6 routes are not managed; TURN/TCP/TLS is not implemented.
 
 ## Security invariants
 
-- Never transmit the config password or derived key on the wire.
-- All `Frame` bytes are AEAD-protected before leaving a process.
-- `device_id`, session ID and sequence remain in the authenticated cleartext envelope for demux/replay handling.
-- `ReplayWindow` must run before an accepted packet is applied to TUN state.
-- Do not log passwords, TURN credentials, VK access tokens or decrypted packet bytes.
-- Management API defaults to loopback; remote exposure requires an explicit operator change and should use an admin bearer token/reverse proxy.
-
-## TUIC-inspired behavior (not TUIC wire compatibility)
-
-`protocol/frame.rs` owns the original ToTS commands. Data frames include association ID, packet ID and fragment coordinates. `fragment.rs` and `reassembly.rs` are responsible for bounded fragmentation/reassembly. `flow.rs` owns the adaptive in-flight window and RTT estimator. Do not import or copy TUIC source code.
-
-## TURN/STUN
-
-`transport/stun.rs` is a small RFC-style codec. `transport/turn.rs` performs UDP Allocate -> long-term auth -> CreatePermission -> ChannelBind and then carries ToTS datagrams as TURN ChannelData. If TURN/TCP/TLS is added, implement it behind the same `DatagramPath` trait.
-
-## Provider contract
-
-`providers::Provider` returns `ProviderBootstrap` containing TURN credentials, STUN URLs and signalling metadata. `Providers/vk.rs` is the VK implementation. New providers get a new file in `Providers/` and one registry branch in `tots-core/src/providers/mod.rs`.
-
-`provider_data` is opaque JSON in the public config so adding providers does not change the URI schema. VK currently accepts:
-
-```json
-{
-  "vk_call_links": ["https://vk.ru/call/join/..."],
-  "vk_token": "optional-token",
-  "ice_servers": []
-}
-```
-
-At least one of `vk_call_links` or `vk_token` must be present. `ice_servers` is an optional explicit bootstrap useful for tests/self-hosted provider gateways.
-
-## Server storage/API
-
-`server/db.rs` is the only module that speaks SQLite. DB path defaults to `/var/lib/tots/tots.db`. Configs persist across binary upgrades.
-
-`server/api.rs` owns HTTP routes. Creation returns the config URI and derived virtual address. Avoid leaking the password in list endpoints.
+- Never send the config password or derived key as transport payload.
+- AEAD-protect all ToTS `Frame` bytes before they leave a process.
+- Keep UUID/session/sequence envelope metadata authenticated; enforce replay checks before applying packets to TUN.
+- Do not log passwords, config URIs, invites, connector tokens, TURN credentials, VK tokens or decrypted packet bytes.
+- Use static/sanitized provider errors; provider response bodies and URLs can contain secrets.
+- Keep management API exposure and bearer-token configuration explicit.
+- Bound queues, maps, fragmentation and reassembly for untrusted input.
 
 ## File map
 
-- `/Cargo.toml` — workspace and dependency versions.
-- `/Providers/vk.rs` — VK Calls/ICE/TURN acquisition adapter.
-- `/tots-core/src/config.rs` — public config schema and `tots://` codec.
-- `/tots-core/src/crypto.rs` — Argon2id + XChaCha20-Poly1305.
-- `/tots-core/src/protocol/frame.rs` — frame types and serialization.
-- `/tots-core/src/protocol/wire.rs` — authenticated envelope.
-- `/tots-core/src/fragment.rs` — MTU-aware data fragmentation.
-- `/tots-core/src/reassembly.rs` — bounded fragment reassembly.
-- `/tots-core/src/flow.rs` — ACK/RTT/in-flight controller.
-- `/tots-core/src/session.rs` — high-level packet engine.
-- `/tots-core/src/transport/path.rs` — `DatagramPath` trait + direct UDP path.
-- `/tots-core/src/transport/stun.rs` — STUN/TURN message codec.
-- `/tots-core/src/transport/turn.rs` — TURN/UDP path.
-- `/tots-core/src/transport/probe.rs` — path RTT/health probes.
-- `/tots-client/src/main.rs` — CLI orchestration.
-- `/tots-client/src/tun_io.rs` — cross-platform TUN loop; Unix/Android may use an externally supplied fd, Windows uses Wintun through the `tun` crate.
-- `/tots-ios/src/lib.rs` — C ABI for NetworkExtension hosts.
-- `/tots-server/src/main.rs` — server lifecycle.
-- `/tots-server/src/api.rs` — local config API.
-- `/tots-server/src/db.rs` — SQLite schema/queries.
-- `/tots-server/src/dataplane.rs` — UDP/TUN packet routing.
-- `/scripts/install-server.sh` — release installer/upgrader preserving DB/config.
-- `/scripts/setup-network.sh` — idempotent Linux forwarding/NAT setup.
-- `/systemd/tots-server.service` — systemd unit.
-- `/.github/workflows/ci.yml` — stable-Rust Linux clippy/test/build plus Windows client compile check (no rustfmt gate).
-- `/.github/workflows/release.yml` — automatic Linux server + Windows x86_64 client release on every branch push; Windows package includes verified official Wintun; tags use `YY.DD.MM.HH.MM` in UTC.
+| File | Responsibility |
+| --- | --- |
+| `tots-core/src/config.rs` | Public config and URI codec |
+| `tots-core/src/crypto.rs`, `protocol/` | Key derivation, AEAD, original frame/envelope format |
+| `tots-core/src/fragment.rs`, `reassembly.rs`, `flow.rs` | Packet fragmentation, bounded reassembly and flow state |
+| `tots-core/src/session.rs` | Shared packet engine |
+| `tots-core/src/transport/` | Datagram paths, STUN/TURN, RTP envelope and probes |
+| `tots-client/src/main.rs`, `tun_io.rs`, `routes.rs` | Client lifecycle, TUN and Windows routing |
+| `tots-ios/src/lib.rs` | NetworkExtension C ABI |
+| `tots-server/src/api.rs`, `db.rs`, `bridge.rs`, `dataplane.rs` | Config lifecycle, persistence, provider bridge and UDP/TUN routing |
+| `scripts/`, `systemd/` | Installation, Linux NAT and service integration |
 
-## Change rules
-
-Keep public structs serde-compatible unless bumping config protocol version. Add tests for every frame format and config migration. Prefer bounded queues/maps; untrusted network input must not grow memory without limits. New transport paths implement `DatagramPath` and are selected by probe results rather than special-casing the client loop.
+Keep public structs serde-compatible unless the config protocol version changes. Test wire formats, config/lifecycle changes and route ownership at their actual boundaries. Record live provider evidence in `docs/TEST-RESULTS.md`; a direct UDP probe or unit test does not prove provider VPN egress. Current recorded checks are 22 workspace tests (5 client, 10 core, 7 server), a separately verified elevated MTU test, and 26 Jazz unit tests plus one doc test. Deliver one archive with source, release binaries, instructions, report and licenses; a PR is not required.

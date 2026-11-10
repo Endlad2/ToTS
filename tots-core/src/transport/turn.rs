@@ -1,5 +1,5 @@
 use crate::{
-    transport::{path::DatagramPath, stun},
+    transport::{path::DatagramPath, rtp, stun},
     Error, Result,
 };
 use async_trait::async_trait;
@@ -193,17 +193,24 @@ fn parse_turn_udp(value: &str) -> Result<SocketAddr> {
 
 #[async_trait]
 impl DatagramPath for TurnUdpPath {
+    fn route_ips(&self) -> Vec<std::net::Ipv4Addr> {
+        match self.socket.peer_addr().ok().map(|a| a.ip()) {
+            Some(std::net::IpAddr::V4(ip)) => vec![ip],
+            _ => vec![],
+        }
+    }
     fn name(&self) -> &str {
         &self.name
     }
     async fn send(&self, data: &[u8]) -> Result<()> {
+        let data = rtp::encode_datagram(data)?;
         if data.len() > u16::MAX as usize {
             return Err(Error::Transport("TURN payload too large".into()));
         }
         let mut packet = Vec::with_capacity(4 + data.len());
         packet.extend_from_slice(&self.channel.to_be_bytes());
         packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        packet.extend_from_slice(data);
+        packet.extend_from_slice(&data);
         self.socket.send(&packet).await?;
         Ok(())
     }
@@ -215,11 +222,13 @@ impl DatagramPath for TurnUdpPath {
                 let ch = u16::from_be_bytes([packet[0], packet[1]]);
                 let len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
                 if ch == self.channel && 4 + len <= n {
-                    if len > buf.len() {
+                    let payload = &packet[4..4 + len];
+                    let payload = rtp::decode(payload).unwrap_or(payload);
+                    if payload.len() > buf.len() {
                         return Err(Error::Transport("receive buffer too small".into()));
                     }
-                    buf[..len].copy_from_slice(&packet[4..4 + len]);
-                    return Ok(len);
+                    buf[..payload.len()].copy_from_slice(payload);
+                    return Ok(payload.len());
                 }
             }
         }

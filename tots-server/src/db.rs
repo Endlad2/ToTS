@@ -63,6 +63,7 @@ impl Db {
             let c = Self::conn(&p)?;
             let provider_s = match provider {
                 ProviderName::Vk => "vk",
+                ProviderName::Jazz => "jazz",
                 ProviderName::Unknown => "unknown",
             };
             c.execute(
@@ -111,6 +112,7 @@ impl Db {
             };
             let provider = match provider_s.as_str() {
                 "vk" => ProviderName::Vk,
+                "jazz" => ProviderName::Jazz,
                 _ => ProviderName::Unknown,
             };
             let provider_data = serde_json::from_str(&pd)?;
@@ -128,13 +130,36 @@ impl Db {
     }
     pub async fn revoke(&self, id: Uuid) -> Result<bool> {
         let p = self.path.clone();
-        Ok(task::spawn_blocking(move || -> Result<bool> {
+        task::spawn_blocking(move || -> Result<bool> {
             let c = Self::conn(&p)?;
             Ok(c.execute(
                 "UPDATE configs SET revoked=1 WHERE device_id=?1",
                 [id.to_string()],
             )? > 0)
         })
-        .await??)
+        .await?
+    }
+
+    pub async fn active_jazz(&self) -> Result<Vec<Device>> {
+        let p = self.path.clone();
+        let ids = task::spawn_blocking(move || -> Result<Vec<String>> {
+            let conn = Self::conn(&p)?;
+            let mut query =
+                conn.prepare("SELECT device_id FROM configs WHERE provider='jazz' AND revoked=0")?;
+            let rows = query
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok(rows)
+        })
+        .await??;
+        let mut devices = Vec::new();
+        for id in ids {
+            if let Some(device) = self.get(Uuid::parse_str(&id)?).await? {
+                if device.expires_at >= Utc::now() {
+                    devices.push(device);
+                }
+            }
+        }
+        Ok(devices)
     }
 }

@@ -8,6 +8,12 @@ pub trait DatagramPath: Send + Sync {
     fn name(&self) -> &str;
     async fn send(&self, data: &[u8]) -> Result<()>;
     async fn recv(&self, buf: &mut [u8]) -> Result<usize>;
+    fn route_ips(&self) -> Vec<std::net::Ipv4Addr> {
+        Vec::new()
+    }
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct DirectUdpPath {
@@ -31,6 +37,12 @@ impl DirectUdpPath {
 }
 #[async_trait]
 impl DatagramPath for DirectUdpPath {
+    fn route_ips(&self) -> Vec<std::net::Ipv4Addr> {
+        match self.socket.peer_addr().ok().map(|a| a.ip()) {
+            Some(std::net::IpAddr::V4(ip)) => vec![ip],
+            _ => vec![],
+        }
+    }
     fn name(&self) -> &str {
         &self.name
     }

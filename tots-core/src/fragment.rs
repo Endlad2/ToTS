@@ -15,7 +15,7 @@ pub fn fragment_ip(
         return Err(Error::Packet("MTU too small".into()));
     }
     let chunk = mtu - OVERHEAD;
-    let total = ((packet.len() + chunk - 1) / chunk).max(1);
+    let total = packet.len().div_ceil(chunk).max(1);
     if total > u16::MAX as usize {
         return Err(Error::Packet("too many fragments".into()));
     }

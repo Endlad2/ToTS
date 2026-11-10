@@ -27,3 +27,4 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 argon2 = "0.5"
+jazz-session = { path = "../Providers/jazz-session" }

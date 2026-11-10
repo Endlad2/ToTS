@@ -9,6 +9,7 @@ use uuid::Uuid;
 #[serde(rename_all = "lowercase")]
 pub enum ProviderName {
     Vk,
+    Jazz,
     #[serde(other)]
     Unknown,
 }
@@ -17,6 +18,7 @@ impl ProviderName {
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "vk" => Ok(Self::Vk),
+            "jazz" => Ok(Self::Jazz),
             other => Err(Error::Config(format!("unsupported provider {other:?}"))),
         }
     }
@@ -77,6 +79,20 @@ impl ConnectionConfig {
                 }
             }
             ProviderName::Unknown => return Err(Error::Config("unknown provider".into())),
+            ProviderName::Jazz => {
+                if self
+                    .provider_data
+                    .get("join_link")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                {
+                    return Err(Error::Config(
+                        "Jazz requires a server-issued join_link".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }

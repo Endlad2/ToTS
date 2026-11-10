@@ -15,6 +15,7 @@ use tots_core::{
     config::ConnectionConfig,
     protocol::peek_meta,
     session::{DecodedPacket, SessionEngine},
+    transport::rtp,
 };
 use uuid::Uuid;
 
@@ -28,6 +29,7 @@ enum PathKind {
 struct Route {
     path: PathKind,
     addr: SocketAddr,
+    media: bool,
 }
 
 struct Peer {
@@ -51,10 +53,6 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
             .netmask((255, 255, 0, 0))
             .mtu(1400)
             .up();
-        #[cfg(target_os = "linux")]
-        c.platform_config(|p| {
-            p.packet_information(false);
-        });
         let dev = tun::create_as_async(&c).context("create server TUN")?;
         let (mut rd, mut wr) = tokio::io::split(dev);
         let tx = from_tun_tx.clone();
@@ -79,9 +77,7 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
             }
         });
     } else {
-        tokio::spawn(async move {
-            while to_tun_rx.recv().await.is_some() {}
-        });
+        tokio::spawn(async move { while to_tun_rx.recv().await.is_some() {} });
     }
 
     for (kind, sock) in [
@@ -99,6 +95,9 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
                     continue;
                 };
                 let data = &buf[..n];
+                let media_payload = rtp::decode(data);
+                let media = media_payload.is_some();
+                let data = media_payload.unwrap_or(data);
                 let Ok(meta) = peek_meta(data) else {
                     continue;
                 };
@@ -106,20 +105,27 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
                     Ok(Some(p)) => p,
                     _ => continue,
                 };
+                let Ok(decoded) = peer.engine.decapsulate(data) else {
+                    continue;
+                };
                 active_by_ip.insert(peer.virtual_ip, (meta.device_id, meta.session_id));
-                *peer.route.lock().await = Route { path: kind, addr };
-                match peer.engine.decapsulate(data) {
-                    Ok(Some(DecodedPacket::Ip {
+                *peer.route.lock().await = Route {
+                    path: kind,
+                    addr,
+                    media,
+                };
+                match decoded {
+                    Some(DecodedPacket::Ip {
                         packet_id, bytes, ..
-                    })) => {
+                    }) => {
                         let _ = tx.send(bytes).await;
-                        let _ = sock
-                            .send_to(&peer.engine.make_ack(packet_id).unwrap_or_default(), addr)
-                            .await;
+                        if let Ok(ack) = peer.engine.make_ack(packet_id) {
+                            let _ = send_reply(&sock, &ack, addr, media).await;
+                        }
                     }
-                    Ok(Some(DecodedPacket::Probe { token, sent_micros })) => {
+                    Some(DecodedPacket::Probe { token, sent_micros }) => {
                         if let Ok(a) = peer.engine.make_probe_ack(token, sent_micros) {
-                            let _ = sock.send_to(&a, addr).await;
+                            let _ = send_reply(&sock, &a, addr, media).await;
                         }
                     }
                     _ => {}
@@ -145,7 +151,7 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
                 PathKind::Turn => &turn,
             };
             for f in frames {
-                let _ = socket.send_to(&f, route.addr).await;
+                let _ = send_reply(socket, &f, route.addr, route.media).await;
             }
         }
     }
@@ -185,11 +191,26 @@ async fn get_peer(
         route: Mutex::new(Route {
             path: PathKind::Direct,
             addr: "0.0.0.0:0".parse().unwrap(),
+            media: false,
         }),
         virtual_ip,
     });
     map.insert(key, p.clone());
     Ok(Some(p))
+}
+
+async fn send_reply(
+    socket: &UdpSocket,
+    packet: &[u8],
+    addr: SocketAddr,
+    media: bool,
+) -> Result<()> {
+    if media {
+        socket.send_to(&rtp::encode_datagram(packet)?, addr).await?;
+    } else {
+        socket.send_to(packet, addr).await?;
+    }
+    Ok(())
 }
 
 fn ipv4_dst(p: &[u8]) -> Option<Ipv4Addr> {
