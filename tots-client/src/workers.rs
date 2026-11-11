@@ -11,7 +11,7 @@ use std::{
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tots_core::{
     config::{ConnectionConfig, ProviderName},
-    flow::{FlowManager, Reliability},
+    flow::{FlowManager, FlowScheduler, Reliability},
     providers::{make_provider, Provider, ProviderBootstrap},
     recovery::RecoveryController,
     session::{DecodedPacket, SessionEngine},
@@ -52,7 +52,7 @@ struct WorkerSlot {
 pub struct WorkerManager {
     cfg: ConnectionConfig,
     slots: Vec<Arc<WorkerSlot>>,
-    flows: Mutex<FlowManager>,
+    scheduler: Mutex<FlowScheduler>,
     shutdown_tx: watch::Sender<bool>,
     handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub stats: Arc<TrafficStats>,
@@ -90,7 +90,7 @@ impl WorkerManager {
         let manager = Arc::new(Self {
             cfg: cfg.clone(),
             slots,
-            flows: Mutex::new(FlowManager::default()),
+            scheduler: Mutex::new(FlowScheduler::default()),
             shutdown_tx,
             handles: Mutex::new(Vec::new()),
             stats: Arc::new(TrafficStats::default()),
@@ -149,33 +149,60 @@ impl WorkerManager {
 
     pub async fn send_ip(&self, packet: &[u8]) -> Result<()> {
         let reliability = FlowManager::classify(packet);
-        let (assoc_id, preferred) = self
-            .flows
-            .lock()
-            .await
-            .association(packet, self.slots.len());
-        let mut order = Vec::with_capacity(self.slots.len());
-        order.push(preferred % self.slots.len());
-        for offset in 1..self.slots.len() {
-            order.push((preferred + offset) % self.slots.len());
-        }
-        for index in order {
-            let slot = &self.slots[index];
-            if !slot.healthy.load(Ordering::Acquire) {
+        let mut candidates: Vec<u64> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.healthy.load(Ordering::Acquire))
+            .map(|slot| slot.id as u64)
+            .collect();
+
+        while !candidates.is_empty() {
+            let decision = {
+                let mut scheduler = self.scheduler.lock().await;
+                scheduler.select(packet, &candidates)
+            };
+            let Some(decision) = decision else {
+                break;
+            };
+            let index = decision.worker_id as usize;
+            let Some(slot) = self.slots.get(index) else {
+                candidates.retain(|worker_id| *worker_id != decision.worker_id);
                 continue;
-            }
+            };
             let outbound = OutboundPacket {
-                assoc_id,
+                assoc_id: decision.assoc_id,
                 bytes: packet.to_vec(),
                 reliability,
                 enqueued_at: Instant::now(),
             };
-            if slot.sender.send(outbound).await.is_ok() {
-                self.flows.lock().await.rebind(packet, index);
-                self.stats
-                    .tun_tx_bytes
-                    .fetch_add(packet.len() as u64, Ordering::Relaxed);
-                return Ok(());
+            match slot.sender.try_send(outbound) {
+                Ok(()) => {
+                    self.stats
+                        .tun_tx_bytes
+                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Full(outbound)) => {
+                    self.scheduler
+                        .lock()
+                        .await
+                        .mark_congested(decision.worker_id);
+                    // Keep the current flowlet ordered. Queue saturation lowers this
+                    // worker's future scheduling weight, while this packet applies
+                    // backpressure instead of being sprayed to another path.
+                    slot.sender
+                        .send(outbound)
+                        .await
+                        .map_err(|_| anyhow!("ToTS worker queue closed"))?;
+                    self.stats
+                        .tun_tx_bytes
+                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    slot.healthy.store(false, Ordering::Release);
+                    candidates.retain(|worker_id| *worker_id != decision.worker_id);
+                }
             }
         }
         Err(anyhow!("no healthy ToTS worker"))
@@ -218,6 +245,7 @@ impl WorkerManager {
             workers_target = self.desired_count(),
             workers_vk = vk_workers,
             workers_jazz = jazz_workers,
+            vk_estimated_capacity_mbps = FlowScheduler::estimated_capacity_mbps(vk_workers),
             "ToTS status"
         );
     }

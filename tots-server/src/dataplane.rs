@@ -17,7 +17,7 @@ use tokio::{
 };
 use tots_core::{
     config::ConnectionConfig,
-    flow::FlowManager,
+    flow::{FlowManager, FlowScheduler},
     protocol::peek_meta,
     recovery::RecoveryController,
     session::{DecodedPacket, SessionEngine},
@@ -48,12 +48,21 @@ struct Peer {
 
 type PeerMap = Arc<DashMap<(Uuid, u64), Arc<Peer>>>;
 type DeviceSessions = Arc<DashMap<Uuid, Arc<Mutex<Vec<u64>>>>>;
+type DeviceSchedulers = Arc<DashMap<Uuid, Arc<Mutex<FlowScheduler>>>>;
+
+struct SelectedPeer {
+    assoc_id: u16,
+    session_id: u64,
+    peer: Arc<Peer>,
+    scheduler: Arc<Mutex<FlowScheduler>>,
+}
 
 pub async fn run(args: Args, db: Db) -> Result<()> {
     let direct = Arc::new(tots_core::transport::socket::bind_udp(args.webrtc_listen)?);
     let turn = Arc::new(tots_core::transport::socket::bind_udp(args.turn_listen)?);
     let peers: PeerMap = Arc::new(DashMap::new());
     let sessions_by_device: DeviceSessions = Arc::new(DashMap::new());
+    let schedulers: DeviceSchedulers = Arc::new(DashMap::new());
     // One virtual IP maps to a device; a device may now have many worker sessions.
     let active_by_ip: Arc<DashMap<Ipv4Addr, Uuid>> = Arc::new(DashMap::new());
     let (to_tun_tx, mut to_tun_rx) = mpsc::channel::<Vec<u8>>(4096);
@@ -248,6 +257,7 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
     {
         let peers = peers.clone();
         let sessions_by_device = sessions_by_device.clone();
+        let schedulers = schedulers.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -267,6 +277,12 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
                     if let Some(list) = sessions_by_device.get(&device).map(|v| v.value().clone()) {
                         let mut list = list.lock().await;
                         list.retain(|id| *id != session);
+                        let empty = list.is_empty();
+                        drop(list);
+                        if empty {
+                            sessions_by_device.remove(&device);
+                            schedulers.remove(&device);
+                        }
                     }
                 }
             }
@@ -280,9 +296,23 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
         let Some(device_id) = active_by_ip.get(&dst).map(|v| *v.value()) else {
             continue;
         };
-        let Some(peer) = select_peer(device_id, &packet, &peers, &sessions_by_device).await else {
+        let Some(selected) = select_peer(
+            device_id,
+            &packet,
+            &peers,
+            &sessions_by_device,
+            &schedulers,
+        )
+        .await
+        else {
             continue;
         };
+        let SelectedPeer {
+            assoc_id,
+            session_id,
+            peer,
+            scheduler,
+        } = selected;
         let route = peer.route.lock().await.clone();
         if route.addr.port() == 0 {
             continue;
@@ -292,12 +322,16 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
             PathKind::Turn => &turn,
         };
         let reliability = FlowManager::classify(&packet);
-        let assoc_id = server_assoc_id(&packet);
         if let Ok((packet_id, frames)) = peer.engine.encapsulate_ip(assoc_id, &packet) {
             let bytes: usize = frames.iter().map(Vec::len).sum();
+            let mut congestion_marked = false;
             loop {
                 if peer.recovery.lock().await.can_send(bytes) {
                     break;
+                }
+                if !congestion_marked {
+                    scheduler.lock().await.mark_congested(session_id);
+                    congestion_marked = true;
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -311,6 +345,7 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
                     .await
                     .is_err()
                 {
+                    scheduler.lock().await.mark_congested(session_id);
                     sent_all = false;
                     break;
                 }
@@ -391,38 +426,64 @@ async fn select_peer(
     packet: &[u8],
     peers: &PeerMap,
     sessions_by_device: &DeviceSessions,
-) -> Option<Arc<Peer>> {
+    schedulers: &DeviceSchedulers,
+) -> Option<SelectedPeer> {
     let sessions = sessions_by_device.get(&device)?.value().clone();
     let sessions = sessions.lock().await.clone();
     let now = now_millis();
+    let latency_sensitive = FlowScheduler::is_latency_sensitive(packet);
+    let estimated_wire_bytes = packet.len().saturating_add(256);
     let mut active = Vec::new();
+    let mut sendable = Vec::new();
+
     for session in sessions {
-        let Some(peer) = peers.get(&(device, session)).map(|entry| entry.value().clone()) else {
+        let Some(peer) = peers
+            .get(&(device, session))
+            .map(|entry| entry.value().clone())
+        else {
             continue;
         };
-        if now.saturating_sub(peer.last_seen_ms.load(Ordering::Relaxed)) <= 30_000 {
-            active.push((session, peer));
+        if now.saturating_sub(peer.last_seen_ms.load(Ordering::Relaxed)) > 30_000 {
+            continue;
+        }
+        if peer.route.lock().await.addr.port() == 0 {
+            continue;
+        }
+        active.push(session);
+        if !latency_sensitive
+            && peer
+                .recovery
+                .lock()
+                .await
+                .can_send(estimated_wire_bytes)
+        {
+            sendable.push(session);
         }
     }
+
     if active.is_empty() {
         return None;
     }
-    let flow = u64::from(server_assoc_id(packet));
-    active
-        .into_iter()
-        .max_by_key(|(session, _)| rendezvous_score(flow, *session))
-        .map(|(_, peer)| peer)
-}
-
-fn rendezvous_score(flow: u64, session: u64) -> u64 {
-    // Rendezvous hashing keeps unaffected flows on their existing worker when one
-    // session disappears or returns; only flows owned by that session need to move.
-    let mut x = flow ^ session.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
+    let candidates = if !latency_sensitive && !sendable.is_empty() {
+        &sendable
+    } else {
+        &active
+    };
+    let scheduler = schedulers
+        .entry(device)
+        .or_insert_with(|| Arc::new(Mutex::new(FlowScheduler::default())))
+        .value()
+        .clone();
+    let decision = scheduler.lock().await.select(packet, candidates)?;
+    let peer = peers
+        .get(&(device, decision.worker_id))
+        .map(|entry| entry.value().clone())?;
+    Some(SelectedPeer {
+        assoc_id: decision.assoc_id,
+        session_id: decision.worker_id,
+        peer,
+        scheduler,
+    })
 }
 
 async fn send_reply(
@@ -448,32 +509,6 @@ fn ipv4_dst(packet: &[u8]) -> Option<Ipv4Addr> {
     ))
 }
 
-fn server_assoc_id(packet: &[u8]) -> u16 {
-    if packet.len() >= 20 && packet[0] >> 4 == 4 {
-        let ihl = usize::from(packet[0] & 0x0f) * 4;
-        if ihl >= 20 && packet.len() >= ihl {
-            let mut hash = 0x9e37_79b9u32;
-            for byte in &packet[12..20] {
-                hash = hash.rotate_left(5) ^ u32::from(*byte);
-                hash = hash.wrapping_mul(0x85eb_ca6b);
-            }
-            hash ^= u32::from(packet[9]);
-            if matches!(packet[9], 6 | 17) && packet.len() >= ihl + 4 {
-                for byte in &packet[ihl..ihl + 4] {
-                    hash = hash.rotate_left(5) ^ u32::from(*byte);
-                    hash = hash.wrapping_mul(0x85eb_ca6b);
-                }
-            }
-            return ((hash >> 16) ^ hash) as u16;
-        }
-    }
-    let mut hash = 0x9e37_79b9u32;
-    for byte in packet.iter().take(32) {
-        hash = hash.rotate_left(5) ^ u32::from(*byte);
-        hash = hash.wrapping_mul(0x85eb_ca6b);
-    }
-    ((hash >> 16) ^ hash) as u16
-}
 
 fn now_millis() -> u64 {
     SystemTime::now()

@@ -20,7 +20,7 @@ Encrypted frame types:
 
 ToTS is not QUIC- or TUIC-wire-compatible. It implements the transport mechanisms needed by this tunnel independently above `DatagramPath`:
 
-- stable IPv4 five-tuple associations and per-flow worker pinning;
+- stable IPv4 five-tuple associations; small UDP is worker-pinned for low jitter while TCP/large or high-rate UDP is striped across workers at bounded flowlet boundaries;
 - ACK ranges and packet-number RTT samples;
 - congestion window and pacing;
 - time-based loss detection;
@@ -33,3 +33,7 @@ ToTS is not QUIC- or TUIC-wire-compatible. It implements the transport mechanism
 Inner TCP and UDP default to `Unreliable` ToTS recovery to avoid double retransmission and head-of-line amplification. Control/other IP protocols default to bounded `Reliable` recovery.
 
 The encrypted ToTS datagram budget is capped at 1200 bytes before provider envelopes. TURN adds RTP/channel-data outside that budget. This is deliberately more conservative than forcing a 1420-byte media payload and avoids outer IP fragmentation on common paths.
+
+### Allocation scheduling estimate
+
+The multi-worker scheduler uses 247,000 bytes/s (about 2 Mbit/s) as the nominal capacity weight of one provider allocation. It is not a hard limiter. Each worker has a bounded token/deficit budget and an adaptive weight that is temporarily reduced when its queue/path is congested. Client and server apply the same flowlet policy so both upload and download can aggregate several independent sessions without per-packet round-robin reordering.

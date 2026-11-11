@@ -15,7 +15,7 @@ Provider adapters live in top-level `Providers/` and are included by `tots-core/
 
 ## Packet flow
 
-Client TUN → stable five-tuple `FlowManager` → worker scheduler → per-worker `SessionEngine` → congestion/pacing/recovery → encrypted ToTS datagram → worker `DatagramPath` → server authenticated multi-session dataplane → server TUN → Internet. Return traffic reverses that flow.
+Client TUN → stable five-tuple classifier → `FlowScheduler` → per-worker `SessionEngine` → congestion/pacing/recovery → encrypted ToTS datagram → worker `DatagramPath` → server authenticated multi-session dataplane → symmetric `FlowScheduler` → server TUN → Internet. Small UDP stays pinned for latency; bulk TCP/UDP rotates only at flowlet boundaries.
 
 Keep separate UDP ingress ports:
 
@@ -42,7 +42,7 @@ Match current Jazz signalling: publish microphone audio with `muted:false`. Disc
 
 `provider_data` is provider-keyed JSON: `{"vk": {...}, "jazz": {...}}`. `provider` names the preferred provider; additional keys are fallbacks. VK requires `vk_call_links` or `vk_token`; explicit `ice_servers` supplements bootstrap. `jazz: {}` makes the API create a room, and optional `join_link` joins an existing room. The API inserts the invite and secret `connector_url` into `provider_data.jazz`. Legacy flat single-provider rows are accepted only as a migration path.
 
-`--n` controls 1..256 independent client workers. Every worker gets a distinct `session_id`; the server stores multiple sessions per `device_id` and schedules return traffic without the old last-route-wins conflict. A failed worker retries the preferred provider first, then configured fallbacks, then cycles back to the preferred provider. Do not make workers share a SessionEngine.
+`--n` controls 1..256 independent client workers. Every worker gets a distinct `session_id`; the server stores multiple sessions per `device_id` and schedules return traffic without the old last-route-wins conflict. Do not replace flowlet scheduling with permanent 5-tuple pinning: bulk traffic must be able to use multiple healthy sessions, while small UDP must remain sticky unless its measured short-window load exceeds one worker-class capacity. A failed worker retries the preferred provider first, then configured fallbacks, then cycles back to the preferred provider. Do not make workers share a SessionEngine.
 
 ## Storage and lifecycle
 
@@ -70,6 +70,7 @@ The client accepts a server-issued URI with `--config tots://...` or explicit CL
 | `tots-core/src/crypto.rs`, `protocol/` | Key derivation, AEAD, original frame/envelope format |
 | `tots-core/src/fragment.rs`, `reassembly.rs`, `flow.rs` | Safe datagram sizing, bounded reassembly, five-tuple associations and reliability classification |
 | `tots-core/src/recovery.rs` | Congestion window, pacing, RTT, ACK processing, loss detection and bounded retransmission |
+| `tots-core/src/flow.rs` | Five-tuple classification, small-UDP pinning, ~16 KiB bulk flowlets and adaptive ~2 Mbit/s-per-allocation scheduling weights |
 | `tots-core/src/session.rs` | Per-worker packet engine, ACK-range tracking and replay/delivery deduplication |
 | `tots-core/src/transport/` | Datagram paths, tuned UDP sockets, STUN/TURN, RTP envelope and probes |
 | `tots-client/src/main.rs`, `tun_io.rs`, `workers.rs`, `routes.rs` | Client lifecycle, TUN, worker pool/failover and Windows routing |
