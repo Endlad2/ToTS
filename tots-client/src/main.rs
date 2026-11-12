@@ -36,6 +36,10 @@ struct Args {
     /// Number of independent transport workers.
     #[arg(long = "n", default_value_t = 1)]
     n: usize,
+    /// Optional provider proportions, e.g. {"jazz":"50","vk":"50"}.
+    /// Underscore spelling is canonical; --workers-percent is accepted as an alias.
+    #[arg(long = "workers_percent", visible_alias = "workers-percent")]
+    workers_percent: Option<String>,
     #[arg(long)]
     tun_fd: Option<i32>,
     #[arg(long, default_value = "tots0")]
@@ -90,7 +94,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = config_from_args(&args)?;
     cfg.validate()?;
-    let (manager, inbound) = WorkerManager::start(cfg.clone(), args.n, args.relay_only).await?;
+    let (manager, inbound) = WorkerManager::start(
+        cfg.clone(),
+        args.n,
+        args.relay_only,
+        args.workers_percent.as_deref(),
+    )
+    .await?;
     if let Err(error) = manager
         .wait_for_healthy(Duration::from_secs((45 + args.n as u64 * 5).min(300)))
         .await
@@ -205,10 +215,13 @@ mod tests {
             "30",
             "--n",
             "12",
+            "--workers_percent",
+            r#"{"jazz":"50","vk":"50"}"#,
         ])
         .unwrap();
         assert!(args.relay_only && args.probe_only && args.tun_default_route);
         assert_eq!(args.run_for_seconds, Some(30));
         assert_eq!(args.n, 12);
+        assert_eq!(args.workers_percent.as_deref(), Some(r#"{"jazz":"50","vk":"50"}"#));
     }
 }

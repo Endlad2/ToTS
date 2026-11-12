@@ -34,7 +34,7 @@ The request contains `provider` (the preferred provider), `provider_data`, a pas
 }
 ```
 
-`vk` accepts `vk_call_links` or `vk_token`; optional `ice_servers` supplements bootstrap. Every worker fetches independent TURN credentials so shared credentials do not also share a provider rate budget. Fetches are serialized with a three-second gap; multiple call links rotate between fetches. Repeated flood-control failures impose a shared 30/60/120/240/300-second cooldown. The full pool can take several minutes to start; its bounded startup budget is `min(45 + 5*N, 300)` seconds. Every worker owns an independent encrypted session.
+`vk` accepts `vk_call_links` or `vk_token`; optional `ice_servers` supplements bootstrap. VK bootstrap generations remain paced by three seconds to avoid anonymous API flood control, but one generation may lease credentials to a cohort of up to seven workers. Those workers still create independent UDP sockets, TURN allocations and encrypted sessions. Worker setup/path probing is bounded to seven concurrent workers and candidate paths inside each worker are probed in parallel. Multiple call links rotate between bootstrap generations. Repeated flood-control failures impose a shared 30/60/120/240/300-second cooldown.
 
 For parallel Jazz workers, request `"jazz": {"worker_count": 30}` and run the returned URI with `--n 30`. The count is 1–50, default 1. The server provisions independent rooms and bridges, with four concurrent setup operations, and persists an ordered secret `worker_rooms` array. Each worker uses its own room so media is not broadcast to the other workers. The first room's invite and `connector_url` remain in the legacy fields. An optional `join_link` supplies room zero; further rooms are created independently. Existing one-room configs support one Jazz worker and must be provisioned again for a larger pool. This also applies when Jazz is configured as a fallback.
 
@@ -52,12 +52,21 @@ Extract the delivery archive and keep `wintun.dll` beside the Windows `tots-clie
 .\tots-client.exe --config 'tots://...' --n 10 --relay-only --tun-default-route
 ```
 
+To request a preferred startup split across configured providers, add `--workers_percent`. Values may be JSON strings or integers and must total 100:
+
+```powershell
+.\tots-client.exe --config 'tots://...' --n 20 --workers_percent '{"jazz":"50","vk":"50"}' --relay-only --tun-default-route
+```
+
+With that example, ten slots prefer Jazz and ten prefer VK. Each slot still retains the other configured provider as fallback, so the *actual* `workers_vk` / `workers_jazz` status can move away from 50/50 after failures. Omitting `--workers_percent` preserves the existing primary-provider-first behavior. If Jazz is present as a fallback, provision at least `worker_count = --n`, because any slot may eventually fail over to Jazz and must have a non-conflicting room.
+
 Useful options:
 
 | Option | Behavior |
 | --- | --- |
 | `--config URI` | Decode one server-issued `tots://` config. |
 | `--n N` | Run `N` independent transport workers (1..256). |
+| `--workers_percent JSON` | Optional preferred provider split, e.g. `{"jazz":"50","vk":"50"}`; values must sum to 100. |
 | `--mtu N` | Override the IPv4 TUN MTU, including with `--config`; valid range 576..1400. |
 | `--relay-only` | Exclude the direct VPS/WebRTC-side UDP path; use provider relay/native transport. |
 | `--probe-only` | Wait for every requested encrypted worker without opening TUN or installing routes. |
@@ -66,7 +75,7 @@ Useful options:
 
 For example, add `--run-for-seconds 75` for a bounded test. The route guard pins the VPS and provider endpoint IPv4 addresses to the physical gateway, then removes its owned routes and restores TUN DNS during normal exit, including Ctrl+C and the timer. Cleanup after force-killing the process is not guaranteed.
 
-The client waits for the complete requested pool before creating the full-tunnel routes. A Jazz-primary request exceeding the provisioned room count fails immediately.
+The client waits for the complete requested pool before creating the full-tunnel routes. Startup/reconnect connection work is capped at seven workers concurrently rather than serially staggering every worker. Any request that configures Jazz (primary or fallback) and exceeds the provisioned Jazz room count fails immediately.
 
 IPv6 routing is not managed. Automatic full-tunnel routing is currently Windows-only. On Android, an application can supply its `VpnService` fd with `--tun-fd`; iOS requires a NetworkExtension host.
 
@@ -78,11 +87,11 @@ Jazz uses actual WebSocket signalling and WebRTC RTP media through the restored 
 
 The Jazz session publishes audio with `muted:false` and explicitly subscribes to remote unmuted AUDIO tracks, deduplicating updates and unsubscribing when tracks are muted. Encrypted path probes retry every 500 ms with fresh sequence numbers within an overall three-second deadline, allowing for initial packet loss during SFU renegotiation.
 
-ToTS frames use XChaCha20-Poly1305 with an Argon2id-derived key, authenticated envelope metadata and replay protection. Each worker has its own session and sequence space; workers reuse the device key without repeating Argon2. Data frames receive their sequence number immediately before encrypted transmission. The replay window remains 128 packets.
+ToTS frames use XChaCha20-Poly1305 with an Argon2id-derived key, authenticated envelope metadata and replay protection. Each worker has its own session and sequence space; workers reuse the device key without repeating Argon2. Data frames receive their sequence number immediately before encrypted transmission. The replay window remains 128 packets. ACK-range feedback is delayed for at most about 2 ms and batched up to 32 received packet IDs per datagram, reducing control traffic and transport sends without changing authenticated packet numbering.
 
 TCP/UDP IP traffic uses best-effort datagram forwarding, relying on the inner transport's congestion control rather than adding a second ACK window, pacer or retransmission layer. Bounded queues and socket backpressure still apply. Reliable control traffic retains congestion control, burst pacing, loss detection and bounded recovery. Best-effort ACK diagnostics retain at most 512 payload-free samples per worker.
 
-Bulk traffic moves between workers at roughly 16 KiB flowlet boundaries. Small UDP (up to 300-byte IP packets) stays sticky unless its short-window load rises above about 75% of one estimated allocation, at which point it is temporarily treated as bulk. Worker selection uses an adaptive token/deficit weight of about 247 kB/s (~2 Mbit/s) per allocation; this is a balancing estimate rather than a hard rate cap.
+Bulk traffic moves between workers at roughly 16 KiB flowlet boundaries. Small UDP (up to 300-byte IP packets) stays sticky unless its short-window load rises above about 75% of one estimated allocation, at which point it is temporarily treated as bulk. Worker selection uses an adaptive token/deficit weight of about 247 kB/s (~2 Mbit/s) per allocation; this is a balancing estimate rather than a hard rate cap. The server receive hot path uses a larger bounded TUN ingress queue and no longer awaits one TUN enqueue plus one ACK network send per incoming IP packet; ACK transmission is handled by a separate per-session batcher. TURN paths also reuse their receive/send packet buffers instead of allocating a ~65 KiB receive Vec and multiple transmit Vecs per datagram. These changes follow the same hot-path separation/buffer-reuse principles as MRTT without importing its source code.
 
 Every worker owns a distinct authenticated `session_id`, so workers from one device cannot overwrite each other on the server. If a path dies, the same SessionEngine/sequence space is retained while the worker re-probes direct/WebRTC-side and TURN candidates; after repeated preferred-provider failures it tries configured fallback providers. This gives authenticated 0-RTT-like path resumption without importing QUIC wire format. A five-second status line reports TUN MB, healthy/target worker counts, provider split and the approximate aggregate VK scheduling capacity. TURN/TCP and TURN/TLS are not implemented.
 

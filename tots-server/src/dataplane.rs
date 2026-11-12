@@ -28,6 +28,11 @@ use tots_core::{
 };
 use uuid::Uuid;
 
+const SERVER_ACK_QUEUE: usize = 4096;
+const SERVER_ACK_BATCH_MAX: usize = 32;
+const SERVER_ACK_BATCH_DELAY: Duration = Duration::from_millis(2);
+const TO_TUN_QUEUE: usize = 16_384;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PathKind {
     Direct,
@@ -51,20 +56,12 @@ struct Peer {
     last_seen_ms: AtomicU64,
     recovery: Mutex<RecoveryController>,
     outbound: mpsc::Sender<OutboundPacket>,
+    ack_outbound: mpsc::Sender<AckRequest>,
     migrated: AtomicBool,
     ack_ranges: AtomicBool,
     _slot: OwnedSemaphorePermit,
 }
 
-impl Peer {
-    fn make_ack(&self, packet_id: u32) -> tots_core::Result<Vec<u8>> {
-        if self.ack_ranges.load(Ordering::Acquire) {
-            self.engine.make_ack(packet_id)
-        } else {
-            self.engine.make_legacy_ack(packet_id)
-        }
-    }
-}
 
 type PeerMap = Arc<DashMap<(Uuid, u64), Arc<Peer>>>;
 type DeviceSessions = Arc<DashMap<Uuid, Arc<Mutex<Vec<u64>>>>>;
@@ -82,6 +79,12 @@ struct OutboundPacket {
     bytes: Vec<u8>,
     scheduler: Arc<Mutex<FlowScheduler>>,
     enqueued_at: tokio::time::Instant,
+}
+
+#[derive(Clone)]
+struct AckRequest {
+    packet_id: u32,
+    route: Route,
 }
 
 struct CachedKey {
@@ -235,6 +238,7 @@ impl PeerRegistry {
             return Ok(None);
         };
         let (outbound, receiver) = mpsc::channel(128);
+        let (ack_outbound, ack_receiver) = mpsc::channel(SERVER_ACK_QUEUE);
         let peer = Arc::new(Peer {
             device_id: id,
             auth_fingerprint,
@@ -249,6 +253,7 @@ impl PeerRegistry {
             last_seen_ms: AtomicU64::new(now_millis()),
             recovery: Mutex::new(RecoveryController::default()),
             outbound,
+            ack_outbound,
             migrated: AtomicBool::new(false),
             ack_ranges: AtomicBool::new(false),
             _slot: slot,
@@ -262,6 +267,12 @@ impl PeerRegistry {
             self.direct.clone(),
             self.turn.clone(),
             receiver,
+        ));
+        tokio::spawn(peer_ack_loop(
+            Arc::downgrade(&peer),
+            self.direct.clone(),
+            self.turn.clone(),
+            ack_receiver,
         ));
         Ok(Some((peer, decoded)))
     }
@@ -346,7 +357,7 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
     let schedulers: DeviceSchedulers = Arc::new(DashMap::new());
     // One virtual IP maps to a device; a device may now have many worker sessions.
     let active_by_ip: Arc<DashMap<Ipv4Addr, Uuid>> = Arc::new(DashMap::new());
-    let (to_tun_tx, mut to_tun_rx) = mpsc::channel::<Vec<u8>>(4096);
+    let (to_tun_tx, mut to_tun_rx) = mpsc::channel::<Vec<u8>>(TO_TUN_QUEUE);
     let (from_tun_tx, from_tun_rx) = mpsc::channel::<Vec<u8>>(4096);
 
     if !args.no_tun {
@@ -588,21 +599,27 @@ async fn handle_received(
             peer.migrated.store(true, Ordering::Release);
             tracing::info!(device_id = %peer.device_id, session_id = peer.engine.session_id(), path = ?incoming.path, "worker route migrated");
         }
-        *route = incoming;
+        *route = incoming.clone();
     }
     match decoded {
         Some(DecodedPacket::Ip {
             packet_id, bytes, ..
         }) => {
-            let _ = tx.send(bytes).await;
-            if let Ok(ack) = peer.make_ack(packet_id) {
-                let _ = send_reply(sock, &ack, addr, media).await;
+            // Never stall the socket receive loop on a TUN write or an ACK transport send.
+            // A bounded TUN queue absorbs bursts; overload drops are preferable to blocking
+            // every worker sharing this UDP socket. TCP/QUIC inside the tunnel can recover.
+            if tx.try_send(bytes).is_ok() {
+                let _ = peer.ack_outbound.try_send(AckRequest {
+                    packet_id,
+                    route: incoming.clone(),
+                });
             }
         }
         Some(DecodedPacket::Duplicate { packet_id }) => {
-            if let Ok(ack) = peer.make_ack(packet_id) {
-                let _ = send_reply(sock, &ack, addr, media).await;
-            }
+            let _ = peer.ack_outbound.try_send(AckRequest {
+                packet_id,
+                route: incoming.clone(),
+            });
         }
         Some(DecodedPacket::Ack { packet_id }) => {
             peer.recovery.lock().await.on_ack(packet_id);
@@ -618,6 +635,61 @@ async fn handle_received(
             }
         }
         _ => {}
+    }
+}
+
+async fn peer_ack_loop(
+    weak: Weak<Peer>,
+    direct: Arc<UdpSocket>,
+    turn: Arc<UdpSocket>,
+    mut receiver: mpsc::Receiver<AckRequest>,
+) {
+    let mut carry: Option<AckRequest> = None;
+    let mut packet_ids = Vec::with_capacity(SERVER_ACK_BATCH_MAX);
+    loop {
+        let first = match carry.take() {
+            Some(request) => request,
+            None => match receiver.recv().await {
+                Some(request) => request,
+                None => return,
+            },
+        };
+        let route = first.route.clone();
+        packet_ids.push(first.packet_id);
+        let deadline = tokio::time::Instant::now() + SERVER_ACK_BATCH_DELAY;
+        while packet_ids.len() < SERVER_ACK_BATCH_MAX {
+            match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                Ok(Some(request)) if request.route == route => packet_ids.push(request.packet_id),
+                Ok(Some(request)) => {
+                    carry = Some(request);
+                    break;
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let Some(peer) = weak.upgrade() else {
+            return;
+        };
+        if !peer.authorized.load(Ordering::Acquire) {
+            return;
+        }
+        let socket = match route.path {
+            PathKind::Direct => direct.as_ref(),
+            PathKind::Turn => turn.as_ref(),
+        };
+        if peer.ack_ranges.load(Ordering::Acquire) {
+            if let Ok(ack) = peer.engine.make_ack_batch(&packet_ids) {
+                let _ = send_reply(socket, &ack, route.addr, route.media).await;
+            }
+        } else {
+            // Preserve v1 compatibility until this authenticated session advertises ACK ranges.
+            for &packet_id in &packet_ids {
+                if let Ok(ack) = peer.engine.make_legacy_ack(packet_id) {
+                    let _ = send_reply(socket, &ack, route.addr, route.media).await;
+                }
+            }
+        }
+        packet_ids.clear();
     }
 }
 
@@ -1446,6 +1518,7 @@ mod tests {
         let mut receivers = Vec::new();
         for session in 1..=2 {
             let (outbound, receiver) = mpsc::channel(1);
+            let (ack_outbound, _ack_receiver) = mpsc::channel(1);
             receivers.push(receiver);
             peers.insert(
                 (cfg.device_id, session),
@@ -1470,6 +1543,7 @@ mod tests {
                     last_seen_ms: AtomicU64::new(now_millis()),
                     recovery: Mutex::new(RecoveryController::default()),
                     outbound,
+                    ack_outbound,
                     migrated: std::sync::atomic::AtomicBool::new(false),
                     ack_ranges: AtomicBool::new(false),
                     _slot: permits.clone().try_acquire_owned().unwrap(),

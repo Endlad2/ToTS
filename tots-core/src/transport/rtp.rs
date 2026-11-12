@@ -1,11 +1,15 @@
 /// The TURN service forwards media packets but drops bare ToTS datagrams.
-pub fn encode(payload: &[u8], sequence: u16, ssrc: u32) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(12 + payload.len());
+fn append(payload: &[u8], sequence: u16, ssrc: u32, packet: &mut Vec<u8>) {
     packet.extend_from_slice(&[0x80, 96]);
     packet.extend_from_slice(&sequence.to_be_bytes());
     packet.extend_from_slice(&(u32::from(sequence) * 960).to_be_bytes());
     packet.extend_from_slice(&ssrc.to_be_bytes());
     packet.extend_from_slice(payload);
+}
+
+pub fn encode(payload: &[u8], sequence: u16, ssrc: u32) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(12 + payload.len());
+    append(payload, sequence, ssrc, &mut packet);
     packet
 }
 
@@ -21,9 +25,16 @@ pub fn decode(packet: &[u8]) -> Option<&[u8]> {
     }
 }
 
-pub fn encode_datagram(packet: &[u8]) -> crate::Result<Vec<u8>> {
+pub fn encode_datagram_into(packet: &[u8], out: &mut Vec<u8>) -> crate::Result<()> {
     let meta = crate::protocol::peek_meta(packet)?;
-    Ok(encode(packet, meta.sequence as u16, meta.session_id as u32))
+    append(packet, meta.sequence as u16, meta.session_id as u32, out);
+    Ok(())
+}
+
+pub fn encode_datagram(packet: &[u8]) -> crate::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(12 + packet.len());
+    encode_datagram_into(packet, &mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -38,6 +49,14 @@ mod tests {
         assert_eq!(&packet[2..4], &17u16.to_be_bytes());
         assert_eq!(&packet[8..12], &42u32.to_be_bytes());
         assert_eq!(decode(&packet), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn encode_into_matches_encode() {
+        let payload = b"TOTS encrypted bytes";
+        let mut out = Vec::new();
+        append(payload, 17, 42, &mut out);
+        assert_eq!(out, encode(payload, 17, 42));
     }
 
     #[test]

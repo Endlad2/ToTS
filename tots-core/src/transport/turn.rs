@@ -14,6 +14,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(180);
 const CONTROL_RTO: Duration = Duration::from_millis(500);
 const CONTROL_ATTEMPTS: u8 = 4;
 const NONCE_RETRIES: u8 = 2;
+const TURN_RX_BUFFER: usize = 65_599;
 const MAINTENANCE_METHODS: [u16; 3] = [
     stun::REFRESH_REQUEST,
     stun::CREATE_PERMISSION_REQUEST,
@@ -40,6 +41,8 @@ pub struct TurnUdpPath {
     name: String,
     _relay: SocketAddr,
     maintenance: Mutex<Maintenance>,
+    send_buffer: Mutex<Vec<u8>>,
+    receive_buffer: Mutex<Vec<u8>>,
 }
 impl TurnUdpPath {
     pub async fn connect(credentials: &TurnCredentials, peer: SocketAddr) -> Result<Self> {
@@ -127,6 +130,8 @@ impl TurnUdpPath {
                 phase: 0,
                 pending: None,
             }),
+            send_buffer: Mutex::new(Vec::with_capacity(2048)),
+            receive_buffer: Mutex::new(vec![0u8; TURN_RX_BUFFER]),
         })
     }
 }
@@ -378,19 +383,27 @@ impl DatagramPath for TurnUdpPath {
         &self.name
     }
     async fn send(&self, data: &[u8]) -> Result<()> {
-        let data = rtp::encode_datagram(data)?;
-        if data.len() > u16::MAX as usize {
+        let media_len = 12usize.saturating_add(data.len());
+        if media_len > u16::MAX as usize {
             return Err(Error::Transport("TURN payload too large".into()));
         }
-        let mut packet = Vec::with_capacity(4 + data.len());
+        // Reuse one packet buffer per TURN allocation. The mutex also serializes the
+        // worker's data/control-feedback sends, avoiding allocator churn while preserving
+        // datagram boundaries.
+        let mut packet = self.send_buffer.lock().await;
+        packet.clear();
+        packet.reserve(4 + media_len);
         packet.extend_from_slice(&self.channel.to_be_bytes());
-        packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        packet.extend_from_slice(&data);
-        self.socket.send(&packet).await?;
+        packet.extend_from_slice(&(media_len as u16).to_be_bytes());
+        rtp::encode_datagram_into(data, &mut packet)?;
+        self.socket.send(packet.as_slice()).await?;
         Ok(())
     }
     async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        let mut packet = vec![0u8; (buf.len() + 64).max(2048)];
+        // Keep one allocation-sized receive buffer per TURN path instead of allocating
+        // ~65 KiB for every datagram on the throughput hot path. Each path has exactly
+        // one receive loop, so the mutex is uncontended in normal operation.
+        let mut packet = self.receive_buffer.lock().await;
         loop {
             let (control, deadline) = {
                 let mut maintenance = self.maintenance.lock().await;
@@ -400,7 +413,7 @@ impl DatagramPath for TurnUdpPath {
             if let Some(control) = control {
                 self.socket.send(&control).await?;
             }
-            let n = match tokio::time::timeout_at(deadline, self.socket.recv(&mut packet)).await {
+            let n = match tokio::time::timeout_at(deadline, self.socket.recv(packet.as_mut_slice())).await {
                 Ok(result) => result?,
                 Err(_) => continue,
             };

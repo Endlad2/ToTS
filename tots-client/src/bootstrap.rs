@@ -12,9 +12,14 @@ use tots_core::{
     Error, Result,
 };
 
-// Independent credentials avoid sharing one provider rate budget across workers.
-// Space logins rather than issuing a burst that triggers anonymous API flood control.
+// Space VK API logins rather than issuing a burst that triggers anonymous flood control.
+// One fetched credential generation is leased to a small worker cohort; each worker still
+// creates an independent UDP socket/TURN allocation, matching the safe cohort model used by MRTT.
 const FETCH_INTERVAL: Duration = Duration::from_secs(3);
+/// One VK bootstrap/credential generation can back several independent TURN allocations.
+/// Keeping this equal to startup parallelism avoids 20 sequential VK API logins while each
+/// worker still owns its own UDP socket and TURN allocation. MRTT uses the same cohort idea.
+pub const VK_WORKERS_PER_BOOTSTRAP: usize = 7;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 const FLOOD_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_OWNED_GENERATIONS: usize = 256;
@@ -22,6 +27,12 @@ const MAX_OWNED_GENERATIONS: usize = 256;
 struct OwnedBootstrap {
     data: Value,
     bootstrap: ProviderBootstrap,
+}
+
+#[derive(Clone)]
+struct SharedBootstrap {
+    bootstrap: ProviderBootstrap,
+    leases_left: usize,
 }
 
 struct State {
@@ -32,6 +43,7 @@ struct State {
     flood_streak: u32,
     closed: bool,
     credential_fingerprints: HashSet<u64>,
+    shared: Option<SharedBootstrap>,
 }
 
 /// Serializes VK bootstrap and owns created calls for one immutable configuration.
@@ -61,6 +73,7 @@ impl BootstrapPool {
                 flood_streak: 0,
                 closed: false,
                 credential_fingerprints: HashSet::new(),
+                shared: None,
             }),
         }
     }
@@ -77,6 +90,13 @@ impl BootstrapPool {
         }
         if state.failed && Instant::now() < state.not_before {
             return Err(Error::Provider("VK bootstrap retry is delayed".into()));
+        }
+        if let Some(shared) = state.shared.as_mut() {
+            if shared.leases_left > 0 {
+                shared.leases_left -= 1;
+                return Ok(shared.bootstrap.clone());
+            }
+            state.shared = None;
         }
         // Old calls may still carry live workers; never evict them by force-finishing.
         if state.owned.len() >= MAX_OWNED_GENERATIONS {
@@ -126,6 +146,10 @@ impl BootstrapPool {
                 state.failed = false;
                 state.flood_streak = 0;
                 state.not_before = Instant::now() + FETCH_INTERVAL;
+                state.shared = Some(SharedBootstrap {
+                    bootstrap: bootstrap.clone(),
+                    leases_left: VK_WORKERS_PER_BOOTSTRAP.saturating_sub(1),
+                });
                 Ok(bootstrap)
             }
             Err(error) => {
@@ -273,7 +297,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn thirty_workers_get_independent_paced_credentials() {
+    async fn thirty_workers_share_paced_bootstraps_in_seven_worker_cohorts() {
         let provider = Arc::new(FakeProvider::default());
         let pool = Arc::new(BootstrapPool::new());
         let mut workers = tokio::task::JoinSet::new();
@@ -295,10 +319,12 @@ mod tests {
         while let Some(result) = workers.join_next().await {
             *leases.entry(result.unwrap()).or_insert(0usize) += 1;
         }
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 30);
-        assert_eq!(pool.credential_count(), 30);
-        assert_eq!(leases.len(), 30);
-        assert!(leases.values().all(|count| *count == 1));
+        let generations = 30usize.div_ceil(VK_WORKERS_PER_BOOTSTRAP);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), generations);
+        assert_eq!(pool.credential_count(), generations);
+        assert_eq!(leases.len(), generations);
+        assert!(leases.values().all(|count| *count <= VK_WORKERS_PER_BOOTSTRAP));
+        assert_eq!(leases.values().sum::<usize>(), 30);
         let times = provider.fetch_times.lock().await;
         assert!(times
             .windows(2)
@@ -308,7 +334,7 @@ mod tests {
             .iter()
             .map(|v| v["vk_call_links"][0].as_str().unwrap())
             .collect();
-        let expected: Vec<_> = (0..30)
+        let expected: Vec<_> = (0..generations)
             .map(|i| ["call-a", "call-b", "call-c", "call-d"][i % 4])
             .collect();
         assert_eq!(selected, expected);
@@ -380,7 +406,7 @@ mod tests {
         assert_eq!(provider.cleaned.load(Ordering::SeqCst), 0);
         pool.cleanup(&provider).await.unwrap();
         pool.cleanup(&provider).await.unwrap();
-        assert_eq!(provider.cleaned.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.cleaned.load(Ordering::SeqCst), 1);
         assert!(pool.acquire(&provider, &json!({})).await.is_err());
     }
 }

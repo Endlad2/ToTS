@@ -89,6 +89,23 @@ mod tests {
     }
 
     #[test]
+    fn batched_ack_records_multiple_packets_in_one_datagram() {
+        let cfg = config();
+        let crypto = PacketCrypto::derive(&cfg.password, cfg.device_id).unwrap();
+        let engine = SessionEngine::with_session_and_crypto(cfg, 1, crypto.clone()).unwrap();
+        let wire = engine.make_ack_batch(&[7, 8, 10]).unwrap();
+        let (_, frame) = open_datagram(&crypto, &wire).unwrap();
+        assert!(matches!(
+            frame,
+            Frame::AckRanges { ranges }
+                if ranges == vec![
+                    AckRange { start: 10, end: 10 },
+                    AckRange { start: 7, end: 8 },
+                ]
+        ));
+    }
+
+    #[test]
     fn shared_key_keeps_session_sequences_and_replay_independent() {
         let cfg = config();
         let crypto = PacketCrypto::derive(&cfg.password, cfg.device_id).unwrap();
@@ -195,8 +212,7 @@ impl AckTracker {
         }
     }
 
-    fn record(&mut self, packet_id: u32) -> Vec<AckRange> {
-        self.observe(packet_id);
+    fn ranges(&self) -> Vec<AckRange> {
         let mut ranges = Vec::new();
         let mut end = None;
         let mut start = 0u32;
@@ -230,6 +246,11 @@ impl AckTracker {
             });
         }
         ranges
+    }
+
+    fn record(&mut self, packet_id: u32) -> Vec<AckRange> {
+        self.observe(packet_id);
+        self.ranges()
     }
 }
 
@@ -371,6 +392,19 @@ impl SessionEngine {
     /// Emits compact ACK ranges. The old single ACK frame is still accepted on receive.
     pub fn make_ack(&self, packet_id: u32) -> Result<Vec<u8>> {
         let ranges = self.ack_tracker.lock().record(packet_id);
+        self.wrap(&Frame::AckRanges { ranges })
+    }
+
+    /// Records several received packet IDs and emits one compact ACK-range datagram.
+    /// This is used by delayed ACK batching so receive hot paths do not perform one
+    /// transport send per delivered IP packet.
+    pub fn make_ack_batch(&self, packet_ids: &[u32]) -> Result<Vec<u8>> {
+        let mut tracker = self.ack_tracker.lock();
+        for &packet_id in packet_ids {
+            tracker.observe(packet_id);
+        }
+        let ranges = tracker.ranges();
+        drop(tracker);
         self.wrap(&Frame::AckRanges { ranges })
     }
 

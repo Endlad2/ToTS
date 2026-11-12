@@ -1,4 +1,4 @@
-use crate::bootstrap::BootstrapPool;
+use crate::bootstrap::{BootstrapPool, VK_WORKERS_PER_BOOTSTRAP};
 use anyhow::{anyhow, Context, Result};
 use std::{
     collections::BTreeSet,
@@ -9,7 +9,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock, Semaphore};
 use tots_core::{
     config::{ConnectionConfig, ProviderName},
     crypto::PacketCrypto,
@@ -26,22 +26,144 @@ const WORKER_QUEUE: usize = 2048;
 const INBOUND_QUEUE: usize = 4096;
 const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
+const STARTUP_PARALLELISM: usize = VK_WORKERS_PER_BOOTSTRAP;
+const ACK_QUEUE: usize = 4096;
+const ACK_BATCH_MAX: usize = 32;
+const ACK_BATCH_DELAY: Duration = Duration::from_millis(2);
 
 fn validate_worker_request(cfg: &ConnectionConfig, workers: usize) -> Result<()> {
     if workers == 0 || workers > 256 {
         anyhow::bail!("--n must be between 1 and 256");
     }
     cfg.validate()?;
-    if cfg.provider == ProviderName::Jazz {
+    if cfg.has_provider(ProviderName::Jazz) {
         let data = cfg
             .provider_data_for(ProviderName::Jazz)
             .context("missing Jazz configuration")?;
         let rooms = tots_core::providers::jazz::worker_room_count(data)?;
         if workers > rooms {
-            anyhow::bail!("--n {workers} exceeds {rooms} provisioned Jazz rooms; create a config with provider_data.jazz.worker_count={workers}");
+            anyhow::bail!("--n {workers} needs {workers} provisioned Jazz worker rooms because any worker may fail over to Jazz; config has {rooms}. Create the config with provider_data.jazz.worker_count={workers}");
         }
     }
     Ok(())
+}
+
+fn percent_value(value: &serde_json::Value, provider: &str) -> Result<usize> {
+    let percent = match value {
+        serde_json::Value::String(value) => value
+            .parse::<usize>()
+            .with_context(|| format!("workers_percent.{provider} must be an integer percent"))?,
+        serde_json::Value::Number(value) => value
+            .as_u64()
+            .map(|value| value as usize)
+            .with_context(|| format!("workers_percent.{provider} must be an integer percent"))?,
+        _ => anyhow::bail!("workers_percent.{provider} must be a string or integer percent"),
+    };
+    if percent > 100 {
+        anyhow::bail!("workers_percent.{provider} must be 0..=100");
+    }
+    Ok(percent)
+}
+
+fn worker_provider_orders(
+    cfg: &ConnectionConfig,
+    workers: usize,
+    workers_percent: Option<&str>,
+) -> Result<Vec<Vec<ProviderName>>> {
+    let configured = cfg.provider_order();
+    if configured.is_empty() {
+        anyhow::bail!("no configured provider");
+    }
+    let Some(raw) = workers_percent else {
+        return Ok((0..workers).map(|_| configured.clone()).collect());
+    };
+    let value: serde_json::Value = serde_json::from_str(raw).context("invalid --workers_percent JSON")?;
+    let object = value
+        .as_object()
+        .context("--workers_percent must be a JSON object")?;
+    if object.is_empty() {
+        anyhow::bail!("--workers_percent cannot be empty");
+    }
+
+    let mut weighted = Vec::new();
+    let mut total = 0usize;
+    for (name, value) in object {
+        let provider = ProviderName::parse(name)
+            .map_err(|_| anyhow!("unsupported workers_percent provider {name}"))?;
+        if provider == ProviderName::Unknown {
+            anyhow::bail!("unsupported workers_percent provider {name}");
+        }
+        let percent = percent_value(value, name)?;
+        if percent > 0 && !configured.contains(&provider) {
+            anyhow::bail!("workers_percent requests {name}, but provider_data.{name} is not configured");
+        }
+        total = total.saturating_add(percent);
+        if percent > 0 {
+            weighted.push((provider, percent));
+        }
+    }
+    if total != 100 {
+        anyhow::bail!("--workers_percent values must sum to 100, got {total}");
+    }
+    if weighted.is_empty() {
+        anyhow::bail!("--workers_percent must assign at least one provider");
+    }
+
+    // Largest-remainder apportionment gives an exact worker count even when --n is not
+    // divisible by 100. Ties prefer the config's primary provider.
+    let mut counts: Vec<(ProviderName, usize, usize)> = weighted
+        .iter()
+        .map(|(provider, percent)| {
+            let scaled = workers.saturating_mul(*percent);
+            (*provider, scaled / 100, scaled % 100)
+        })
+        .collect();
+    let mut assigned: usize = counts.iter().map(|(_, count, _)| *count).sum();
+    while assigned < workers {
+        let index = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (provider, _, remainder))| {
+                (*remainder, if *provider == cfg.provider { 1usize } else { 0usize })
+            })
+            .map(|(index, _)| index)
+            .expect("positive worker distribution");
+        counts[index].1 += 1;
+        counts[index].2 = 0;
+        assigned += 1;
+    }
+
+    // Smooth weighted round-robin spreads provider startup across the pool rather than
+    // starting one large provider block and then another.
+    let mut remaining: Vec<(ProviderName, usize, usize, isize)> = counts
+        .into_iter()
+        .map(|(provider, count, _)| (provider, count, count, 0))
+        .collect();
+    let total_workers = workers as isize;
+    let mut preferences = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        for (_, remaining_count, weight, score) in &mut remaining {
+            if *remaining_count > 0 {
+                *score += *weight as isize;
+            }
+        }
+        let index = remaining
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, remaining_count, _, _))| *remaining_count > 0)
+            .max_by_key(|(_, (provider, _, _, score))| {
+                (*score, if *provider == cfg.provider { 1usize } else { 0usize })
+            })
+            .map(|(index, _)| index)
+            .expect("worker distribution exhausted early");
+        let preferred = remaining[index].0;
+        remaining[index].1 -= 1;
+        remaining[index].3 -= total_workers;
+        let mut order = vec![preferred];
+        order.extend(configured.iter().copied().filter(|provider| *provider != preferred));
+        preferences.push(order);
+    }
+    Ok(preferences)
 }
 
 #[derive(Clone, Debug)]
@@ -68,14 +190,17 @@ struct ReceiveDiagnostics {
     decoded_ip_packets: AtomicU64,
     decoded_ip_bytes: AtomicU64,
     duplicates: AtomicU64,
-    ack_send_wait_ns_sum: AtomicU64,
-    ack_send_wait_ns_max: AtomicU64,
+    ack_packets_queued: AtomicU64,
+    ack_datagrams_sent: AtomicU64,
+    ack_queue_wait_ns_sum: AtomicU64,
+    ack_queue_wait_ns_max: AtomicU64,
     tun_inbound_wait_ns_sum: AtomicU64,
     tun_inbound_wait_ns_max: AtomicU64,
 }
 
 struct WorkerSlot {
     id: usize,
+    preferred_provider: ProviderName,
     healthy: AtomicBool,
     provider: RwLock<Option<ProviderName>>,
     sender: mpsc::Sender<OutboundPacket>,
@@ -102,8 +227,10 @@ impl WorkerManager {
         cfg: ConnectionConfig,
         workers: usize,
         relay_only: bool,
+        workers_percent: Option<&str>,
     ) -> Result<(Arc<Self>, mpsc::Receiver<Vec<u8>>)> {
         validate_worker_request(&cfg, workers)?;
+        let provider_orders = worker_provider_orders(&cfg, workers, workers_percent)?;
         let key_config = cfg.clone();
         let crypto = tokio::task::spawn_blocking(move || {
             PacketCrypto::derive(&key_config.password, key_config.device_id)
@@ -119,6 +246,7 @@ impl WorkerManager {
             let (sender, receiver) = mpsc::channel(WORKER_QUEUE);
             slots.push(Arc::new(WorkerSlot {
                 id,
+                preferred_provider: provider_orders[id][0],
                 healthy: AtomicBool::new(false),
                 provider: RwLock::new(None),
                 sender,
@@ -140,12 +268,21 @@ impl WorkerManager {
             bootstraps: bootstraps.clone(),
             stats: Arc::new(TrafficStats::default()),
         });
+        let startup_gate = Arc::new(Semaphore::new(STARTUP_PARALLELISM));
         let mut handles = Vec::with_capacity(workers);
-        for (slot, receiver) in manager.slots.iter().cloned().zip(receivers) {
+        for ((slot, receiver), providers) in manager
+            .slots
+            .iter()
+            .cloned()
+            .zip(receivers)
+            .zip(provider_orders)
+        {
             handles.push(tokio::spawn(worker_supervisor(
                 cfg.clone(),
                 crypto.clone(),
                 bootstraps.clone(),
+                startup_gate.clone(),
+                providers,
                 slot,
                 receiver,
                 inbound_tx.clone(),
@@ -153,6 +290,23 @@ impl WorkerManager {
                 relay_only,
             )));
         }
+        let vk_target = manager
+            .slots
+            .iter()
+            .filter(|slot| slot.preferred_provider == ProviderName::Vk)
+            .count();
+        let jazz_target = manager
+            .slots
+            .iter()
+            .filter(|slot| slot.preferred_provider == ProviderName::Jazz)
+            .count();
+        info!(
+            workers,
+            workers_vk_target = vk_target,
+            workers_jazz_target = jazz_target,
+            startup_parallelism = STARTUP_PARALLELISM,
+            "worker supervisors launched"
+        );
         *manager.handles.lock().await = handles;
         Ok((manager, inbound_rx))
     }
@@ -290,6 +444,16 @@ impl WorkerManager {
         let total = tx.saturating_add(rx);
         let mut vk_workers = 0usize;
         let mut jazz_workers = 0usize;
+        let vk_target = self
+            .slots
+            .iter()
+            .filter(|slot| slot.preferred_provider == ProviderName::Vk)
+            .count();
+        let jazz_target = self
+            .slots
+            .iter()
+            .filter(|slot| slot.preferred_provider == ProviderName::Jazz)
+            .count();
         let mut cwnd_bytes = 0usize;
         let mut inflight_bytes = 0usize;
         let mut rtt_min_us = u128::MAX;
@@ -308,8 +472,10 @@ impl WorkerManager {
         let mut decoded_ip_bytes = 0u64;
         let mut duplicate_frames = 0u64;
         let mut rx_packets_after_ack = 0u64;
-        let mut ack_send_wait_ns_sum = 0u64;
-        let mut ack_send_wait_ns_max = 0u64;
+        let mut ack_packets_queued = 0u64;
+        let mut ack_datagrams_sent = 0u64;
+        let mut ack_queue_wait_ns_sum = 0u64;
+        let mut ack_queue_wait_ns_max = 0u64;
         let mut tun_inbound_wait_ns_sum = 0u64;
         let mut tun_inbound_wait_ns_max = 0u64;
         for slot in &self.slots {
@@ -323,9 +489,11 @@ impl WorkerManager {
             decoded_ip_bytes += receive.decoded_ip_bytes.load(Ordering::Relaxed);
             duplicate_frames += receive.duplicates.load(Ordering::Relaxed);
             rx_packets_after_ack += slot.rx_packets.load(Ordering::Relaxed);
-            ack_send_wait_ns_sum += receive.ack_send_wait_ns_sum.load(Ordering::Relaxed);
-            ack_send_wait_ns_max =
-                ack_send_wait_ns_max.max(receive.ack_send_wait_ns_max.load(Ordering::Relaxed));
+            ack_packets_queued += receive.ack_packets_queued.load(Ordering::Relaxed);
+            ack_datagrams_sent += receive.ack_datagrams_sent.load(Ordering::Relaxed);
+            ack_queue_wait_ns_sum += receive.ack_queue_wait_ns_sum.load(Ordering::Relaxed);
+            ack_queue_wait_ns_max =
+                ack_queue_wait_ns_max.max(receive.ack_queue_wait_ns_max.load(Ordering::Relaxed));
             tun_inbound_wait_ns_sum += receive.tun_inbound_wait_ns_sum.load(Ordering::Relaxed);
             tun_inbound_wait_ns_max = tun_inbound_wait_ns_max
                 .max(receive.tun_inbound_wait_ns_max.load(Ordering::Relaxed));
@@ -370,6 +538,8 @@ impl WorkerManager {
             workers_target = self.desired_count(),
             workers_vk = vk_workers,
             workers_jazz = jazz_workers,
+            workers_vk_target = vk_target,
+            workers_jazz_target = jazz_target,
             turn_credentials_seen = self.bootstraps.credential_count(),
             cwnd_bytes,
             inflight_bytes,
@@ -385,8 +555,10 @@ impl WorkerManager {
             decoded_ip_bytes,
             duplicate_frames,
             rx_packets_after_ack,
-            ack_send_wait_ms_sum = ack_send_wait_ns_sum as f64 / 1_000_000.0,
-            ack_send_wait_ms_max = ack_send_wait_ns_max as f64 / 1_000_000.0,
+            ack_packets_queued,
+            ack_datagrams_sent,
+            ack_queue_wait_ms_sum = ack_queue_wait_ns_sum as f64 / 1_000_000.0,
+            ack_queue_wait_ms_max = ack_queue_wait_ns_max as f64 / 1_000_000.0,
             tun_inbound_wait_ms_sum = tun_inbound_wait_ns_sum as f64 / 1_000_000.0,
             tun_inbound_wait_ms_max = tun_inbound_wait_ns_max as f64 / 1_000_000.0,
             best_effort_samples,
@@ -416,6 +588,8 @@ async fn worker_supervisor(
     cfg: ConnectionConfig,
     crypto: PacketCrypto,
     bootstraps: Arc<BootstrapPool>,
+    startup_gate: Arc<Semaphore>,
+    providers: Vec<ProviderName>,
     slot: Arc<WorkerSlot>,
     mut outbound_rx: mpsc::Receiver<OutboundPacket>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
@@ -430,26 +604,12 @@ async fn worker_supervisor(
         }
     };
     let recovery = slot.recovery.clone();
-    let providers = cfg.provider_order();
     let mut failures = 0usize;
     info!(
         worker = slot.id,
         session_id = engine.session_id(),
         "worker starting"
     );
-    // Avoid a provider API/ICE thundering herd when many workers start together.
-    let startup_stagger = Duration::from_millis((slot.id as u64) * 100);
-    if !startup_stagger.is_zero() {
-        tokio::select! {
-            _ = tokio::time::sleep(startup_stagger) => {}
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    slot.healthy.store(false, Ordering::Release);
-                    return;
-                }
-            }
-        }
-    }
     loop {
         if *shutdown.borrow() {
             break;
@@ -466,7 +626,17 @@ async fn worker_supervisor(
             attempt = failures + 1,
             "worker connecting"
         );
-        match connect_path(
+        let permit = tokio::select! {
+            permit = startup_gate.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+                continue;
+            }
+        };
+        let connected = connect_path(
             &cfg,
             provider,
             slot.id,
@@ -475,8 +645,9 @@ async fn worker_supervisor(
             relay_only,
             &bootstraps,
         )
-        .await
-        {
+        .await;
+        drop(permit);
+        match connected {
             Ok(connected) => {
                 let ConnectedPath {
                     path,
@@ -685,18 +856,31 @@ async fn connect_path(
             provider_name.as_str()
         );
     }
-    let mut best: Option<(Duration, Arc<dyn DatagramPath>)> = None;
+    // Probe all paths for this worker concurrently. Worker-level setup is already bounded by
+    // STARTUP_PARALLELISM, so this removes serial 3-second probe tails without creating an
+    // unbounded provider thundering herd.
+    let mut probes = tokio::task::JoinSet::new();
     for candidate in &candidates {
-        match probe::probe(&engine, candidate.clone(), Duration::from_secs(3)).await {
-            Ok(result) => {
+        let candidate = candidate.clone();
+        let engine = engine.clone();
+        probes.spawn(async move {
+            let result = probe::probe(&engine, candidate.clone(), Duration::from_secs(3)).await;
+            (candidate, result)
+        });
+    }
+    let mut best: Option<(Duration, Arc<dyn DatagramPath>)> = None;
+    while let Some(joined) = probes.join_next().await {
+        match joined {
+            Ok((candidate, Ok(result))) => {
                 info!(provider=provider_name.as_str(), path=%result.path, rtt_ms=result.rtt.as_millis(), "worker path healthy");
                 if best.as_ref().is_none_or(|(rtt, _)| result.rtt < *rtt) {
-                    best = Some((result.rtt, candidate.clone()));
+                    best = Some((result.rtt, candidate));
                 }
             }
-            Err(error) => {
+            Ok((candidate, Err(error))) => {
                 warn!(provider=provider_name.as_str(), path=%candidate.name(), %error, "path probe failed")
             }
+            Err(error) => warn!(provider=provider_name.as_str(), %error, "path probe task failed"),
         }
     }
     let path = match best {
@@ -742,6 +926,7 @@ async fn run_worker(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let last_rx = Arc::new(AtomicU64::new(now_millis()));
+    let (ack_tx, ack_rx) = mpsc::channel(ACK_QUEUE);
     let sender = send_loop(
         slot.clone(),
         engine.clone(),
@@ -756,12 +941,15 @@ async fn run_worker(
         recovery.clone(),
         inbound_tx,
         last_rx.clone(),
+        ack_tx,
     );
+    let acknowledgements = ack_loop(slot.clone(), engine.clone(), path.clone(), ack_rx);
     let recovery_loop = loss_loop(engine.clone(), path.clone(), recovery.clone());
     let health = health_loop(slot.id, engine, path, recovery, last_rx);
     tokio::select! {
         result = sender => result,
         result = receiver => result,
+        result = acknowledgements => result,
         result = recovery_loop => result,
         result = health => result,
         changed = shutdown.changed() => {
@@ -850,6 +1038,7 @@ async fn recv_loop(
     recovery: Arc<Mutex<RecoveryController>>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     last_rx: Arc<AtomicU64>,
+    ack_tx: mpsc::Sender<u32>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 65535];
     loop {
@@ -889,7 +1078,7 @@ async fn recv_loop(
                 slot.receive
                     .decoded_ip_bytes
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                send_ack_with_diagnostics(&slot, &engine, path.as_ref(), packet_id).await?;
+                queue_ack(&slot, &ack_tx, packet_id).await?;
                 slot.rx_packets.fetch_add(1, Ordering::Relaxed);
                 let started = Instant::now();
                 let sent = inbound_tx.send(bytes).await;
@@ -904,7 +1093,7 @@ async fn recv_loop(
             }
             DecodedPacket::Duplicate { packet_id } => {
                 slot.receive.duplicates.fetch_add(1, Ordering::Relaxed);
-                send_ack_with_diagnostics(&slot, &engine, path.as_ref(), packet_id).await?;
+                queue_ack(&slot, &ack_tx, packet_id).await?;
             }
             DecodedPacket::Ack { packet_id } => {
                 recovery.lock().await.on_ack(packet_id);
@@ -931,24 +1120,55 @@ async fn recv_loop(
     }
 }
 
-async fn send_ack_with_diagnostics(
-    slot: &WorkerSlot,
-    engine: &SessionEngine,
-    path: &dyn DatagramPath,
-    packet_id: u32,
+async fn queue_ack(slot: &WorkerSlot, ack_tx: &mpsc::Sender<u32>, packet_id: u32) -> Result<()> {
+    slot.receive
+        .ack_packets_queued
+        .fetch_add(1, Ordering::Relaxed);
+    match ack_tx.try_send(packet_id) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(packet_id)) => {
+            let started = Instant::now();
+            let sent = ack_tx.send(packet_id).await;
+            let waited = started.elapsed().as_nanos() as u64;
+            slot.receive
+                .ack_queue_wait_ns_sum
+                .fetch_add(waited, Ordering::Relaxed);
+            slot.receive
+                .ack_queue_wait_ns_max
+                .fetch_max(waited, Ordering::Relaxed);
+            sent.map_err(|_| anyhow!("ACK queue closed"))
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow!("ACK queue closed")),
+    }
+}
+
+async fn ack_loop(
+    slot: Arc<WorkerSlot>,
+    engine: Arc<SessionEngine>,
+    path: Arc<dyn DatagramPath>,
+    mut ack_rx: mpsc::Receiver<u32>,
 ) -> Result<()> {
-    let ack = engine.make_ack(packet_id)?;
-    let started = Instant::now();
-    let sent = path.send(&ack).await;
-    let waited = started.elapsed().as_nanos() as u64;
-    slot.receive
-        .ack_send_wait_ns_sum
-        .fetch_add(waited, Ordering::Relaxed);
-    slot.receive
-        .ack_send_wait_ns_max
-        .fetch_max(waited, Ordering::Relaxed);
-    sent?;
-    Ok(())
+    let mut pending = Vec::with_capacity(ACK_BATCH_MAX);
+    loop {
+        let first = ack_rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("ACK queue closed"))?;
+        pending.push(first);
+        let deadline = tokio::time::Instant::now() + ACK_BATCH_DELAY;
+        while pending.len() < ACK_BATCH_MAX {
+            match tokio::time::timeout_at(deadline, ack_rx.recv()).await {
+                Ok(Some(packet_id)) => pending.push(packet_id),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let ack = engine.make_ack_batch(&pending)?;
+        path.send(&ack).await?;
+        slot.receive
+            .ack_datagrams_sent
+            .fetch_add(1, Ordering::Relaxed);
+        pending.clear();
+    }
 }
 
 async fn loss_loop(
@@ -1066,7 +1286,53 @@ mod tests {
         assert!(validate_worker_request(&cfg, 20).is_err());
         validate_worker_request(&cfg, 1).unwrap();
         cfg.provider = ProviderName::Vk;
+        // Jazz is still configured as a fallback, so every slot must have a unique room.
+        assert!(validate_worker_request(&cfg, 20).is_err());
+        cfg.provider_data = serde_json::json!({"vk":{"vk_call_links":["test"]}});
         validate_worker_request(&cfg, 20).unwrap();
+    }
+
+    #[test]
+    fn workers_percent_splits_preferred_providers_exactly() {
+        let cfg = ConnectionConfig {
+            version: 1,
+            peer: "127.0.0.1".into(),
+            webrtc_port: 1,
+            turn_port: 2,
+            password: "test-password".into(),
+            device_id: uuid::Uuid::new_v4(),
+            provider: ProviderName::Vk,
+            provider_data: serde_json::json!({
+                "vk":{"vk_call_links":["test"]},
+                "jazz":{"join_link":"https://example.test/room", "connector_url":"wss://example.test/connector"}
+            }),
+            mtu: 1200,
+        };
+        let orders = worker_provider_orders(&cfg, 20, Some(r#"{"jazz":"50","vk":"50"}"#)).unwrap();
+        assert_eq!(orders.len(), 20);
+        assert_eq!(orders.iter().filter(|order| order[0] == ProviderName::Vk).count(), 10);
+        assert_eq!(orders.iter().filter(|order| order[0] == ProviderName::Jazz).count(), 10);
+        assert!(orders.iter().all(|order| order.len() == 2));
+    }
+
+    #[test]
+    fn workers_percent_is_optional_and_validated() {
+        let cfg = ConnectionConfig {
+            version: 1,
+            peer: "127.0.0.1".into(),
+            webrtc_port: 1,
+            turn_port: 2,
+            password: "test-password".into(),
+            device_id: uuid::Uuid::new_v4(),
+            provider: ProviderName::Vk,
+            provider_data: serde_json::json!({"vk":{"vk_call_links":["test"]}}),
+            mtu: 1200,
+        };
+        let default_orders = worker_provider_orders(&cfg, 3, None).unwrap();
+        assert!(default_orders.iter().all(|order| order[0] == ProviderName::Vk));
+        assert!(worker_provider_orders(&cfg, 10, Some(r#"{"vk":90}"#)).is_err());
+        assert!(worker_provider_orders(&cfg, 10, Some(r#"{"vk":50,"jazz":50}"#)).is_err());
+        worker_provider_orders(&cfg, 10, Some(r#"{"vk":100}"#)).unwrap();
     }
 
     #[tokio::test]
@@ -1077,6 +1343,7 @@ mod tests {
                 let (sender, _) = mpsc::channel(1);
                 Arc::new(WorkerSlot {
                     id,
+                    preferred_provider: ProviderName::Vk,
                     healthy: AtomicBool::new(id < 10),
                     provider: RwLock::new(None),
                     sender,
