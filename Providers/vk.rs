@@ -59,8 +59,8 @@ impl Provider for VkProvider {
         let mut ice = parsed.ice_servers;
         let mut signalling = Vec::new();
         for link in &links {
-            let hash = join_hash(link)
-                .ok_or_else(|| Error::Provider("invalid VK call link".into()))?;
+            let hash =
+                join_hash(link).ok_or_else(|| Error::Provider("invalid VK call link".into()))?;
             let (servers, meta) = ice_from_join_link(&client, &hash).await?;
             ice.extend(servers);
             signalling.push(meta);
@@ -267,7 +267,9 @@ async fn ice_from_join_link(client: &Client, hash: &str) -> Result<(Vec<IceServe
         .append_pair("lang", "en");
     let r3 = vk_method_json(client, u, "messages.getAnonymCallToken").await?;
     let ok_token = str_at(&r3, "/response/token")?.to_owned();
-    let session_data = json!({"version":2,"device_id":Uuid::new_v4().to_string(),"client_version":"1.0.1"}).to_string();
+    let session_data =
+        json!({"version":2,"device_id":Uuid::new_v4().to_string(),"client_version":"1.0.1"})
+            .to_string();
     let login: Value = client
         .post(OK_CALLS)
         .form(&[
@@ -321,10 +323,7 @@ fn parse_ice_servers(v: &Value) -> Result<Vec<IceServer>> {
     };
     let mut out = Vec::new();
     for s in candidates {
-        let username = s
-            .get("username")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let username = s.get("username").and_then(Value::as_str).map(str::to_owned);
         let credential = s
             .get("credential")
             .or_else(|| s.get("password"))

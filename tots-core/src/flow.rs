@@ -183,7 +183,9 @@ impl WorkerBudget {
     }
 
     fn update(&mut self, now: Instant) {
-        let elapsed = now.saturating_duration_since(self.last_update).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(self.last_update)
+            .as_secs_f64();
         self.last_update = now;
         self.tokens = (self.tokens + elapsed * self.rate).min(ALLOCATION_TOKEN_CAPACITY);
 
@@ -220,11 +222,27 @@ pub struct FlowScheduler {
 
 impl FlowScheduler {
     pub fn select(&mut self, packet: &[u8], workers: &[u64]) -> Option<ScheduleDecision> {
-        if workers.is_empty() {
+        self.select_with_preferred(packet, workers, workers)
+    }
+
+    /// Credit preference applies at flowlet boundaries; only dead workers break a flowlet.
+    /// `preferred` must be a subset of `alive`; an empty preference uses every alive worker.
+    pub fn select_with_preferred(
+        &mut self,
+        packet: &[u8],
+        alive: &[u64],
+        preferred: &[u64],
+    ) -> Option<ScheduleDecision> {
+        if alive.is_empty() {
             return None;
         }
         let now = Instant::now();
-        self.update_budgets(workers, now);
+        let candidates = if preferred.is_empty() {
+            alive
+        } else {
+            preferred
+        };
+        self.update_budgets(alive, now);
         self.evict_flows(now);
 
         let key = flow_key(packet).unwrap_or_else(|| fallback_key(packet));
@@ -233,7 +251,7 @@ impl FlowScheduler {
 
         if let Some(mut state) = self.flows.remove(&key) {
             let sticky = state.observe(now, packet.len(), small_udp);
-            let assigned_alive = workers.contains(&state.worker_id);
+            let assigned_alive = alive.contains(&state.worker_id);
             if assigned_alive && (sticky || state.flowlet_left >= packet.len()) {
                 state.flowlet_left = state.flowlet_left.saturating_sub(packet.len());
                 let worker_id = state.worker_id;
@@ -247,8 +265,8 @@ impl FlowScheduler {
                 });
             }
 
-            let avoid = (workers.len() > 1 && assigned_alive).then_some(state.worker_id);
-            let worker_id = self.choose_worker(workers, avoid, now)?;
+            let avoid = (candidates.len() > 1 && assigned_alive).then_some(state.worker_id);
+            let worker_id = self.choose_worker(candidates, avoid, now)?;
             state.worker_id = worker_id;
             state.flowlet_left = FLOWLET_BYTES.saturating_sub(packet.len());
             let latency_sensitive = sticky;
@@ -261,7 +279,7 @@ impl FlowScheduler {
             });
         }
 
-        let worker_id = self.choose_worker(workers, None, now)?;
+        let worker_id = self.choose_worker(candidates, None, now)?;
         self.debit(worker_id, packet.len());
         self.flows.insert(
             key,
@@ -288,8 +306,7 @@ impl FlowScheduler {
     }
 
     pub fn is_latency_sensitive(packet: &[u8]) -> bool {
-        flow_key(packet)
-            .is_some_and(|key| is_small_udp_key(&key, packet.len()))
+        flow_key(packet).is_some_and(|key| is_small_udp_key(&key, packet.len()))
     }
 
     fn update_budgets(&mut self, workers: &[u64], now: Instant) {
@@ -300,7 +317,8 @@ impl FlowScheduler {
                 .update(now);
         }
         if self.budgets.len() > workers.len().saturating_mul(4).max(64) {
-            self.budgets.retain(|worker_id, _| workers.contains(worker_id));
+            self.budgets
+                .retain(|worker_id, _| workers.contains(worker_id));
         }
     }
 
@@ -343,7 +361,7 @@ impl FlowScheduler {
 
     fn evict_flows(&mut self, now: Instant) {
         self.evict_counter = self.evict_counter.wrapping_add(1);
-        if self.flows.len() < FLOW_TABLE_SOFT_LIMIT && self.evict_counter % 1024 != 0 {
+        if self.flows.len() < FLOW_TABLE_SOFT_LIMIT && !self.evict_counter.is_multiple_of(1024) {
             return;
         }
         self.flows
@@ -371,17 +389,15 @@ fn flow_key(packet: &[u8]) -> Option<FlowKey> {
     let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
     let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
     let fragment_offset = u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff;
-    let (src_port, dst_port) = if fragment_offset == 0
-        && matches!(protocol, 6 | 17)
-        && packet.len() >= ihl + 4
-    {
-        (
-            u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
-            u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]),
-        )
-    } else {
-        (0, 0)
-    };
+    let (src_port, dst_port) =
+        if fragment_offset == 0 && matches!(protocol, 6 | 17) && packet.len() >= ihl + 4 {
+            (
+                u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
+                u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]),
+            )
+        } else {
+            (0, 0)
+        };
     Some(FlowKey {
         src,
         dst,
@@ -479,7 +495,62 @@ mod tests {
                 .unwrap();
             seen.insert(decision.worker_id);
         }
-        assert!(seen.len() >= 3, "bulk flow should use several workers: {seen:?}");
+        assert!(
+            seen.len() >= 3,
+            "bulk flow should use several workers: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn credit_preference_does_not_interrupt_a_tcp_flowlet() {
+        let mut scheduler = FlowScheduler::default();
+        let packet = ipv4_packet(6, 50000, 443, 1400, 1);
+        let first = scheduler
+            .select_with_preferred(&packet, &[1, 2], &[1])
+            .unwrap();
+        assert_eq!(first.worker_id, 1);
+        for _ in 1..11 {
+            let decision = scheduler
+                .select_with_preferred(&packet, &[1, 2], &[2])
+                .unwrap();
+            assert_eq!(
+                decision.worker_id, 1,
+                "credit shortage interrupted the existing flowlet"
+            );
+        }
+        let next = scheduler
+            .select_with_preferred(&packet, &[1, 2], &[2])
+            .unwrap();
+        assert_eq!(
+            next.worker_id, 2,
+            "the next flowlet ignored its preferred worker"
+        );
+    }
+
+    #[test]
+    fn credit_preference_keeps_small_udp_sticky() {
+        let mut scheduler = FlowScheduler::default();
+        let packet = ipv4_packet(17, 50000, 3478, 120, 1);
+        let first = scheduler
+            .select_with_preferred(&packet, &[1, 2], &[1])
+            .unwrap();
+        for _ in 0..20 {
+            let decision = scheduler
+                .select_with_preferred(&packet, &[1, 2], &[2])
+                .unwrap();
+            assert_eq!(decision.worker_id, first.worker_id);
+            assert!(decision.latency_sensitive);
+        }
+    }
+
+    #[test]
+    fn empty_credit_preference_falls_back_to_alive_workers() {
+        let mut scheduler = FlowScheduler::default();
+        let packet = ipv4_packet(6, 50000, 443, 1400, 1);
+        assert!(scheduler
+            .select_with_preferred(&packet, &[1, 2], &[])
+            .is_some());
+        assert!(scheduler.select_with_preferred(&packet, &[], &[]).is_none());
     }
 
     #[test]

@@ -53,6 +53,9 @@ mod tests {
 
     #[test]
     fn encrypted_datagram_budget_is_bounded() {
-        assert_eq!(MAX_FRAGMENT_PAYLOAD + ENVELOPE_OVERHEAD + DATA_FRAME_OVERHEAD, 1200);
+        assert_eq!(
+            MAX_FRAGMENT_PAYLOAD + ENVELOPE_OVERHEAD + DATA_FRAME_OVERHEAD,
+            1200
+        );
     }
 }

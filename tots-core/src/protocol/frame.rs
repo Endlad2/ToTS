@@ -230,7 +230,10 @@ mod tests {
     fn ack_ranges_roundtrip() {
         let f = Frame::AckRanges {
             ranges: vec![
-                AckRange { start: 90, end: 100 },
+                AckRange {
+                    start: 90,
+                    end: 100,
+                },
                 AckRange { start: 70, end: 80 },
             ],
         };

@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod carrier;
 mod error;
 mod http;
 mod invite;
@@ -7,12 +8,18 @@ mod rtc;
 mod session;
 mod snapshot;
 
+pub use carrier::MediaCarrier;
 pub use error::{Error, Result};
 pub use http::HttpError;
 pub use session::{CallSession, JazzDataPlane};
 
 /// Создать гостевую встречу и получить её живую медиасессию.
 pub async fn create_call(name: &str) -> Result<CallSession> {
+    create_call_with_carrier(name, MediaCarrier::Audio).await
+}
+
+/// Opt-in media carrier; existing callers continue to use the audio default.
+pub async fn create_call_with_carrier(name: &str, carrier: MediaCarrier) -> Result<CallSession> {
     let name = validate_name(name)?;
     let timeout = std::time::Duration::from_secs(30);
     let service = http::Service::new(
@@ -38,17 +45,25 @@ pub async fn create_call(name: &str) -> Result<CallSession> {
     if invite.room_id != room_id || invite.password != password {
         return Err(Error::Protocol("ссылка не соответствует созданной комнате"));
     }
-    connect_invite(name, link, invite, service, timeout).await
+    connect_invite(name, link, invite, service, timeout, carrier).await
 }
 
 /// Присоединиться к встрече по ссылке с выбранным именем.
 pub async fn join_call(link: &str, name: &str) -> Result<CallSession> {
+    join_call_with_carrier(link, name, MediaCarrier::Audio).await
+}
+
+pub async fn join_call_with_carrier(
+    link: &str,
+    name: &str,
+    carrier: MediaCarrier,
+) -> Result<CallSession> {
     let name = validate_name(name)?;
     let invite =
         invite::Invite::parse(link).map_err(|_| Error::InvalidInput("некорректная ссылка Jazz"))?;
     let timeout = std::time::Duration::from_secs(30);
     let service = http::Service::new(invite.origin.clone(), timeout)?;
-    connect_invite(name, link, invite, service, timeout).await
+    connect_invite(name, link, invite, service, timeout, carrier).await
 }
 
 /// Получить адрес сигнального сервера через HTTP без входа в медиасессию.
@@ -63,6 +78,15 @@ pub async fn preconnect_call(link: &str) -> Result<String> {
 /// Войти напрямую в WebSocket и WebRTC по адресу, полученному через preconnect_call().
 /// HTTP-запросы не выполняются. `connector` содержит секрет подключения.
 pub async fn join_preconnected(link: &str, name: &str, connector: &str) -> Result<CallSession> {
+    join_preconnected_with_carrier(link, name, connector, MediaCarrier::Audio).await
+}
+
+pub async fn join_preconnected_with_carrier(
+    link: &str,
+    name: &str,
+    connector: &str,
+    carrier: MediaCarrier,
+) -> Result<CallSession> {
     let name = validate_name(name)?;
     let invite =
         invite::Invite::parse(link).map_err(|_| Error::InvalidInput("некорректная ссылка Jazz"))?;
@@ -72,6 +96,7 @@ pub async fn join_preconnected(link: &str, name: &str, connector: &str) -> Resul
         invite,
         parse_connector(connector)?,
         std::time::Duration::from_secs(30),
+        carrier,
     )
     .await
 }
@@ -91,9 +116,10 @@ async fn connect_invite(
     invite: invite::Invite,
     service: http::Service,
     timeout: std::time::Duration,
+    carrier: MediaCarrier,
 ) -> Result<CallSession> {
     let connector = preconnect_invite(&invite, service).await?;
-    establish_invite(name, link, invite, connector, timeout).await
+    establish_invite(name, link, invite, connector, timeout, carrier).await
 }
 
 async fn preconnect_invite(invite: &invite::Invite, service: http::Service) -> Result<url::Url> {
@@ -134,6 +160,7 @@ async fn establish_invite(
     invite: invite::Invite,
     connector_url: url::Url,
     timeout: std::time::Duration,
+    carrier: MediaCarrier,
 ) -> Result<CallSession> {
     session::establish(
         session::CallInfo {
@@ -142,6 +169,7 @@ async fn establish_invite(
             password: invite.password,
             join_url: link.to_owned(),
             connector_url,
+            carrier,
         },
         timeout,
     )

@@ -177,10 +177,7 @@ fn validate_provider(provider: ProviderName, data: &Value) -> Result<()> {
                 .get("vk_call_links")
                 .and_then(Value::as_array)
                 .map_or(0, |v| v.len());
-            let token = data
-                .get("vk_token")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let token = data.get("vk_token").and_then(Value::as_str).unwrap_or("");
             if links == 0 && token.trim().is_empty() {
                 return Err(Error::Config(
                     "provider_data.vk requires vk_call_links or vk_token".into(),
@@ -232,7 +229,10 @@ mod tests {
         let uri = c.encode_uri().unwrap();
         let d = ConnectionConfig::decode_uri(&uri).unwrap();
         assert_eq!(d.peer, c.peer);
-        assert_eq!(d.provider_order(), vec![ProviderName::Vk, ProviderName::Jazz]);
+        assert_eq!(
+            d.provider_order(),
+            vec![ProviderName::Vk, ProviderName::Jazz]
+        );
     }
 
     #[test]

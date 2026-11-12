@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::{net::SocketAddr, sync::Arc};
-use tokio::{net::UdpSocket, task::JoinHandle};
-use tots_core::transport::DatagramPath;
+use tokio::task::JoinHandle;
+use tots_core::transport::{socket::bind_udp, DatagramPath};
 
 /// Keep provider media and the existing authenticated UDP/TUN dataplane joined.
 pub struct NativeBridge {
@@ -18,12 +18,11 @@ impl NativeBridge {
                 std::net::Ipv6Addr::LOCALHOST.into()
             });
         }
-        let socket = UdpSocket::bind(if target.is_ipv4() {
-            "0.0.0.0:0"
+        let socket = bind_udp(if target.is_ipv4() {
+            "0.0.0.0:0".parse()?
         } else {
-            "[::]:0"
-        })
-        .await?;
+            "[::]:0".parse()?
+        })?;
         socket.connect(target).await?;
         let transport = path.clone();
         let task = tokio::spawn(async move {
@@ -64,6 +63,7 @@ impl Drop for NativeBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UdpSocket;
     use tots_core::transport::DirectUdpPath;
 
     #[tokio::test]

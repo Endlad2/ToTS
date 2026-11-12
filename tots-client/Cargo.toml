@@ -16,5 +16,8 @@ tun.workspace = true
 uuid.workspace = true
 tots-core = { path = "../tots-core" }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

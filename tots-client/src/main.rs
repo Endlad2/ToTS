@@ -1,3 +1,4 @@
+mod bootstrap;
 mod routes;
 mod tun_io;
 mod workers;
@@ -39,12 +40,13 @@ struct Args {
     tun_fd: Option<i32>,
     #[arg(long, default_value = "tots0")]
     tun_name: String,
-    #[arg(long, default_value_t = 1200)]
-    mtu: usize,
+    /// Override the URI's IPv4 TUN MTU (576..=1400); explicit fields default to 1200.
+    #[arg(long)]
+    mtu: Option<usize>,
     /// Exclude the direct VPS path and use provider relay/native transport only.
     #[arg(long)]
     relay_only: bool,
-    /// Check that at least one encrypted worker is healthy without opening a TUN device.
+    /// Check that all requested encrypted workers are healthy without opening a TUN device.
     #[arg(long)]
     probe_only: bool,
     /// Route all IPv4 Internet traffic through the TUN (Windows).
@@ -57,7 +59,12 @@ struct Args {
 
 fn config_from_args(a: &Args) -> Result<ConnectionConfig> {
     if let Some(uri) = &a.config {
-        return Ok(ConnectionConfig::decode_uri(uri)?);
+        let mut cfg = ConnectionConfig::decode_uri(uri)?;
+        if let Some(mtu) = a.mtu {
+            cfg.mtu = mtu;
+            cfg.validate()?;
+        }
+        return Ok(cfg);
     }
     Ok(ConnectionConfig {
         version: 1,
@@ -68,7 +75,7 @@ fn config_from_args(a: &Args) -> Result<ConnectionConfig> {
         device_id: a.device_id.context("--device-id required")?,
         provider: ProviderName::parse(&a.provider)?,
         provider_data: serde_json::from_str(a.provider_data.as_deref().unwrap_or("{}"))?,
-        mtu: a.mtu,
+        mtu: a.mtu.unwrap_or(1200),
     })
 }
 
@@ -84,7 +91,10 @@ async fn main() -> Result<()> {
     let cfg = config_from_args(&args)?;
     cfg.validate()?;
     let (manager, inbound) = WorkerManager::start(cfg.clone(), args.n, args.relay_only).await?;
-    if let Err(error) = manager.wait_for_healthy(Duration::from_secs(45)).await {
+    if let Err(error) = manager
+        .wait_for_healthy(Duration::from_secs((45 + args.n as u64 * 5).min(300)))
+        .await
+    {
         manager.shutdown().await;
         return Err(error);
     }
@@ -145,16 +155,44 @@ async fn main() -> Result<()> {
         _ = deadline => Ok(()),
     };
     status_task.abort();
-    if let Some(routes) = routes {
-        routes.cleanup().await?;
-    }
+    manager.stop();
+    let cleanup = if let Some(routes) = routes {
+        routes.cleanup().await
+    } else {
+        Ok(())
+    };
     manager.shutdown().await;
+    cleanup?;
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_mtu_overrides_uri_and_preserves_validation() {
+        let cfg = ConnectionConfig {
+            version: 1,
+            peer: "203.0.113.2".into(),
+            webrtc_port: 7800,
+            turn_port: 7801,
+            password: "test-password".into(),
+            device_id: Uuid::new_v4(),
+            provider: ProviderName::Vk,
+            provider_data: serde_json::json!({"vk":{"vk_call_links":["test"]}}),
+            mtu: 1200,
+        };
+        let uri = cfg.encode_uri().unwrap();
+        let plain = Args::try_parse_from(["tots-client", "--config", &uri]).unwrap();
+        assert_eq!(config_from_args(&plain).unwrap().mtu, 1200);
+        let overridden =
+            Args::try_parse_from(["tots-client", "--config", &uri, "--mtu", "900"]).unwrap();
+        assert_eq!(config_from_args(&overridden).unwrap().mtu, 900);
+        let invalid =
+            Args::try_parse_from(["tots-client", "--config", &uri, "--mtu", "500"]).unwrap();
+        assert!(config_from_args(&invalid).is_err());
+    }
 
     #[test]
     fn accepts_worker_count_and_runtime_flags() {
@@ -173,5 +211,4 @@ mod tests {
         assert_eq!(args.run_for_seconds, Some(30));
         assert_eq!(args.n, 12);
     }
-
 }

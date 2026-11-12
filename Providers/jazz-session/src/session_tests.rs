@@ -1,5 +1,6 @@
 use super::{establish, subscription_changes, CallInfo};
 use crate::rtc::Media;
+use crate::MediaCarrier;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{collections::HashSet, time::Duration};
@@ -61,6 +62,7 @@ impl Fixture {
             password: PASSWORD.to_owned(),
             join_url: JOIN_URL.to_owned(),
             connector_url: self.connector.clone(),
+            carrier: MediaCarrier::Audio,
         }
     }
 
@@ -127,7 +129,7 @@ async fn serve(
     events: mpsc::UnboundedSender<&'static str>,
 ) -> Result<(), String> {
     let (ice_tx, mut ice_rx) = mpsc::unbounded_channel();
-    let media = Media::new(&json!([]), ice_tx)
+    let media = Media::new(&json!([]), ice_tx, MediaCarrier::Audio)
         .await
         .map_err(|_| "fixture Media init failed")?;
     let result = async {
@@ -267,27 +269,73 @@ fn remote_audio_subscription_changes_skip_local_duplicates_and_muted_tracks() {
     ]);
     let subscribe = json!({"method":"rtc:track:subscription:change","subscription":{"trackSids":["remote-audio"],"subscribe":true}});
     assert_eq!(
-        subscription_changes("local", &mut subscribed, &participants).unwrap(),
+        subscription_changes("local", &mut subscribed, &participants, MediaCarrier::Audio).unwrap(),
         vec![subscribe.clone()]
     );
     assert!(
-        subscription_changes("local", &mut subscribed, &participants)
+        subscription_changes("local", &mut subscribed, &participants, MediaCarrier::Audio)
             .unwrap()
             .is_empty()
     );
     let muted = json!([{"identity":"remote","tracks":[{"sid":"remote-audio","type":"AUDIO","muted":true}]}]);
     assert_eq!(
-        subscription_changes("local", &mut subscribed, &muted).unwrap(),
+        subscription_changes("local", &mut subscribed, &muted, MediaCarrier::Audio).unwrap(),
         vec![
             json!({"method":"rtc:track:subscription:change","subscription":{"trackSids":["remote-audio"],"subscribe":false}})
         ]
     );
-    assert!(subscription_changes("local", &mut subscribed, &muted)
-        .unwrap()
-        .is_empty());
+    assert!(
+        subscription_changes("local", &mut subscribed, &muted, MediaCarrier::Audio)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
-        subscription_changes("local", &mut subscribed, &participants).unwrap(),
+        subscription_changes("local", &mut subscribed, &participants, MediaCarrier::Audio).unwrap(),
         vec![subscribe]
+    );
+}
+
+#[test]
+fn experimental_video_subscribes_only_video_and_requests_its_dimensions() {
+    let mut subscribed = HashSet::new();
+    let participants = json!([
+        {"identity":"local","tracks":[{"sid":"local-video","type":"VIDEO","muted":false}]},
+        {"identity":"remote","tracks":[{"sid":"remote-audio","type":"AUDIO","muted":false},
+            {"sid":"remote-video","type":"VIDEO","muted":false}]}
+    ]);
+    assert_eq!(
+        subscription_changes(
+            "local",
+            &mut subscribed,
+            &participants,
+            MediaCarrier::Vp8Experimental
+        )
+        .unwrap(),
+        vec![
+            json!({"method":"rtc:track:subscription:change","subscription":{"trackSids":["remote-video"],"subscribe":true}}),
+            json!({"method":"rtc:track:settings:update","trackSetting":{"trackSids":["remote-video"],"disabled":false,"width":1280,"height":720}})
+        ]
+    );
+    assert!(subscription_changes(
+        "local",
+        &mut subscribed,
+        &participants,
+        MediaCarrier::Vp8Experimental
+    )
+    .unwrap()
+    .is_empty());
+    let muted = json!([{"identity":"remote","tracks":[{"sid":"remote-video","type":"VIDEO","muted":true}]}]);
+    assert_eq!(
+        subscription_changes(
+            "local",
+            &mut subscribed,
+            &muted,
+            MediaCarrier::Vp8Experimental
+        )
+        .unwrap(),
+        vec![
+            json!({"method":"rtc:track:subscription:change","subscription":{"trackSids":["remote-video"],"subscribe":false}})
+        ]
     );
 }
 

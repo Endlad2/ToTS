@@ -97,8 +97,8 @@ pub fn encode(ty: u16, tx: [u8; 12], attrs: &[Attr], key: Option<&[u8; 16]>) -> 
         let mi_final = out.len() + 24;
         let len = (mi_final - 20) as u16;
         out[2..4].copy_from_slice(&len.to_be_bytes());
-        let mut mac = Hmac::<Sha1>::new_from_slice(key)
-            .map_err(|_| Error::Packet("HMAC key".into()))?;
+        let mut mac =
+            Hmac::<Sha1>::new_from_slice(key).map_err(|_| Error::Packet("HMAC key".into()))?;
         mac.update(&out);
         let tag = mac.finalize().into_bytes();
         push_attr(
@@ -126,9 +126,7 @@ pub fn decode(data: &[u8]) -> Result<Message> {
     }
     let ty = u16::from_be_bytes([data[0], data[1]]);
     let len = u16::from_be_bytes([data[2], data[3]]) as usize;
-    if data.len() < 20 + len
-        || u32::from_be_bytes(data[4..8].try_into().unwrap()) != MAGIC_COOKIE
-    {
+    if data.len() < 20 + len || u32::from_be_bytes(data[4..8].try_into().unwrap()) != MAGIC_COOKIE {
         return Err(Error::Packet("bad STUN header".into()));
     }
     let mut tx = [0u8; 12];

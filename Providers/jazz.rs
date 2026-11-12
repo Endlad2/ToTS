@@ -1,9 +1,10 @@
 use async_trait::async_trait;
+pub use jazz_session::MediaCarrier;
 use jazz_session::{CallSession, JazzDataPlane};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     net::{IpAddr, Ipv4Addr},
     sync::Arc,
     time::Duration,
@@ -16,6 +17,8 @@ use crate::{
     transport::path::DatagramPath,
     Error, Result,
 };
+
+pub const MAX_WORKER_ROOMS: usize = 50;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const KEEPALIVE: &[u8] = b"ToTS/Jazz transport keepalive v1";
@@ -40,6 +43,12 @@ fn client_name() -> String {
 }
 
 fn parse_data(data: &Value) -> Result<JazzData> {
+    media_carrier(data)?;
+    if data.get("worker_rooms").is_some() {
+        return Err(Error::Provider(
+            "select a Jazz worker room before connecting".into(),
+        ));
+    }
     let parsed: JazzData = serde_json::from_value(data.clone())
         .map_err(|_| Error::Provider("invalid Jazz provider_data".into()))?;
     if parsed.join_link.trim().is_empty()
@@ -56,6 +65,93 @@ fn parse_data(data: &Value) -> Result<JazzData> {
     Ok(parsed)
 }
 
+/// Shared API/client validation. Alternative carriers remain explicit experiments.
+pub fn media_carrier(data: &Value) -> Result<MediaCarrier> {
+    match data.get("media_carrier") {
+        None => Ok(MediaCarrier::Audio),
+        Some(Value::String(value)) if value == "audio" => Ok(MediaCarrier::Audio),
+        Some(Value::String(value)) if value == "audio-wallclock" => {
+            Ok(MediaCarrier::AudioWallclock)
+        }
+        Some(Value::String(value)) if value == "vp8-experimental" => {
+            Ok(MediaCarrier::Vp8Experimental)
+        }
+        _ => Err(Error::Provider("invalid Jazz media_carrier".into())),
+    }
+}
+
+/// A legacy invite has one slot; a pool gives each worker its own media publisher.
+pub fn worker_room_count(data: &Value) -> Result<usize> {
+    match worker_rooms(data)? {
+        Some(rooms) => Ok(rooms.len()),
+        None => {
+            parse_data(data)?;
+            Ok(1)
+        }
+    }
+}
+
+/// Select before native connection so no workers broadcast into the same room.
+pub fn worker_room_data(data: &Value, worker_id: usize) -> Result<Value> {
+    let rooms = worker_rooms(data)?;
+    let mut selected = data.clone();
+    if let Some(rooms) = rooms {
+        let room = rooms.get(worker_id).ok_or_else(|| {
+            Error::Provider("Jazz worker has no room; provision a larger worker_count".into())
+        })?;
+        let object = selected.as_object_mut().ok_or_else(invalid_worker_rooms)?;
+        object.remove("worker_rooms");
+        object.remove("worker_count");
+        object.insert("join_link".into(), Value::String(room.join_link.clone()));
+        object.insert(
+            "connector_url".into(),
+            Value::String(room.connector_url.clone()),
+        );
+    } else if worker_id != 0 {
+        return Err(Error::Provider(
+            "Jazz worker has no room; provision a larger worker_count".into(),
+        ));
+    }
+    parse_data(&selected)?;
+    Ok(selected)
+}
+
+#[derive(Deserialize)]
+struct WorkerRoom {
+    join_link: String,
+    connector_url: String,
+}
+
+fn invalid_worker_rooms() -> Error {
+    Error::Provider("invalid Jazz worker_rooms".into())
+}
+
+fn worker_rooms(data: &Value) -> Result<Option<Vec<WorkerRoom>>> {
+    let Some(value) = data.get("worker_rooms") else {
+        return Ok(None);
+    };
+    let values = value.as_array().ok_or_else(invalid_worker_rooms)?;
+    if values.is_empty() || values.len() > MAX_WORKER_ROOMS {
+        return Err(invalid_worker_rooms());
+    }
+    if let Some(count) = data.get("worker_count") {
+        if count.as_u64() != Some(values.len() as u64) {
+            return Err(invalid_worker_rooms());
+        }
+    }
+    let rooms: Vec<WorkerRoom> =
+        serde_json::from_value(value.clone()).map_err(|_| invalid_worker_rooms())?;
+    let mut links = HashSet::new();
+    if rooms.iter().any(|room| {
+        room.join_link.trim().is_empty()
+            || room.connector_url.trim().is_empty()
+            || !links.insert(room.join_link.as_str())
+    }) {
+        return Err(invalid_worker_rooms());
+    }
+    Ok(Some(rooms))
+}
+
 #[async_trait]
 impl Provider for JazzProvider {
     async fn bootstrap(&self, _data: &Value) -> Result<ProviderBootstrap> {
@@ -63,14 +159,23 @@ impl Provider for JazzProvider {
     }
 
     async fn connect_native(&self, data: &Value) -> Result<Option<Arc<dyn DatagramPath>>> {
+        let carrier = media_carrier(data)?;
         let data = parse_data(data)?;
         let session = match data.connector_url {
             Some(connector) => {
-                jazz_session::join_preconnected(&data.join_link, &data.name, &connector).await
+                jazz_session::join_preconnected_with_carrier(
+                    &data.join_link,
+                    &data.name,
+                    &connector,
+                    carrier,
+                )
+                .await
             }
-            None => jazz_session::join_call(&data.join_link, &data.name).await,
+            None => {
+                jazz_session::join_call_with_carrier(&data.join_link, &data.name, carrier).await
+            }
         }
-        .map_err(|error| Error::Provider(format!("Jazz session join failed: {error}")))?;
+        .map_err(|_| Error::Provider("Jazz session join failed".into()))?;
         Ok(Some(JazzPath::connect(session, true).await?))
     }
 }
@@ -81,16 +186,24 @@ pub struct JazzRoom {
 }
 
 pub async fn create_room() -> Result<JazzRoom> {
-    let session = jazz_session::create_call("ToTS server")
+    create_room_with_carrier(MediaCarrier::Audio).await
+}
+
+pub async fn create_room_with_carrier(carrier: MediaCarrier) -> Result<JazzRoom> {
+    let session = jazz_session::create_call_with_carrier("ToTS server", carrier)
         .await
-        .map_err(|error| Error::Provider(format!("Jazz room creation failed: {error}")))?;
+        .map_err(|_| Error::Provider("Jazz room creation failed".into()))?;
     server_room(session).await
 }
 
 pub async fn join_room(link: &str) -> Result<JazzRoom> {
-    let session = jazz_session::join_call(link, "ToTS server")
+    join_room_with_carrier(link, MediaCarrier::Audio).await
+}
+
+pub async fn join_room_with_carrier(link: &str, carrier: MediaCarrier) -> Result<JazzRoom> {
+    let session = jazz_session::join_call_with_carrier(link, "ToTS server", carrier)
         .await
-        .map_err(|error| Error::Provider(format!("Jazz server session join failed: {error}")))?;
+        .map_err(|_| Error::Provider("Jazz server session join failed".into()))?;
     server_room(session).await
 }
 
@@ -104,7 +217,7 @@ async fn server_room(session: CallSession) -> Result<JazzRoom> {
 pub async fn preconnect(link: &str) -> Result<String> {
     jazz_session::preconnect_call(link)
         .await
-        .map_err(|error| Error::Provider(format!("Jazz client provisioning failed: {error}")))
+        .map_err(|_| Error::Provider("Jazz client provisioning failed".into()))
 }
 
 struct JazzPath {
@@ -210,6 +323,15 @@ impl DatagramPath for JazzPath {
         self.keepalive.abort();
         let session = self.session.lock().await.take();
         if let Some(session) = session {
+            if let Ok(snapshot) =
+                tokio::time::timeout(Duration::from_millis(500), session.json()).await
+            {
+                tracing::info!(target: "tots::jazz-native",
+                    native_receive = %snapshot["webrtc"]["native_receive"],
+                    publisher_rtp = %snapshot["webrtc"]["publisher"]["rtp_diagnostics"],
+                    subscriber_rtp = %snapshot["webrtc"]["subscriber"]["rtp_diagnostics"],
+                    "Jazz native receive summary");
+            }
             session
                 .close()
                 .await
@@ -360,6 +482,96 @@ mod tests {
                 .unwrap();
         assert_eq!(data.name, "ToTS client");
         assert!(data.connector_url.is_none());
+    }
+
+    #[test]
+    fn worker_selection_uses_distinct_invites_and_preserves_client_settings() {
+        let data = json!({"join_link":"legacy", "connector_url":"old", "name":"custom", "media_carrier":"vp8-experimental", "worker_count":2,
+        "worker_rooms":[
+            {"join_link":"room-a", "connector_url":"connector-a"},
+            {"join_link":"room-b", "connector_url":"connector-b"}
+        ]});
+        assert_eq!(worker_room_count(&data).unwrap(), 2);
+        for index in 0..2 {
+            let selected = worker_room_data(&data, index).unwrap();
+            assert_eq!(
+                selected["join_link"],
+                data["worker_rooms"][index]["join_link"]
+            );
+            assert_eq!(
+                selected["connector_url"],
+                data["worker_rooms"][index]["connector_url"]
+            );
+            assert_eq!(selected["name"], "custom");
+            assert_eq!(selected["media_carrier"], "vp8-experimental");
+            assert!(selected.get("worker_rooms").is_none());
+            assert!(parse_data(&selected).is_ok());
+        }
+        assert!(worker_room_data(&data, 2).is_err());
+    }
+
+    #[test]
+    fn worker_selection_rejects_malformed_pools_without_echoing_secrets() {
+        for data in [
+            json!({"worker_rooms":null}),
+            json!({"worker_rooms":[]}),
+            json!({"worker_rooms":[{"join_link":"secret"}]}),
+            json!({"worker_rooms":[{"join_link":"secret", "connector_url":""}]}),
+            json!({"worker_count":2,"worker_rooms":[{"join_link":"secret", "connector_url":"connector"}]}),
+            json!({"worker_rooms":[{"join_link":"secret", "connector_url":"a"},{"join_link":"secret", "connector_url":"b"}]}),
+            json!({"worker_rooms":vec![json!({"join_link":"secret", "connector_url":"connector"});51]}),
+        ] {
+            let error = worker_room_count(&data).unwrap_err();
+            assert!(!error.to_string().contains("secret"));
+            assert!(worker_room_data(&data, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_invites_provide_exactly_one_worker_slot() {
+        let data = json!({"join_link":"legacy-secret"});
+        assert_eq!(worker_room_count(&data).unwrap(), 1);
+        assert_eq!(worker_room_data(&data, 0).unwrap(), data);
+        let error = worker_room_data(&data, 1).unwrap_err();
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn native_connection_rejects_an_unselected_or_malformed_worker_pool() {
+        for rooms in [
+            json!([]),
+            json!([{"join_link":"secret", "connector_url":""}]),
+            json!([{"join_link":"secret", "connector_url":"connector"}]),
+        ] {
+            let data = json!({"join_link":"legacy-secret", "worker_rooms":rooms});
+            let error = parse_data(&data).err().expect("unselected pool accepted");
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
+    #[test]
+    fn carrier_selection_is_explicit_and_audio_remains_the_default() {
+        assert_eq!(media_carrier(&json!({})).unwrap(), MediaCarrier::Audio);
+        for (value, expected) in [
+            ("audio", MediaCarrier::Audio),
+            ("audio-wallclock", MediaCarrier::AudioWallclock),
+            ("vp8-experimental", MediaCarrier::Vp8Experimental),
+        ] {
+            assert_eq!(
+                media_carrier(&json!({"media_carrier":value})).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn provider_data_rejects_unknown_media_carriers_without_echoing_input() {
+        for value in [json!("secret-unsupported"), json!(false), Value::Null] {
+            let error = parse_data(&json!({"join_link":"secret-invite","media_carrier":value}))
+                .err()
+                .expect("invalid media carrier accepted");
+            assert!(!error.to_string().contains("secret"));
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ const MAGIC: &[u8; 4] = b"TOTS";
 const VERSION: u8 = 1;
 const AAD_LEN: usize = 4 + 1 + 16 + 8 + 8;
 const HEADER_LEN: usize = AAD_LEN + 24;
+pub(crate) const SEALED_ENVELOPE_OVERHEAD: usize = HEADER_LEN + 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnvelopeMeta {
@@ -34,10 +35,14 @@ pub fn peek_meta(datagram: &[u8]) -> Result<EnvelopeMeta> {
     })
 }
 
-pub fn seal_datagram(
+pub fn seal_datagram(crypto: &PacketCrypto, meta: EnvelopeMeta, frame: &Frame) -> Result<Vec<u8>> {
+    seal_encoded_datagram(crypto, meta, &frame.encode())
+}
+
+pub(crate) fn seal_encoded_datagram(
     crypto: &PacketCrypto,
     meta: EnvelopeMeta,
-    frame: &Frame,
+    encoded_frame: &[u8],
 ) -> Result<Vec<u8>> {
     let mut aad = BytesMut::with_capacity(AAD_LEN);
     aad.extend_from_slice(MAGIC);
@@ -45,7 +50,7 @@ pub fn seal_datagram(
     aad.extend_from_slice(meta.device_id.as_bytes());
     aad.put_u64(meta.session_id);
     aad.put_u64(meta.sequence);
-    let (nonce, ciphertext) = crypto.seal(&aad, &frame.encode())?;
+    let (nonce, ciphertext) = crypto.seal(&aad, encoded_frame)?;
     let mut out = Vec::with_capacity(aad.len() + 24 + ciphertext.len());
     out.extend_from_slice(&aad);
     out.extend_from_slice(&nonce);

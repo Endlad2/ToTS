@@ -175,3 +175,11 @@ cargo run --locked --example live_check
 ICE gatherer, поскольку этот backend их не обрабатывает. Это также исключает
 нерабочие IPv6/link-local кандидаты на Windows без IPv6-маршрута. Сама исходная
 ICE-конфигурация всё равно сохраняется в `webrtc.ice_servers` снимка сессии.
+
+Корневой `Cargo.lock` ToTS сохраняет `webrtc-ice 0.17.2` при `webrtc 0.17.3`;
+самостоятельный lockfile SDK также использует ICE 0.17.2. В ICE 0.17.3 общий
+таймаут STUN-записи 100 мс может отменить ожидающий сетевого ответа TURN
+CreatePermission. В контролируемой проверке через физическую сеть, без активного
+TUN, замена только ICE на 0.17.2 восстановила оба PeerConnection Jazz. Сохраняйте
+lockfile и собирайте с `--locked`, пока upstream не исправит отмену настройки
+TURN permissions.

@@ -1,5 +1,7 @@
 # ToTS — Traffic over Turn Server
 
+**Development draft, 2026-11-12:** the 40 Mbit/s target is not achieved. Live speed measurements were made with a background VPN reportedly enabled and need an isolated repeat. Worker startup has both successful 30/50-worker runs and later incomplete-pool timeouts. See [current status](PROJECT_STATUS.md) and [the throughput investigation](docs/THROUGHPUT-RESULTS.md) before treating this snapshot as a release.
+
 ToTS carries encrypted L3 VPN packets through VK Calls TURN/UDP, the direct WebRTC-side ingress, or a live SaluteJazz RTP media session. The client runs an independent worker pool, keeps latency-sensitive small UDP pinned to one healthy worker, stripes bulk TCP/large UDP across workers in bounded flowlets, and can rebuild a failed worker on the preferred provider or a configured fallback. Windows IPv4 Internet egress through both providers has been verified against three IP services, with clean timed exits and full-tunnel route removal. The same Jazz config also passed a reconnect probe. See [test results](docs/TEST-RESULTS.md).
 
 ## Workspace
@@ -32,7 +34,11 @@ The request contains `provider` (the preferred provider), `provider_data`, a pas
 }
 ```
 
-`vk` accepts `vk_call_links` or `vk_token`; optional `ice_servers` supplements bootstrap. `jazz: {}` makes the server create/provision a room, while `jazz: {"join_link":"..."}` joins an existing room. The API inserts the Jazz invite and secret `connector_url` into the returned config even when Jazz is only a fallback. Old flat single-provider DB/config rows remain readable for migration.
+`vk` accepts `vk_call_links` or `vk_token`; optional `ice_servers` supplements bootstrap. Every worker fetches independent TURN credentials so shared credentials do not also share a provider rate budget. Fetches are serialized with a three-second gap; multiple call links rotate between fetches. Repeated flood-control failures impose a shared 30/60/120/240/300-second cooldown. The full pool can take several minutes to start; its bounded startup budget is `min(45 + 5*N, 300)` seconds. Every worker owns an independent encrypted session.
+
+For parallel Jazz workers, request `"jazz": {"worker_count": 30}` and run the returned URI with `--n 30`. The count is 1–50, default 1. The server provisions independent rooms and bridges, with four concurrent setup operations, and persists an ordered secret `worker_rooms` array. Each worker uses its own room so media is not broadcast to the other workers. The first room's invite and `connector_url` remain in the legacy fields. An optional `join_link` supplies room zero; further rooms are created independently. Existing one-room configs support one Jazz worker and must be provisioned again for a larger pool. This also applies when Jazz is configured as a fallback.
+
+Jazz also accepts the diagnostic `media_carrier` option: `audio` (default), `audio-wallclock` (same audio transport with timestamps derived from elapsed time), or `vp8-experimental` (opaque video RTP envelope). The API applies it to both server bridges and client worker rooms. The video variant adds VP8 framing metadata for forwarding tests; it is not a VP8 video encoder. Check the throughput report for physical-provider evidence before choosing an experimental carrier.
 
 If `TOTS_ADMIN_TOKEN` is configured, include its bearer authorization header. Store the returned `tots://` URI privately; it contains credentials. The database preserves the invite; server restart rejoins active rooms. Revoke, expiry and provider replacement close the old room bridge. Revoke a device with `DELETE /v1/configs/{device_id}`. The server bridges Jazz packets into its existing authenticated UDP/TUN dataplane.
 
@@ -52,12 +58,15 @@ Useful options:
 | --- | --- |
 | `--config URI` | Decode one server-issued `tots://` config. |
 | `--n N` | Run `N` independent transport workers (1..256). |
+| `--mtu N` | Override the IPv4 TUN MTU, including with `--config`; valid range 576..1400. |
 | `--relay-only` | Exclude the direct VPS/WebRTC-side UDP path; use provider relay/native transport. |
-| `--probe-only` | Wait for at least one encrypted worker without opening TUN or installing routes. |
+| `--probe-only` | Wait for every requested encrypted worker without opening TUN or installing routes. |
 | `--tun-default-route` | Install Windows IPv4 full-tunnel routing and TUN DNS. |
 | `--run-for-seconds N` | End the connected TUN run gracefully after a bounded interval. |
 
 For example, add `--run-for-seconds 75` for a bounded test. The route guard pins the VPS and provider endpoint IPv4 addresses to the physical gateway, then removes its owned routes and restores TUN DNS during normal exit, including Ctrl+C and the timer. Cleanup after force-killing the process is not guaranteed.
+
+The client waits for the complete requested pool before creating the full-tunnel routes. A Jazz-primary request exceeding the provisioned room count fails immediately.
 
 IPv6 routing is not managed. Automatic full-tunnel routing is currently Windows-only. On Android, an application can supply its `VpnService` fd with `--tun-fd`; iOS requires a NetworkExtension host.
 
@@ -69,13 +78,17 @@ Jazz uses actual WebSocket signalling and WebRTC RTP media through the restored 
 
 The Jazz session publishes audio with `muted:false` and explicitly subscribes to remote unmuted AUDIO tracks, deduplicating updates and unsubscribing when tracks are muted. Encrypted path probes retry every 500 ms with fresh sequence numbers within an overall three-second deadline, allowing for initial packet loss during SFU renegotiation.
 
-ToTS frames use XChaCha20-Poly1305 with an Argon2id-derived key, authenticated envelope metadata and replay protection. The transport engine now uses stable five-tuple associations, symmetric client/server flowlet scheduling, ACK ranges, RTT estimation, AIMD-style congestion control, pacing, loss detection, bounded reliable recovery, stale-unreliable suppression, and unreliable low-latency mode. Bulk traffic moves between workers at roughly 16 KiB boundaries. Small UDP (up to 300-byte IP packets) stays sticky unless its short-window load rises above about 75% of one estimated allocation, at which point it is temporarily treated as bulk. Worker selection uses an adaptive token/deficit weight of about 247 kB/s (~2 Mbit/s) per allocation; this is a balancing estimate rather than a hard rate cap. TCP/UDP inner traffic stays unreliable at the ToTS layer by default to avoid double retransmission/HOL; control protocols can use bounded recovery.
+ToTS frames use XChaCha20-Poly1305 with an Argon2id-derived key, authenticated envelope metadata and replay protection. Each worker has its own session and sequence space; workers reuse the device key without repeating Argon2. Data frames receive their sequence number immediately before encrypted transmission. The replay window remains 128 packets.
+
+TCP/UDP IP traffic uses best-effort datagram forwarding, relying on the inner transport's congestion control rather than adding a second ACK window, pacer or retransmission layer. Bounded queues and socket backpressure still apply. Reliable control traffic retains congestion control, burst pacing, loss detection and bounded recovery. Best-effort ACK diagnostics retain at most 512 payload-free samples per worker.
+
+Bulk traffic moves between workers at roughly 16 KiB flowlet boundaries. Small UDP (up to 300-byte IP packets) stays sticky unless its short-window load rises above about 75% of one estimated allocation, at which point it is temporarily treated as bulk. Worker selection uses an adaptive token/deficit weight of about 247 kB/s (~2 Mbit/s) per allocation; this is a balancing estimate rather than a hard rate cap.
 
 Every worker owns a distinct authenticated `session_id`, so workers from one device cannot overwrite each other on the server. If a path dies, the same SessionEngine/sequence space is retained while the worker re-probes direct/WebRTC-side and TURN candidates; after repeated preferred-provider failures it tries configured fallback providers. This gives authenticated 0-RTT-like path resumption without importing QUIC wire format. A five-second status line reports TUN MB, healthy/target worker counts, provider split and the approximate aggregate VK scheduling capacity. TURN/TCP and TURN/TLS are not implemented.
 
 ## Build and release delivery
 
-This source tree contains no private configuration or credentials. GitHub Actions builds the Linux server and Windows client release assets; local rebuilds use stable Rust. The inherited snapshot was tested with Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`. The multi-worker/recovery revision in this archive still needs CI verification as noted in `PROJECT_STATUS.md`.
+This source tree contains no private configuration or credentials. GitHub Actions builds the Linux server and Windows client release assets; local rebuilds use stable Rust. This revision was tested with Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`. Keep the workspace lockfile and use `--locked`: its ICE dependency pin fixes Jazz TURN permission setup on the tested network. See `PROJECT_STATUS.md` and `docs/THROUGHPUT-RESULTS.md` for measured validation and remaining limitations.
 
 ```bash
 cargo test --workspace --locked

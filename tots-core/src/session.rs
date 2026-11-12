@@ -2,7 +2,10 @@ use crate::{
     config::ConnectionConfig,
     crypto::PacketCrypto,
     fragment::fragment_ip,
-    protocol::{open_datagram, seal_datagram, AckRange, EnvelopeMeta, Frame, ReplayWindow, MAX_ACK_RANGES},
+    protocol::{
+        open_datagram, seal_encoded_datagram, AckRange, EnvelopeMeta, Frame, ReplayWindow,
+        MAX_ACK_RANGES, SEALED_ENVELOPE_OVERHEAD,
+    },
     reassembly::Reassembler,
     Result,
 };
@@ -45,13 +48,143 @@ pub enum DecodedPacket {
     },
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> ConnectionConfig {
+        ConnectionConfig {
+            version: 1,
+            peer: "127.0.0.1".into(),
+            webrtc_port: 1,
+            turn_port: 2,
+            password: "test-password".into(),
+            device_id: uuid::Uuid::new_v4(),
+            provider: crate::config::ProviderName::Vk,
+            provider_data: serde_json::json!({"vk_call_links":["test"]}),
+            mtu: 1200,
+        }
+    }
+
+    #[test]
+    fn legacy_ack_is_authenticated_fresh_and_preserves_range_history() {
+        let cfg = config();
+        let crypto = PacketCrypto::derive(&cfg.password, cfg.device_id).unwrap();
+        let engine = SessionEngine::with_session_and_crypto(cfg, 1, crypto.clone()).unwrap();
+        for (packet_id, sequence) in [(7, 1), (8, 2)] {
+            let wire = engine.make_legacy_ack(packet_id).unwrap();
+            let (meta, frame) = open_datagram(&crypto, &wire).unwrap();
+            assert_eq!(meta.sequence, sequence);
+            assert!(matches!(frame, Frame::Ack { packet_id: id, .. } if id == packet_id));
+            let mut corrupt = wire;
+            let end = corrupt.len() - 1;
+            corrupt[end] ^= 1;
+            assert!(open_datagram(&crypto, &corrupt).is_err());
+        }
+        let (meta, frame) = open_datagram(&crypto, &engine.make_ack(9).unwrap()).unwrap();
+        assert_eq!(meta.sequence, 3);
+        assert!(
+            matches!(frame, Frame::AckRanges { ranges } if ranges == vec![AckRange { start: 7, end: 9 }])
+        );
+    }
+
+    #[test]
+    fn shared_key_keeps_session_sequences_and_replay_independent() {
+        let cfg = config();
+        let crypto = PacketCrypto::derive(&cfg.password, cfg.device_id).unwrap();
+        let first = SessionEngine::with_session_and_crypto(cfg.clone(), 1, crypto.clone()).unwrap();
+        let second =
+            SessionEngine::with_session_and_crypto(cfg.clone(), 2, crypto.clone()).unwrap();
+        let receiver = SessionEngine::with_session_and_crypto(cfg, 1, crypto).unwrap();
+        let probe = first.make_probe(7, 9).unwrap();
+        assert!(matches!(
+            receiver.decapsulate(&probe),
+            Ok(Some(DecodedPacket::Probe { token: 7, .. }))
+        ));
+        assert_eq!(receiver.replay_rejections(), 0);
+        assert!(receiver.decapsulate(&probe).is_err());
+        assert_eq!(receiver.replay_rejections(), 1);
+        assert!(second.decapsulate(&probe).unwrap().is_none());
+        assert_eq!(
+            crate::protocol::peek_meta(&second.make_probe(8, 9).unwrap())
+                .unwrap()
+                .sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn prepared_fragments_survive_128_ack_sequences_before_each_send() {
+        let cfg = config();
+        let crypto = PacketCrypto::derive(&cfg.password, cfg.device_id).unwrap();
+        let sender =
+            SessionEngine::with_session_and_crypto(cfg.clone(), 1, crypto.clone()).unwrap();
+        let receiver = SessionEngine::with_session_and_crypto(cfg, 1, crypto).unwrap();
+        let packet = vec![7; 1400];
+        let (packet_id, frames) = sender.prepare_ip(3, &packet).unwrap();
+        assert_eq!(frames.len(), 2);
+        let mut delivered = None;
+        for (fragment, frame) in frames.iter().enumerate() {
+            // Both a congestion wait and each fragment's pacing wait may emit many ACKs.
+            for ack in 0..128 {
+                let ack = sender.make_ack((fragment * 128 + ack + 1) as u32).unwrap();
+                assert!(matches!(
+                    receiver.decapsulate(&ack),
+                    Ok(Some(DecodedPacket::AckRanges { .. }))
+                ));
+            }
+            let sealed = sender.seal_prepared(frame).unwrap();
+            assert_eq!(frame.wire_len(), sealed.len());
+            assert_eq!(
+                crate::protocol::peek_meta(&sealed).unwrap().sequence,
+                ((fragment + 1) * 129) as u64
+            );
+            if let Some(DecodedPacket::Ip {
+                packet_id: received_id,
+                bytes,
+                ..
+            }) = receiver.decapsulate(&sealed).unwrap()
+            {
+                assert_eq!(received_id, packet_id);
+                delivered = Some(bytes);
+            }
+            assert_eq!(receiver.replay_rejections(), fragment as u64);
+            assert!(matches!(
+                receiver.decapsulate(&sealed),
+                Err(crate::Error::Replay)
+            ));
+            assert_eq!(receiver.replay_rejections(), fragment as u64 + 1);
+        }
+        assert_eq!(delivered.unwrap(), packet);
+    }
+
+    #[test]
+    fn prepared_retransmit_preserves_packet_id_and_uses_fresh_sequence() {
+        let cfg = config();
+        let crypto = PacketCrypto::derive(&cfg.password, cfg.device_id).unwrap();
+        let sender =
+            SessionEngine::with_session_and_crypto(cfg.clone(), 1, crypto.clone()).unwrap();
+        let receiver = SessionEngine::with_session_and_crypto(cfg, 1, crypto).unwrap();
+        let frames = sender.prepare_ip_with_id(3, 42, &[9; 100]).unwrap();
+        for id in 1..=128 {
+            receiver.decapsulate(&sender.make_ack(id).unwrap()).unwrap();
+        }
+        let sealed = sender.seal_prepared(&frames[0]).unwrap();
+        assert_eq!(frames[0].wire_len(), sealed.len());
+        assert!(matches!(
+            receiver.decapsulate(&sealed),
+            Ok(Some(DecodedPacket::Ip { packet_id: 42, .. }))
+        ));
+    }
+}
+
 #[derive(Debug, Default)]
 struct AckTracker {
     received: BTreeSet<u32>,
 }
 
 impl AckTracker {
-    fn record(&mut self, packet_id: u32) -> Vec<AckRange> {
+    fn observe(&mut self, packet_id: u32) {
         self.received.insert(packet_id);
         // Keep a bounded tail. Packet IDs are monotonically increasing within a session.
         while self.received.len() > 512 {
@@ -60,6 +193,10 @@ impl AckTracker {
             };
             self.received.remove(&first);
         }
+    }
+
+    fn record(&mut self, packet_id: u32) -> Vec<AckRange> {
+        self.observe(packet_id);
         let mut ranges = Vec::new();
         let mut end = None;
         let mut start = 0u32;
@@ -102,39 +239,56 @@ pub struct SessionEngine {
     session_id: u64,
     next_sequence: AtomicU64,
     next_packet: AtomicU32,
+    replay_rejections: AtomicU64,
     replay: Mutex<ReplayWindow>,
     reassembly: Mutex<Reassembler>,
     delivered: Mutex<BTreeSet<u32>>,
     ack_tracker: Mutex<AckTracker>,
 }
 
+/// An encoded frame without an authenticated envelope or allocated sequence number.
+pub struct PreparedFrame {
+    encoded: Vec<u8>,
+}
+
+impl PreparedFrame {
+    pub fn wire_len(&self) -> usize {
+        SEALED_ENVELOPE_OVERHEAD + self.encoded.len()
+    }
+}
+
 impl SessionEngine {
     pub fn new(config: ConnectionConfig) -> Result<Self> {
         config.validate()?;
         let crypto = PacketCrypto::derive(&config.password, config.device_id)?;
+        Self::new_with_crypto(config, crypto)
+    }
+
+    /// Reuses a device key while keeping every worker's sequence and replay state separate.
+    pub fn new_with_crypto(config: ConnectionConfig, crypto: PacketCrypto) -> Result<Self> {
         let mut r = OsRng;
-        let session_id = r.next_u64();
-        Ok(Self {
-            config,
-            crypto,
-            session_id,
-            next_sequence: AtomicU64::new(1),
-            next_packet: AtomicU32::new(1),
-            replay: Mutex::new(ReplayWindow::default()),
-            reassembly: Mutex::new(Reassembler::default()),
-            delivered: Mutex::new(BTreeSet::new()),
-            ack_tracker: Mutex::new(AckTracker::default()),
-        })
+        Self::with_session_and_crypto(config, r.next_u64(), crypto)
     }
 
     pub fn with_session(config: ConnectionConfig, session_id: u64) -> Result<Self> {
         config.validate()?;
+        let crypto = PacketCrypto::derive(&config.password, config.device_id)?;
+        Self::with_session_and_crypto(config, session_id, crypto)
+    }
+
+    pub fn with_session_and_crypto(
+        config: ConnectionConfig,
+        session_id: u64,
+        crypto: PacketCrypto,
+    ) -> Result<Self> {
+        config.validate()?;
         Ok(Self {
-            crypto: PacketCrypto::derive(&config.password, config.device_id)?,
+            crypto,
             config,
             session_id,
             next_sequence: AtomicU64::new(1),
             next_packet: AtomicU32::new(1),
+            replay_rejections: AtomicU64::new(0),
             replay: Mutex::new(ReplayWindow::default()),
             reassembly: Mutex::new(Reassembler::default()),
             delivered: Mutex::new(BTreeSet::new()),
@@ -146,22 +300,58 @@ impl SessionEngine {
         self.session_id
     }
 
+    pub fn replay_rejections(&self) -> u64 {
+        self.replay_rejections.load(Ordering::Relaxed)
+    }
+
     fn wrap(&self, frame: &Frame) -> Result<Vec<u8>> {
+        self.seal_prepared(&PreparedFrame {
+            encoded: frame.encode(),
+        })
+    }
+
+    /// Allocate the envelope sequence only after congestion/pacing waits, immediately before send.
+    pub fn seal_prepared(&self, frame: &PreparedFrame) -> Result<Vec<u8>> {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        seal_datagram(
+        seal_encoded_datagram(
             &self.crypto,
             EnvelopeMeta {
                 device_id: self.config.device_id,
                 session_id: self.session_id,
                 sequence,
             },
-            frame,
+            &frame.encoded,
         )
     }
 
-    pub fn encapsulate_ip(&self, assoc_id: u16, packet: &[u8]) -> Result<(u32, Vec<Vec<u8>>)> {
+    pub fn prepare_ip(&self, assoc_id: u16, packet: &[u8]) -> Result<(u32, Vec<PreparedFrame>)> {
         let id = self.next_packet.fetch_add(1, Ordering::Relaxed);
-        Ok((id, self.encapsulate_ip_with_id(assoc_id, id, packet)?))
+        Ok((id, self.prepare_ip_with_id(assoc_id, id, packet)?))
+    }
+
+    pub fn prepare_ip_with_id(
+        &self,
+        assoc_id: u16,
+        packet_id: u32,
+        packet: &[u8],
+    ) -> Result<Vec<PreparedFrame>> {
+        Ok(fragment_ip(assoc_id, packet_id, packet, self.config.mtu)?
+            .into_iter()
+            .map(|frame| PreparedFrame {
+                encoded: frame.encode(),
+            })
+            .collect())
+    }
+
+    pub fn encapsulate_ip(&self, assoc_id: u16, packet: &[u8]) -> Result<(u32, Vec<Vec<u8>>)> {
+        let (id, frames) = self.prepare_ip(assoc_id, packet)?;
+        Ok((
+            id,
+            frames
+                .iter()
+                .map(|frame| self.seal_prepared(frame))
+                .collect::<Result<_>>()?,
+        ))
     }
 
     /// Re-encapsulates the same packet number with fresh envelope sequence numbers.
@@ -172,17 +362,25 @@ impl SessionEngine {
         packet_id: u32,
         packet: &[u8],
     ) -> Result<Vec<Vec<u8>>> {
-        let mut out = Vec::new();
-        for frame in fragment_ip(assoc_id, packet_id, packet, self.config.mtu)? {
-            out.push(self.wrap(&frame)?);
-        }
-        Ok(out)
+        self.prepare_ip_with_id(assoc_id, packet_id, packet)?
+            .iter()
+            .map(|frame| self.seal_prepared(frame))
+            .collect()
     }
 
     /// Emits compact ACK ranges. The old single ACK frame is still accepted on receive.
     pub fn make_ack(&self, packet_id: u32) -> Result<Vec<u8>> {
         let ranges = self.ack_tracker.lock().record(packet_id);
         self.wrap(&Frame::AckRanges { ranges })
+    }
+
+    /// Emits a v1 single ACK while retaining history for a later range-capable peer.
+    pub fn make_legacy_ack(&self, packet_id: u32) -> Result<Vec<u8>> {
+        self.ack_tracker.lock().observe(packet_id);
+        self.wrap(&Frame::Ack {
+            packet_id,
+            recv_micros: 0,
+        })
     }
 
     pub fn make_probe(&self, token: u64, sent_micros: u64) -> Result<Vec<u8>> {
@@ -205,6 +403,7 @@ impl SessionEngine {
             return Ok(None);
         }
         if !self.replay.lock().accept(meta.sequence) {
+            self.replay_rejections.fetch_add(1, Ordering::Relaxed);
             return Err(crate::Error::Replay);
         }
         match &frame {
@@ -236,14 +435,16 @@ impl SessionEngine {
                 } else {
                     Ok(None)
                 }
-            },
+            }
             Frame::Ack { packet_id, .. } => Ok(Some(DecodedPacket::Ack {
                 packet_id: *packet_id,
             })),
             Frame::AckRanges { ranges } => Ok(Some(DecodedPacket::AckRanges {
                 ranges: ranges.clone(),
             })),
-            Frame::Heartbeat { counter } => Ok(Some(DecodedPacket::Heartbeat { counter: *counter })),
+            Frame::Heartbeat { counter } => {
+                Ok(Some(DecodedPacket::Heartbeat { counter: *counter }))
+            }
             Frame::Probe { token, sent_micros } => Ok(Some(DecodedPacket::Probe {
                 token: *token,
                 sent_micros: *sent_micros,

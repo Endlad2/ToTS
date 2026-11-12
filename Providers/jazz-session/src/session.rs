@@ -1,4 +1,5 @@
 use crate::{
+    carrier::{MediaCarrier, VIDEO_HEIGHT, VIDEO_WIDTH},
     rtc::{DataPlane, Media},
     snapshot::sdp_parameters,
     Error, Result,
@@ -30,6 +31,7 @@ pub(crate) struct CallInfo {
     pub password: String,
     pub join_url: String,
     pub connector_url: Url,
+    pub carrier: MediaCarrier,
 }
 
 type MediaSlot = Arc<RwLock<Option<Arc<Media>>>>;
@@ -67,6 +69,8 @@ impl JazzDataPlane {
             .map_err(Into::into)
     }
 
+    /// Experimental video queues bounded datagrams for the next 60 fps media frame.
+    /// Success means accepted by the queue; a failed writer rejects later sends.
     pub async fn send(&self, payload: &[u8]) -> Result<()> {
         self.inner.send(payload).await.map_err(Into::into)
     }
@@ -108,6 +112,7 @@ impl CallSession {
         let media = self.media.read().await.clone();
         if let Some(media) = media {
             let data = media.snapshot().await;
+            result["webrtc"]["native_receive"] = data["native_receive"].clone();
             for key in ["publisher", "subscriber"] {
                 result["webrtc"][key] = data[key].clone();
                 for description in ["local_description", "remote_description"] {
@@ -224,7 +229,7 @@ pub(crate) async fn establish(call: CallInfo, timeout: Duration) -> Result<CallS
         turn_configured: false,
         rtc_joined: false,
         local_identity: String::new(),
-        audio_subscriptions: HashSet::new(),
+        track_subscriptions: HashSet::new(),
         pending: VecDeque::new(),
         servers: None,
         ping_interval: Duration::ZERO,
@@ -289,7 +294,7 @@ struct Worker {
     turn_configured: bool,
     rtc_joined: bool,
     local_identity: String,
-    audio_subscriptions: HashSet<String>,
+    track_subscriptions: HashSet<String>,
     pending: VecDeque<Value>,
     servers: Option<Value>,
     ping_interval: Duration,
@@ -422,7 +427,9 @@ impl Worker {
                         }
                     } else {
                         // The async WebRTC engine binds the initial ICE servers to its gatherer.
-                        let media = Arc::new(Media::new(servers, self.outgoing.clone()).await?);
+                        let media = Arc::new(
+                            Media::new(servers, self.outgoing.clone(), self.call.carrier).await?,
+                        );
                         *self.media.write().await = Some(media);
                         self.turn_configured = has_turn_credentials(servers);
                         self.servers = Some(servers.clone());
@@ -474,8 +481,8 @@ impl Worker {
             // The current web client publishes an explicitly unmuted track after rtc:join.
             if self.rtc_joined && !self.track_requested {
                 self.track_requested = true;
-                self.send_media(json!({"method":"rtc:track:add","addTrackRequest":{
-                    "cid":self.track_cid,"type":"AUDIO","source":"MICROPHONE","muted":false}}))
+                self.send_media(json!({"method":"rtc:track:add","addTrackRequest":
+                    self.call.carrier.track_request(&self.track_cid)}))
                     .await?;
             }
             while let Some(payload) = self.pending.pop_front() {
@@ -511,8 +518,9 @@ impl Worker {
                 };
                 for command in subscription_changes(
                     &self.local_identity,
-                    &mut self.audio_subscriptions,
+                    &mut self.track_subscriptions,
                     participants,
+                    self.call.carrier,
                 )? {
                     self.send_media(command).await?;
                 }
@@ -589,6 +597,7 @@ fn subscription_changes(
     local_identity: &str,
     subscribed: &mut HashSet<String>,
     participants: &Value,
+    carrier: MediaCarrier,
 ) -> Result<Vec<Value>> {
     let mut commands = Vec::new();
     let Some(participants) = participants.as_array() else {
@@ -605,17 +614,17 @@ fn subscription_changes(
             continue;
         };
         for track in tracks {
-            if track["type"] != "AUDIO" {
+            if track["type"] != carrier.track_type() {
                 continue;
             }
             let sid = track["sid"]
                 .as_str()
                 .filter(|sid| !sid.is_empty() && sid.len() <= 256)
-                .ok_or(Error::Protocol("некорректный remote audio track sid"))?;
+                .ok_or(Error::Protocol("некорректный remote media track sid"))?;
             let subscribe = track["muted"] != true && participant["state"] != "DISCONNECTED";
             let changed = if subscribe {
                 if !subscribed.contains(sid) && subscribed.len() >= 4096 {
-                    return Err(Error::Protocol("слишком много audio subscriptions"));
+                    return Err(Error::Protocol("слишком много media subscriptions"));
                 }
                 subscribed.insert(sid.to_owned())
             } else {
@@ -624,6 +633,10 @@ fn subscription_changes(
             if changed {
                 commands.push(json!({"method":"rtc:track:subscription:change",
                     "subscription":{"trackSids":[sid],"subscribe":subscribe}}));
+                if subscribe && carrier.is_video() {
+                    commands.push(json!({"method":"rtc:track:settings:update",
+                        "trackSetting":{"trackSids":[sid],"disabled":false,"width":VIDEO_WIDTH,"height":VIDEO_HEIGHT}}));
+                }
             }
         }
     }
