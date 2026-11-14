@@ -12,7 +12,7 @@ Keep exactly five workspace crates:
 4. `tots-ios`: C ABI/static library calling core logic for a NetworkExtension host.
 5. `tots-server`: SQLite, management API, Linux TUN, provider-room bridges and system integration.
 
-Provider adapters live in top-level `Providers/` and are included by `tots-core/src/providers/mod.rs`. `Providers/jazz-session` is the bundled MIT path dependency, excluded from workspace membership. Preserve its license and attribution when redistributing source or binaries. Workspace/Jazz Rust-version metadata is `1.89`; stable `1.99.1` was tested. Retain `webrtc-ice 0.17.2` in the workspace lock and build with `--locked`: 0.17.3 applies a 100 ms STUN write deadline to relay writes that may still be awaiting a TURN CreatePermission round trip. A physical-network A/B changing only ICE restored both Jazz PeerConnections; keep this lock until upstream makes TURN permission setup cancellation-safe.
+Provider adapters live in top-level `Providers/` and are included by `tots-core/src/providers/mod.rs`. `Providers/jazz-session` is the bundled MIT path dependency, excluded from workspace membership. Preserve its license and attribution when redistributing source or binaries. Workspace/Jazz Rust-version metadata is `1.89`; stable `1.99.1` was tested. Retain `webrtc-ice 0.17.2`: `Providers/jazz-session/Cargo.toml` pins it exactly so builds that must refresh the stale workspace lock still keep the known-good relay behavior. Version 0.17.3 applies a 100 ms STUN write deadline to relay writes that may still be awaiting a TURN CreatePermission round trip. A physical-network A/B changing only ICE restored both Jazz PeerConnections; keep this lock until upstream makes TURN permission setup cancellation-safe.
 
 ## Packet flow
 

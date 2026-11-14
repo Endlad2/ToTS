@@ -65,7 +65,6 @@ fn standalone_builder_mode() -> Result<PathBuf, Box<dyn Error>> {
             "--target",
             &target,
             "--release",
-            "--locked",
         ])
         .status()?;
     if !status.success() {

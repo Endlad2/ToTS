@@ -145,7 +145,7 @@ Every worker owns a distinct authenticated `session_id`, so workers from one dev
 
 ## Build and release delivery
 
-This source tree contains no private configuration or credentials. GitHub Actions builds the Linux server, Windows client and Android arm64-v8a client release assets; local rebuilds use stable Rust. This revision was tested with Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`. The workspace lockfile predates the added native WebSocket/cookie dependencies in this snapshot; run Cargo once without `--locked` to refresh it before enforcing a locked build. The existing Jazz ICE pin remains in the manifest tree. See `PROJECT_STATUS.md` and `docs/THROUGHPUT-RESULTS.md` for measured validation and remaining limitations.
+This source tree contains no private configuration or credentials. GitHub Actions builds the Linux server, Windows client and Android arm64-v8a client release assets; local rebuilds use stable Rust. This revision was tested with Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`. The workspace lockfile predates the added native WebSocket/cookie dependencies in this snapshot. Android's standalone builder therefore lets Cargo refresh the lock during the build. Jazz still pins `webrtc-ice = 0.17.2` explicitly, so refreshing the lock cannot silently move that relay-sensitive dependency to 0.17.3. See `PROJECT_STATUS.md` and `docs/THROUGHPUT-RESULTS.md` for measured validation and remaining limitations.
 
 ```bash
 cargo test --workspace

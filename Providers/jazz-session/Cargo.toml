@@ -19,6 +19,8 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 webrtc = "0.17"
+# Keep the known-good ICE relay behavior even when Cargo refreshes the workspace lock.
+webrtc-ice = "=0.17.2"
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
