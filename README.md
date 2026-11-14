@@ -112,14 +112,16 @@ libtots.so --config tots://... --n 20 --workers_percent {"vk":50,"jazz":50} --re
 
 `libtots.so` is deliberately **not** a Rust `cdylib`: it is the normal PIE executable produced from `tots-android`, renamed after linking so Android packaging can place it under `jniLibs/<abi>/libtots.so`. The package `build.rs` has two modes. Under Cargo it stamps the Android ELF soname; when compiled/run standalone by `scripts/build-android.sh`, the same `build.rs` invokes the real Android Cargo build and moves the finished executable to `dist/android/<abi>/libtots.so`.
 
-Build arm64-v8a locally with an Android NDK installed:
+Build any supported Android ABI locally with an Android NDK installed:
 
 ```bash
 export ANDROID_NDK_HOME=/path/to/android-ndk
 ./scripts/build-android.sh aarch64-linux-android
+./scripts/build-android.sh armv7-linux-androideabi
+./scripts/build-android.sh x86_64-linux-android
 ```
 
-The minimum/default Android API level is 24 and can be overridden with `ANDROID_API` to a newer level. API 23 is not supported because the WebRTC networking stack uses `getifaddrs`/`freeifaddrs`, which Android exposes from API 24. The build helper also understands `armv7-linux-androideabi`, `x86_64-linux-android`, and `i686-linux-android`. GitHub Release builds `arm64-v8a` and packages it at `jniLibs/arm64-v8a/libtots.so`.
+The minimum/default Android API level is 24 and can be overridden with `ANDROID_API` to a newer level. API 23 is not supported because the WebRTC networking stack uses `getifaddrs`/`freeifaddrs`, which Android exposes from API 24. The build helper also understands `i686-linux-android` for local legacy builds. GitHub CI/Release build the three APK ABIs `arm64-v8a`, `armeabi-v7a`, and `x86_64` in parallel and package them together under `jniLibs/<abi>/libtots.so`.
 
 For a probe without consuming a TUN fd:
 
@@ -145,7 +147,7 @@ Every worker owns a distinct authenticated `session_id`, so workers from one dev
 
 ## Build and release delivery
 
-This source tree contains no private configuration or credentials. GitHub Actions builds the Linux server, Windows client and Android arm64-v8a client release assets; local rebuilds use stable Rust. This revision was tested with Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`. The workspace lockfile predates the added native WebSocket/cookie dependencies in this snapshot. Android's standalone builder therefore lets Cargo refresh the lock during the build. Jazz still pins `webrtc-ice = 0.17.2` explicitly, so refreshing the lock cannot silently move that relay-sensitive dependency to 0.17.3. See `PROJECT_STATUS.md` and `docs/THROUGHPUT-RESULTS.md` for measured validation and remaining limitations.
+This source tree contains no private configuration or credentials. GitHub Actions builds the Linux server, Linux/macOS/Windows clients and Android arm64-v8a/armeabi-v7a/x86_64 client release assets; local rebuilds use stable Rust. This revision was tested with Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`. The workspace lockfile predates the added native WebSocket/cookie dependencies in this snapshot. Android's standalone builder therefore lets Cargo refresh the lock during the build. Jazz still pins `webrtc-ice = 0.17.2` explicitly, so refreshing the lock cannot silently move that relay-sensitive dependency to 0.17.3. See `PROJECT_STATUS.md` and `docs/THROUGHPUT-RESULTS.md` for measured validation and remaining limitations.
 
 ```bash
 cargo test --workspace
@@ -153,6 +155,6 @@ cargo test --manifest-path Providers/jazz-session/Cargo.toml --locked
 cargo build --workspace --release
 ```
 
-Distribute the built Windows executable with its matching official AMD64 `wintun.dll`, and include `LICENSE`, `NOTICE` and the Jazz MIT license. The Android release archive contains `jniLibs/arm64-v8a/libtots.so`; it is an executable PIE despite the `.so` filename. The Linux server package also needs the systemd unit and network setup script. Preserve `/var/lib/tots/tots.db` and `/etc/tots/server.env` when upgrading. Archive delivery does not require a pull request or published release.
+Distribute the built Windows executable with its matching official AMD64 `wintun.dll`, and include `LICENSE`, `NOTICE` and the Jazz MIT license. The Android release archive contains `jniLibs/arm64-v8a/libtots.so`, `jniLibs/armeabi-v7a/libtots.so`, and `jniLibs/x86_64/libtots.so`; each is an executable PIE despite the `.so` filename. The Linux server package also needs the systemd unit and network setup script. Preserve `/var/lib/tots/tots.db` and `/etc/tots/server.env` when upgrading. Archive delivery does not require a pull request or published release.
 
 [AGENT.MD](AGENT.MD) describes architecture and ownership; [PROJECT_STATUS.md](PROJECT_STATUS.md) separates implementation from verified behavior. ToTS is a reference implementation and has not received an independent security audit.

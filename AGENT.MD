@@ -99,7 +99,7 @@ The desktop and Android clients accept a server-issued URI with `--config tots:/
 | `tots-server/src/api.rs`, `db.rs`, `bridge.rs`, `dataplane.rs` | Config lifecycle, persistence, provider bridge and UDP/TUN routing |
 | `scripts/`, `systemd/` | Installation, Linux NAT and service integration |
 
-Keep public structs serde-compatible unless the config protocol version changes. Test wire formats, config/lifecycle changes and route ownership at their actual boundaries. Record current multi-worker provider evidence in `docs/THROUGHPUT-RESULTS.md`; `docs/TEST-RESULTS.md` preserves earlier single-worker evidence. A direct UDP probe or unit test does not prove provider VPN egress. Keep release packaging reproducible: GitHub Actions publishes the Linux server, Windows client and Android arm64-v8a client assets, while source archives keep instructions, reports and licenses. A PR is not required for local source delivery.
+Keep public structs serde-compatible unless the config protocol version changes. Test wire formats, config/lifecycle changes and route ownership at their actual boundaries. Record current multi-worker provider evidence in `docs/THROUGHPUT-RESULTS.md`; `docs/TEST-RESULTS.md` preserves earlier single-worker evidence. A direct UDP probe or unit test does not prove provider VPN egress. Keep release packaging reproducible: GitHub Actions publishes the Linux server, desktop clients and Android arm64-v8a/armeabi-v7a/x86_64 client assets, while source archives keep instructions, reports and licenses. A PR is not required for local source delivery.
 
 
 ## Native document/room providers

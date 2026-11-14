@@ -176,36 +176,86 @@ jobs:
 
 
   android-client:
+    name: Android client (${{ matrix.abi }})
     runs-on: ubuntu-latest
     env:
       ANDROID_API: "24"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+            machine: AArch64
+          - target: armv7-linux-androideabi
+            abi: armeabi-v7a
+            machine: ARM
+          - target: x86_64-linux-android
+            abi: x86_64
+            machine: Advanced Micro Devices X86-64
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Android arm64 executable
+      - name: Build Android ${{ matrix.abi }} executable
         shell: bash
         run: |
           set -euo pipefail
-          bash ./scripts/build-android.sh aarch64-linux-android
-          test -x dist/android/arm64-v8a/libtots.so
-          file dist/android/arm64-v8a/libtots.so
-          readelf -h dist/android/arm64-v8a/libtots.so | grep -q 'Machine:.*AArch64'
+          bash ./scripts/build-android.sh "${{ matrix.target }}"
+          test -x "dist/android/${{ matrix.abi }}/libtots.so"
+          file "dist/android/${{ matrix.abi }}/libtots.so"
+          readelf -h "dist/android/${{ matrix.abi }}/libtots.so" | grep -q "Machine:.*${{ matrix.machine }}"
+          cp "dist/android/${{ matrix.abi }}/libtots.so" "libtots-${{ matrix.abi }}.so"
 
-      - name: Package Android client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-lib-${{ matrix.abi }}
+          path: libtots-${{ matrix.abi }}.so
+          if-no-files-found: error
+
+  android-package:
+    needs: android-client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-lib-arm64-v8a
+          path: android-libs/arm64-v8a
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-lib-armeabi-v7a
+          path: android-libs/armeabi-v7a
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-lib-x86_64
+          path: android-libs/x86_64
+
+      - name: Package Android clients
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist-android/jniLibs/arm64-v8a
-          cp dist/android/arm64-v8a/libtots.so dist-android/jniLibs/arm64-v8a/libtots.so
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            test -f "android-libs/$ABI/libtots-$ABI.so"
+            mkdir -p "dist-android/jniLibs/$ABI"
+            cp "android-libs/$ABI/libtots-$ABI.so" "dist-android/jniLibs/$ABI/libtots.so"
+          done
           cp LICENSE NOTICE dist-android/
           cp Providers/jazz-session/LICENSE dist-android/JAZZ-SESSION-LICENSE
           cat > dist-android/README-ANDROID.txt <<'EOF'
           ToTS Android client
           ===================
 
-          jniLibs/arm64-v8a/libtots.so is a PIE executable renamed for APK native-library packaging.
+          This archive contains APK-ready executable payloads for:
+            jniLibs/arm64-v8a/libtots.so
+            jniLibs/armeabi-v7a/libtots.so
+            jniLibs/x86_64/libtots.so
+
+          Each libtots.so is a PIE executable renamed for APK native-library packaging.
           It is not a JNI cdylib.
 
           The Android VpnService host must:
@@ -218,16 +268,16 @@ jobs:
           Example argv:
             libtots.so --config tots://... --n 20 --relay-only --tun-fd 42
           EOF
-          (cd dist-android && zip -r ../tots-android-arm64-v8a.zip .)
+          (cd dist-android && zip -r ../tots-android-multiabi.zip .)
 
       - uses: actions/upload-artifact@v4
         with:
           name: android-client
-          path: tots-android-arm64-v8a.zip
+          path: tots-android-multiabi.zip
           if-no-files-found: error
 
   publish:
-    needs: [linux-server, linux-client, macos-client, windows-client, android-client]
+    needs: [linux-server, linux-client, macos-client, windows-client, android-package]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -280,4 +330,4 @@ jobs:
             release-assets/tots-client-x86_64-unknown-linux-gnu.tar.gz
             release-assets/tots-client-*-apple-darwin.tar.gz
             release-assets/tots-client-x86_64-pc-windows-msvc.zip
-            release-assets/tots-android-arm64-v8a.zip
+            release-assets/tots-android-multiabi.zip

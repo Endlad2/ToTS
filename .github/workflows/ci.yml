@@ -54,17 +54,31 @@ jobs:
       - run: cargo build -p tots-client --release
 
   android-client:
+    name: Android client (${{ matrix.abi }})
     runs-on: ubuntu-latest
     env:
       ANDROID_API: "24"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+            machine: AArch64
+          - target: armv7-linux-androideabi
+            abi: armeabi-v7a
+            machine: ARM
+          - target: x86_64-linux-android
+            abi: x86_64
+            machine: Advanced Micro Devices X86-64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build Android arm64 executable and APK-safe libtots.so
+      - name: Build Android ${{ matrix.abi }} executable and APK-safe libtots.so
         shell: bash
         run: |
           set -euo pipefail
-          bash ./scripts/build-android.sh aarch64-linux-android
-          test -x dist/android/arm64-v8a/libtots.so
-          file dist/android/arm64-v8a/libtots.so
-          readelf -h dist/android/arm64-v8a/libtots.so | grep -q 'Machine:.*AArch64'
+          bash ./scripts/build-android.sh "${{ matrix.target }}"
+          test -x "dist/android/${{ matrix.abi }}/libtots.so"
+          file "dist/android/${{ matrix.abi }}/libtots.so"
+          readelf -h "dist/android/${{ matrix.abi }}/libtots.so" | grep -q "Machine:.*${{ matrix.machine }}"
