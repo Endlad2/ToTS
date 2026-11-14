@@ -18,13 +18,40 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --workspace --release
 
+  linux-client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Linux client
+        run: cargo build -p tots-client --release
+      - name: Verify Linux client
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/tots-client
+          file target/release/tots-client
+
+  macos-client:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build macOS client
+        run: cargo build -p tots-client --release
+      - name: Verify macOS client
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/tots-client
+          file target/release/tots-client
+
   windows-client:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build -p tots-client --release
-
 
   android-client:
     runs-on: ubuntu-latest
