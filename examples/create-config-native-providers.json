@@ -1,0 +1,23 @@
+{
+  "provider": "vk",
+  "provider_data": {
+    "vk": {
+      "vk_call_links": ["https://vk.ru/call/join/REPLACE_ME"]
+    },
+    "jazz": {
+      "worker_count": 20
+    },
+    "ya-docs": {
+      "urls": ["https://docs.yandex.ru/docs/view?REPLACE_ME"]
+    },
+    "mail-docs": {
+      "urls": ["AbCdEfGh1/IjKlMnOp2"]
+    },
+    "cups": {
+      "worker_count": 20
+    }
+  },
+  "password": "replace-with-a-private-password",
+  "device_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "valid_days": 30
+}

@@ -61,7 +61,14 @@ impl Db {
             let now = Utc::now();
             let expires = now + Duration::days(days.clamp(1, 3650));
             let c = Self::conn(&p)?;
-            let provider_s = provider.as_str();
+            let provider_s = match provider {
+                ProviderName::Vk => "vk",
+                ProviderName::Jazz => "jazz",
+                ProviderName::YaDocs => "ya-docs",
+                ProviderName::MailDocs => "mail-docs",
+                ProviderName::Cups => "cups",
+                ProviderName::Unknown => "unknown",
+            };
             c.execute(
                 "INSERT INTO configs(device_id,password,provider,provider_data,created_at,expires_at,revoked) VALUES(?1,?2,?3,?4,?5,?6,0) ON CONFLICT(device_id) DO UPDATE SET password=excluded.password,provider=excluded.provider,provider_data=excluded.provider_data,expires_at=excluded.expires_at,revoked=0",
                 params![
@@ -106,7 +113,14 @@ impl Db {
             let Some((password, provider_s, pd, exp, revoked)) = row else {
                 return Ok(None);
             };
-            let provider = ProviderName::parse(&provider_s).unwrap_or(ProviderName::Unknown);
+            let provider = match provider_s.as_str() {
+                "vk" => ProviderName::Vk,
+                "jazz" => ProviderName::Jazz,
+                "ya-docs" => ProviderName::YaDocs,
+                "mail-docs" => ProviderName::MailDocs,
+                "cups" => ProviderName::Cups,
+                _ => ProviderName::Unknown,
+            };
             let provider_data = serde_json::from_str(&pd)?;
             let expires_at = DateTime::parse_from_rfc3339(&exp)?.with_timezone(&Utc);
             Ok(Some(Device {
@@ -132,7 +146,7 @@ impl Db {
         .await?
     }
 
-    pub async fn active_jazz(&self) -> Result<Vec<Device>> {
+    pub async fn active_devices(&self) -> Result<Vec<Device>> {
         let p = self.path.clone();
         let ids = task::spawn_blocking(move || -> Result<Vec<String>> {
             let conn = Self::conn(&p)?;
@@ -146,16 +160,26 @@ impl Db {
         let mut devices = Vec::new();
         for id in ids {
             if let Some(device) = self.get(Uuid::parse_str(&id)?).await? {
-                let keyed = ProviderName::ALL
-                    .iter()
-                    .any(|provider| device.provider_data.get(provider.as_str()).is_some());
-                let has_jazz = device.provider_data.get("jazz").is_some()
-                    || (device.provider == ProviderName::Jazz && !keyed);
-                if has_jazz && device.expires_at >= Utc::now() {
+                if device.expires_at >= Utc::now() {
                     devices.push(device);
                 }
             }
         }
         Ok(devices)
     }
+    pub async fn active_jazz(&self) -> Result<Vec<Device>> {
+        Ok(self
+            .active_devices()
+            .await?
+            .into_iter()
+            .filter(|device| {
+                device.provider_data.get("jazz").is_some()
+                    || (device.provider == ProviderName::Jazz
+                        && !ProviderName::ALL
+                            .iter()
+                            .any(|provider| device.provider_data.get(provider.as_str()).is_some()))
+            })
+            .collect())
+    }
+
 }

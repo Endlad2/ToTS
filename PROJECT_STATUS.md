@@ -1,10 +1,15 @@
+## Native provider expansion (2026-11-14)
+
+Implemented native `ya-docs`, `mail-docs`, and `cups` provider modules directly in `Providers/`, integrated with `ProviderName`, `--workers_percent`, worker fallback/recovery, server bridge provisioning, DB restoration, and five-second provider counts. `cups` provisions independent worker rooms. `ya-docs` includes in-process Yandex proof-of-work handling. No OpenFlux binary, subprocess, SOCKS sidecar, or OpenFlux runtime dependency is present.
+
+This environment does not contain a Rust toolchain and outbound package installation is unavailable, so the new Rust code could not be validated with `cargo clippy/test/build` locally. Static structure/config/script/archive checks are performed before delivery; GitHub CI remains the compile/type-check gate. The Mail.ru edge requires a permessage-deflate WebSocket offer according to the reference implementation; the current carrier sends that offer, but `tokio-tungstenite 0.28` does not itself implement RFC7692 decompression, so live Mail.ru verification is still required and compressed inbound frames may require a follow-up WebSocket backend change.
+
 # Project status
 
 ## Implemented in this source snapshot
 
-- Multi-provider `provider_data` (`vk`, `jazz`, `yandex`, `vyandex`, `boards`, `cupsonline`, `mailru`) with a preferred `provider` and fallback order.
+- Multi-provider `provider_data` (`vk` / `jazz`) with a preferred `provider` and fallback order.
 - Client `--n` worker pool, optional `--workers_percent` preferred-provider apportionment, per-worker session IDs, health logs and five-second TUN traffic/worker telemetry (including preferred and actual provider splits).
-- OpenFlux carrier adapter for Yandex.Docs, Yandex Volga, Yandex Board, Cups.online and Mail.ru Docs. It uses a separate GPLv3 OpenFlux process over SOCKS5 UDP ASSOCIATE; no OpenFlux source is copied into the Apache workspace.
 - Worker recovery: preferred-provider retries, fallback-provider cycling, path re-probing on liveness/sustained-RTT degradation and authenticated session/path resumption.
 - Server multi-session routing per device so workers do not overwrite one another.
 - ACK ranges and RTT diagnostics; congestion control, pacing and bounded retransmission for reliable control. Best-effort TCP/UDP forwarding has no duplicate outer ACK window or pacer.
@@ -24,5 +29,3 @@ The Sasha baseline recorded a workspace run on 2026-11-12 that passed 109 tests 
 Both VK and Jazz have connected 50 independent encrypted workers in earlier bounded Windows runs and returned the Linux server's public IPv4 address. Later starts also timed out with incomplete pools, so repeatable startup is still unresolved. The operator subsequently reported a continuously enabled background VPN, and running WireSock services were observed. Speed measurements are provisional until that additional path is disabled or a ToTS bypass is independently verified. The prior 40 Mbit/s acceptance target was not achieved in the recorded baseline. This revision specifically removes serial startup tails and per-packet ACK/TUN awaits, but no fixed “+10 Mbit/s” improvement is claimed without a clean live benchmark because VK relay capacity, RTT and loss dominate the result.
 
 IPv6 routing is not managed. Reconnected provider endpoints can require a client restart because bypass routes are installed from the initial pool. Permanently exited native bridges are not automatically replaced. Bounded tests do not establish long-duration stability.
-
-The new OpenFlux carrier adapter was added after the recorded Sasha baseline and is not live-tested in this packaging environment. It requires a separately installed OpenFlux binary and a matching OpenFlux exit. Full-tunnel route bypass resolves configured/known carrier hosts before installing the TUN route; dynamic service balancer changes may require explicit `route_hosts` or a platform-specific sidecar bypass.

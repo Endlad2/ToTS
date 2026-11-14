@@ -6,39 +6,31 @@ use std::net::IpAddr;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
 pub enum ProviderName {
+    #[serde(rename = "vk")]
     Vk,
+    #[serde(rename = "jazz")]
     Jazz,
-    Yandex,
-    Vyandex,
-    Boards,
-    Cupsonline,
-    Mailru,
+    #[serde(rename = "ya-docs")]
+    YaDocs,
+    #[serde(rename = "mail-docs")]
+    MailDocs,
+    #[serde(rename = "cups")]
+    Cups,
     #[serde(other)]
     Unknown,
 }
 
 impl ProviderName {
-    pub const ALL: [Self; 7] = [
-        Self::Vk,
-        Self::Jazz,
-        Self::Yandex,
-        Self::Vyandex,
-        Self::Boards,
-        Self::Cupsonline,
-        Self::Mailru,
-    ];
+    pub const ALL: [Self; 5] = [Self::Vk, Self::Jazz, Self::YaDocs, Self::MailDocs, Self::Cups];
 
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "vk" => Ok(Self::Vk),
             "jazz" => Ok(Self::Jazz),
-            "yandex" => Ok(Self::Yandex),
-            "vyandex" => Ok(Self::Vyandex),
-            "boards" => Ok(Self::Boards),
-            "cupsonline" => Ok(Self::Cupsonline),
-            "mailru" => Ok(Self::Mailru),
+            "ya-docs" | "yadocs" | "yandex-docs" => Ok(Self::YaDocs),
+            "mail-docs" | "maildocs" | "mailru" => Ok(Self::MailDocs),
+            "cups" | "cupsonline" | "cups-online" => Ok(Self::Cups),
             other => Err(Error::Config(format!("unsupported provider {other:?}"))),
         }
     }
@@ -47,20 +39,11 @@ impl ProviderName {
         match self {
             Self::Vk => "vk",
             Self::Jazz => "jazz",
-            Self::Yandex => "yandex",
-            Self::Vyandex => "vyandex",
-            Self::Boards => "boards",
-            Self::Cupsonline => "cupsonline",
-            Self::Mailru => "mailru",
+            Self::YaDocs => "ya-docs",
+            Self::MailDocs => "mail-docs",
+            Self::Cups => "cups",
             Self::Unknown => "unknown",
         }
-    }
-
-    pub const fn is_openflux_carrier(self) -> bool {
-        matches!(
-            self,
-            Self::Yandex | Self::Vyandex | Self::Boards | Self::Cupsonline | Self::Mailru
-        )
     }
 }
 
@@ -74,7 +57,7 @@ pub struct ConnectionConfig {
     pub device_id: Uuid,
     /// Preferred provider. Additional providers can be present in `provider_data`.
     pub provider: ProviderName,
-    /// Multi-provider layout: {"vk": {...}, "jazz": {...}, "yandex": {...}, ...}.
+    /// Multi-provider layout keyed by provider: vk/jazz/ya-docs/mail-docs/cups.
     /// Legacy single-provider objects are still accepted for old server DB rows/config URIs.
     #[serde(default)]
     pub provider_data: Value,
@@ -231,46 +214,53 @@ fn validate_provider(provider: ProviderName, data: &Value) -> Result<()> {
                 ));
             }
         }
-        ProviderName::Yandex
-        | ProviderName::Vyandex
-        | ProviderName::Boards
-        | ProviderName::Cupsonline
-        | ProviderName::Mailru => {
-            let url = data.get("url").and_then(Value::as_str).unwrap_or("").trim();
-            if url.is_empty() {
-                return Err(Error::Config(format!(
-                    "provider_data.{} requires url",
-                    provider.as_str()
-                )));
-            }
-            if data.get("socks5_addr").is_some_and(|value| !value.is_string())
-                || data.get("target").is_some_and(|value| !value.is_string())
-                || data.get("auto_launch").is_some_and(|value| !value.is_boolean())
-                || data
-                    .get("openflux_binary")
-                    .is_some_and(|value| !value.is_string())
-                || data
-                    .get("yandex_cookies_file")
-                    .is_some_and(|value| !value.is_string())
-                || data.get("cookie_store").is_some_and(|value| !value.is_string())
-                || data.get("route_hosts").is_some_and(|value| {
-                    value
-                        .as_array()
-                        .is_none_or(|items| items.iter().any(|item| !item.is_string()))
-                })
-            {
-                return Err(Error::Config(format!(
-                    "provider_data.{} has invalid OpenFlux runtime fields",
-                    provider.as_str()
-                )));
-            }
-            if provider != ProviderName::Vyandex && data.get("yandex_cookies_file").is_some() {
+        ProviderName::YaDocs => validate_url_provider("ya-docs", data)?,
+        ProviderName::MailDocs => validate_url_provider("mail-docs", data)?,
+        ProviderName::Cups => {
+            let room = data.get("room_id").and_then(Value::as_str).unwrap_or("").trim();
+            let rooms = data.get("worker_rooms").and_then(Value::as_array);
+            if room.is_empty() && rooms.is_none_or(|rooms| rooms.is_empty()) {
                 return Err(Error::Config(
-                    "yandex_cookies_file is only valid for vyandex".into(),
+                    "provider_data.cups requires server-issued room_id/worker_rooms".into(),
                 ));
             }
         }
         ProviderName::Unknown => return Err(Error::Config("unknown provider".into())),
+    }
+    Ok(())
+}
+
+
+fn validate_url_provider(name: &str, data: &Value) -> Result<()> {
+    let one = data
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let many = data
+        .get("urls")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            !values.is_empty()
+                && values.iter().all(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+        });
+    if !one && !many {
+        return Err(Error::Config(format!(
+            "provider_data.{name} requires url or non-empty urls"
+        )));
+    }
+    if let Some(cookies) = data.get("cookies") {
+        let Some(cookies) = cookies.as_object() else {
+            return Err(Error::Config(format!("provider_data.{name}.cookies must be an object")));
+        };
+        if cookies.values().any(|value| !value.is_string()) {
+            return Err(Error::Config(format!(
+                "provider_data.{name}.cookies values must be strings"
+            )));
+        }
     }
     Ok(())
 }
@@ -306,18 +296,6 @@ mod tests {
             d.provider_order(),
             vec![ProviderName::Vk, ProviderName::Jazz]
         );
-    }
-
-    #[test]
-    fn openflux_carriers_are_keyed_providers() {
-        let mut c = base(serde_json::json!({
-            "vk":{"vk_call_links":["abc"]},
-            "mailru":{"url":"AbCdEfGh1/IjKlMnOp2"}
-        }));
-        c.provider = ProviderName::Mailru;
-        c.validate().unwrap();
-        assert_eq!(c.provider_order()[0], ProviderName::Mailru);
-        assert!(c.has_provider(ProviderName::Vk));
     }
 
     #[test]

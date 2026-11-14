@@ -23,7 +23,7 @@ pub struct ApiState {
 pub struct CreateRequest {
     /// Preferred provider. provider_data can contain additional fallbacks.
     pub provider: String,
-    /// Multi-provider layout: {"vk": {...}, "jazz": {...}, "yandex": {...}, ...}.
+    /// Multi-provider layout: {"vk": {...}, "jazz": {...}, "ya-docs": {...}, "mail-docs": {...}, "cups": {...}}.
     pub provider_data: Value,
     pub password: String,
     pub device_id: Uuid,
@@ -78,7 +78,7 @@ async fn create(
     let mut provider_data = normalize_provider_data(provider, req.provider_data).map_err(bad)?;
 
     // A separate publisher per worker avoids room-wide quadratic media fanout.
-    let bridges = if let Some(jazz) = provider_data.get_mut("jazz") {
+    let mut bridges = if let Some(jazz) = provider_data.get_mut("jazz") {
         let carrier = tots_core::providers::jazz::media_carrier(jazz).map_err(bad)?;
         let links = requested_room_links(jazz).map_err(bad)?;
         let target = s.args.turn_listen;
@@ -125,6 +125,14 @@ async fn create(
     } else {
         Vec::new()
     };
+
+    match provision_extra_native(&mut provider_data, s.args.turn_listen).await {
+        Ok(mut extra) => bridges.append(&mut extra),
+        Err(error) => {
+            close_rooms(bridges).await;
+            return Err(internal(error));
+        }
+    }
 
     let cfg = ConnectionConfig {
         version: 1,
@@ -211,7 +219,7 @@ where
                 failure.get_or_insert(error);
             }
             Err(_) => {
-                failure.get_or_insert_with(|| anyhow::anyhow!("Jazz room setup task failed"));
+                failure.get_or_insert_with(|| anyhow::anyhow!("native path setup task failed"));
             }
         }
     }
@@ -244,23 +252,180 @@ where
                             tracing::info!(
                                 worker = index,
                                 attempt,
-                                "Jazz room setup retry succeeded"
+                                "native path setup retry succeeded"
                             );
                         }
                         return Ok(room);
                     }
                     Err(_) => {
-                        tracing::warn!(worker = index, attempt, "Jazz room setup attempt failed")
+                        tracing::warn!(worker = index, attempt, "native path setup attempt failed")
                     }
                 }
                 if attempt < 3 {
                     tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
                 }
             }
-            anyhow::bail!("Jazz room setup attempts exhausted")
+            anyhow::bail!("native path setup attempts exhausted")
         }
     })
     .await
+}
+
+
+async fn provision_extra_native(
+    provider_data: &mut Value,
+    target: std::net::SocketAddr,
+) -> anyhow::Result<Vec<NativeBridge>> {
+    let mut bridges = Vec::new();
+    for provider in [ProviderName::YaDocs, ProviderName::MailDocs] {
+        let Some(data) = provider_data.get(provider.as_str()).cloned() else {
+            continue;
+        };
+        match start_url_provider_bridges(provider, &data, target).await {
+            Ok(mut created) => bridges.append(&mut created),
+            Err(error) => {
+                close_rooms(bridges).await;
+                return Err(error);
+            }
+        }
+    }
+
+    if let Some(cups) = provider_data.get_mut("cups") {
+        let requested = requested_cups_rooms(cups).map_err(anyhow::Error::msg)?;
+        let provisioned = build_room_pool(requested.len(), move |index| {
+            let room_id = requested[index].clone();
+            async move {
+                let room = match room_id {
+                    Some(room_id) => tots_core::providers::cups::join_room(&room_id).await?,
+                    None => tots_core::providers::cups::create_room().await?,
+                };
+                let bridge = match NativeBridge::start(room.path.clone(), target).await {
+                    Ok(bridge) => bridge,
+                    Err(error) => {
+                        let _ = room.path.close().await;
+                        return Err(error);
+                    }
+                };
+                Ok((serde_json::json!({"room_id":room.room_id}), bridge))
+            }
+        })
+        .await;
+        let (rooms, mut created) = match provisioned {
+            Ok(value) => value,
+            Err(error) => {
+                close_rooms(bridges).await;
+                return Err(error);
+            }
+        };
+        let object = cups
+            .as_object_mut()
+            .expect("Cups data validated before provisioning");
+        object.insert("room_id".into(), rooms[0]["room_id"].clone());
+        object.insert("worker_count".into(), Value::from(rooms.len()));
+        object.insert("worker_rooms".into(), Value::Array(rooms));
+        bridges.append(&mut created);
+    }
+    Ok(bridges)
+}
+
+async fn start_url_provider_bridges(
+    provider: ProviderName,
+    data: &Value,
+    target: std::net::SocketAddr,
+) -> anyhow::Result<Vec<NativeBridge>> {
+    let count = match provider {
+        ProviderName::YaDocs => tots_core::providers::ya_docs::configured_urls(data)?.len(),
+        ProviderName::MailDocs => tots_core::providers::mail_docs::configured_urls(data)?.len(),
+        _ => anyhow::bail!("{} is not a URL-native provider", provider.as_str()),
+    };
+    let data = data.clone();
+    let (_, bridges) = build_room_pool(count, move |index| {
+        let data = data.clone();
+        async move {
+            let selected = match provider {
+                ProviderName::YaDocs => tots_core::providers::ya_docs::worker_data(&data, index)?,
+                ProviderName::MailDocs => tots_core::providers::mail_docs::worker_data(&data, index)?,
+                _ => unreachable!(),
+            };
+            let implementation = tots_core::providers::make_provider(&provider)?;
+            let path = implementation
+                .connect_native(&selected)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("{} did not create a native path", provider.as_str()))?;
+            let bridge = match NativeBridge::start(path.clone(), target).await {
+                Ok(bridge) => bridge,
+                Err(error) => {
+                    let _ = path.close().await;
+                    return Err(error);
+                }
+            };
+            Ok((Value::Null, bridge))
+        }
+    })
+    .await?;
+    Ok(bridges)
+}
+
+fn requested_cups_rooms(cups: &Value) -> Result<Vec<Option<String>>, String> {
+    let object = cups
+        .as_object()
+        .ok_or("provider_data.cups must be an object")?;
+    if let Some(rooms) = object.get("worker_rooms") {
+        let rooms = rooms
+            .as_array()
+            .ok_or("provider_data.cups.worker_rooms must be an array")?;
+        if rooms.is_empty() || rooms.len() > tots_core::providers::cups::MAX_WORKER_ROOMS {
+            return Err("provider_data.cups.worker_rooms must contain 1..=50 rooms".into());
+        }
+        if let Some(count) = object.get("worker_count") {
+            if count.as_u64() != Some(rooms.len() as u64) {
+                return Err("provider_data.cups.worker_count does not match worker_rooms".into());
+            }
+        }
+        return rooms
+            .iter()
+            .map(|room| {
+                room.get("room_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Some(value.to_owned()))
+                    .ok_or_else(|| "provider_data.cups.worker_rooms entry needs room_id".to_owned())
+            })
+            .collect();
+    }
+    let count = match object.get("worker_count") {
+        Some(value) => value
+            .as_u64()
+            .filter(|count| {
+                (1..=tots_core::providers::cups::MAX_WORKER_ROOMS as u64).contains(count)
+            })
+            .ok_or("provider_data.cups.worker_count must be 1..=50")? as usize,
+        None => 1,
+    };
+    let room_id = match object.get("room_id") {
+        Some(Value::String(room_id)) if !room_id.trim().is_empty() => Some(room_id.clone()),
+        Some(Value::String(_)) | None => None,
+        _ => return Err("provider_data.cups.room_id must be a string".into()),
+    };
+    let mut rooms = vec![None; count];
+    rooms[0] = room_id;
+    Ok(rooms)
+}
+
+fn persisted_cups_rooms(cups: &Value) -> Result<Vec<String>, String> {
+    let count = tots_core::providers::cups::worker_room_count(cups)
+        .map_err(|_| "invalid persisted Cups room pool")?;
+    (0..count)
+        .map(|index| {
+            let room = tots_core::providers::cups::worker_room_data(cups, index)
+                .map_err(|_| "invalid persisted Cups room pool")?;
+            room.get("room_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| "invalid persisted Cups room pool".to_owned())
+        })
+        .collect()
 }
 
 async fn close_rooms(bridges: Vec<NativeBridge>) {
@@ -343,11 +508,97 @@ pub async fn restore_rooms(state: ApiState) {
         }
         Err(_) => tracing::warn!("read persisted Jazz rooms failed"),
     }
+    restore_extra_native(&state).await;
     let mut timer = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
         timer.tick().await;
         prune_rooms(&state).await;
     }
+}
+
+
+async fn restore_extra_native(state: &ApiState) {
+    let devices = match state.db.active_devices().await {
+        Ok(devices) => devices,
+        Err(error) => {
+            tracing::warn!(%error, "read persisted native providers failed");
+            return;
+        }
+    };
+    for device in devices {
+        let mut bridges = Vec::new();
+        for provider in [ProviderName::YaDocs, ProviderName::MailDocs] {
+            let Some(data) = provider_entry(device.provider, &device.provider_data, provider) else {
+                continue;
+            };
+            match start_url_provider_bridges(provider, data, state.args.turn_listen).await {
+                Ok(mut restored) => bridges.append(&mut restored),
+                Err(error) => tracing::warn!(device_id=%device.device_id, provider=provider.as_str(), %error, "native provider restore failed"),
+            }
+        }
+        if let Some(cups) = provider_entry(device.provider, &device.provider_data, ProviderName::Cups) {
+            match persisted_cups_rooms(cups) {
+                Ok(room_ids) => {
+                    let target = state.args.turn_listen;
+                    match build_room_pool(room_ids.len(), move |index| {
+                        let room_id = room_ids[index].clone();
+                        async move {
+                            let room = tots_core::providers::cups::join_room(&room_id).await?;
+                            let bridge = match NativeBridge::start(room.path.clone(), target).await {
+                                Ok(bridge) => bridge,
+                                Err(error) => {
+                                    let _ = room.path.close().await;
+                                    return Err(error);
+                                }
+                            };
+                            Ok((Value::Null, bridge))
+                        }
+                    })
+                    .await
+                    {
+                        Ok((_, mut restored)) => bridges.append(&mut restored),
+                        Err(error) => tracing::warn!(device_id=%device.device_id, %error, "Cups room pool restore failed"),
+                    }
+                }
+                Err(error) => tracing::warn!(device_id=%device.device_id, %error, "invalid persisted Cups room pool"),
+            }
+        }
+        if bridges.is_empty() {
+            continue;
+        }
+        let changes = state.room_changes.lock().await;
+        let current = state.db.get(device.device_id).await.ok().flatten();
+        let active = current.is_some_and(|current| {
+            !current.revoked
+                && current.expires_at >= chrono::Utc::now()
+                && current.provider == device.provider
+                && current.provider_data == device.provider_data
+        });
+        let unused = if active {
+            match state.rooms.entry(device.device_id) {
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(bridges);
+                    None
+                }
+                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                    entry.get_mut().append(&mut bridges);
+                    None
+                }
+            }
+        } else {
+            Some(bridges)
+        };
+        drop(changes);
+        if let Some(unused) = unused {
+            close_rooms(unused).await;
+        }
+    }
+}
+
+fn has_native_provider(primary: ProviderName, data: &Value) -> bool {
+    [ProviderName::Jazz, ProviderName::YaDocs, ProviderName::MailDocs, ProviderName::Cups]
+        .into_iter()
+        .any(|provider| provider_entry(primary, data, provider).is_some())
 }
 
 async fn prune_rooms(state: &ApiState) {
@@ -358,8 +609,7 @@ async fn prune_rooms(state: &ApiState) {
             Ok(Some(device)) => {
                 device.revoked
                     || device.expires_at < chrono::Utc::now()
-                    || provider_entry(device.provider, &device.provider_data, ProviderName::Jazz)
-                        .is_none()
+                    || !has_native_provider(device.provider, &device.provider_data)
             }
             Ok(None) => true,
             Err(_) => false,
@@ -465,8 +715,20 @@ fn normalize_provider_data(primary: ProviderName, value: Value) -> Result<Value,
         keyed.insert(primary.as_str().to_owned(), value);
         Value::Object(keyed)
     };
+    if value.get(primary.as_str()).is_none() {
+        return Err(format!("provider_data is missing primary provider {}", primary.as_str()));
+    }
     if let Some(jazz) = value.get("jazz") {
         requested_room_links(jazz)?;
+    }
+    if let Some(cups) = value.get("cups") {
+        requested_cups_rooms(cups)?;
+    }
+    if let Some(data) = value.get("ya-docs") {
+        tots_core::providers::ya_docs::configured_urls(data).map_err(|error| error.to_string())?;
+    }
+    if let Some(data) = value.get("mail-docs") {
+        tots_core::providers::mail_docs::configured_urls(data).map_err(|error| error.to_string())?;
     }
     Ok(value)
 }

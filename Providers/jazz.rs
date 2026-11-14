@@ -158,11 +158,7 @@ impl Provider for JazzProvider {
         Ok(ProviderBootstrap::default())
     }
 
-    async fn connect_native(
-        &self,
-        data: &Value,
-        _target: std::net::SocketAddr,
-    ) -> Result<Option<Arc<dyn DatagramPath>>> {
+    async fn connect_native(&self, data: &Value) -> Result<Option<Arc<dyn DatagramPath>>> {
         let carrier = media_carrier(data)?;
         let data = parse_data(data)?;
         let session = match data.connector_url {

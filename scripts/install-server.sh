@@ -26,7 +26,6 @@ systemctl stop tots-server.service 2>/dev/null || true
 install -m 0755 "$tmp/tots-server" "$PREFIX/bin/tots-server.new"
 mv -f "$PREFIX/bin/tots-server.new" "$PREFIX/bin/tots-server"
 install -m 0755 "$tmp/setup-network.sh" "$PREFIX/lib/tots/setup-network.sh"
-if [[ -f "$tmp/openflux-exit.sh" ]]; then install -m 0755 "$tmp/openflux-exit.sh" "$PREFIX/lib/tots/openflux-exit.sh"; fi
 install -m 0644 "$tmp/tots-server.service" "$SERVICE"
 if [[ ! -f "$ETC/server.env" ]]; then install -m 0600 "$tmp/config.example.env" "$ETC/server.env"; echo "Edit $ETC/server.env and set TOTS_PUBLIC_HOST before starting."; fi
 systemctl daemon-reload

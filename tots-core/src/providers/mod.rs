@@ -2,7 +2,6 @@ use crate::{config::ProviderName, Error, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::net::SocketAddr;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IceServer {
@@ -23,7 +22,6 @@ pub trait Provider: Send + Sync {
     async fn connect_native(
         &self,
         _data: &Value,
-        _target: SocketAddr,
     ) -> Result<Option<std::sync::Arc<dyn crate::transport::DatagramPath>>> {
         Ok(None)
     }
@@ -32,22 +30,26 @@ pub trait Provider: Send + Sync {
     }
 }
 
+#[path = "../../../Providers/native_channel.rs"]
+pub(crate) mod native_channel;
+#[path = "../../../Providers/cups.rs"]
+pub mod cups;
 #[path = "../../../Providers/jazz.rs"]
 pub mod jazz;
-#[path = "../../../Providers/openflux.rs"]
-pub mod openflux;
+#[path = "../../../Providers/mail_docs.rs"]
+pub mod mail_docs;
 #[path = "../../../Providers/vk.rs"]
 pub mod vk;
+#[path = "../../../Providers/ya_docs.rs"]
+pub mod ya_docs;
 
 pub fn make_provider(name: &ProviderName) -> Result<Box<dyn Provider>> {
     match name {
         ProviderName::Vk => Ok(Box::new(vk::VkProvider)),
         ProviderName::Jazz => Ok(Box::new(jazz::JazzProvider)),
-        ProviderName::Yandex
-        | ProviderName::Vyandex
-        | ProviderName::Boards
-        | ProviderName::Cupsonline
-        | ProviderName::Mailru => Ok(Box::new(openflux::OpenFluxProvider::new(*name))),
+        ProviderName::YaDocs => Ok(Box::new(ya_docs::YaDocsProvider)),
+        ProviderName::MailDocs => Ok(Box::new(mail_docs::MailDocsProvider)),
+        ProviderName::Cups => Ok(Box::new(cups::CupsProvider)),
         ProviderName::Unknown => Err(Error::Provider("unknown provider".into())),
     }
 }
