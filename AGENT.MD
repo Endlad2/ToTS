@@ -4,12 +4,13 @@ This file records the architecture and ownership rules for repository changes.
 
 ## Workspace and ownership
 
-Keep exactly four workspace crates:
+Keep exactly five workspace crates:
 
 1. `tots-core`: original packet protocol, AEAD, replay protection, fragmentation, flow control, provider interfaces and transport paths. No UI or server-storage dependencies.
-2. `tots-client`: CLI/config loading, TUN integration and owned Windows route/DNS changes.
-3. `tots-ios`: C ABI/static library calling core logic for a NetworkExtension host.
-4. `tots-server`: SQLite, management API, Linux TUN, provider-room bridges and system integration.
+2. `tots-client`: desktop CLI/config loading, TUN integration and owned Windows route/DNS changes.
+3. `tots-android`: Android CLI worker binary. It mirrors client worker/provider behavior but consumes a `VpnService` TUN fd and never owns Android route/DNS policy.
+4. `tots-ios`: C ABI/static library calling core logic for a NetworkExtension host.
+5. `tots-server`: SQLite, management API, Linux TUN, provider-room bridges and system integration.
 
 Provider adapters live in top-level `Providers/` and are included by `tots-core/src/providers/mod.rs`. `Providers/jazz-session` is the bundled MIT path dependency, excluded from workspace membership. Preserve its license and attribution when redistributing source or binaries. Workspace/Jazz Rust-version metadata is `1.89`; stable `1.99.1` was tested. Retain `webrtc-ice 0.17.2` in the workspace lock and build with `--locked`: 0.17.3 applies a 100 ms STUN write deadline to relay writes that may still be awaiting a TURN CreatePermission round trip. A physical-network A/B changing only ICE restored both Jazz PeerConnections; keep this lock until upstream makes TURN permission setup cancellation-safe.
 
@@ -50,13 +51,21 @@ VK bootstrap is single-flight and generations remain spaced by three seconds, bu
 
 Best-effort TCP/UDP forwarding bypasses the outer ACK credit and pacing budget; inner transports retain congestion control. Bound its queues and keep at most 512 payload-free ACK diagnostic samples per worker. Range ACKs are delayed only briefly (currently up to 2 ms) and batched (currently up to 32 packet IDs) so RX hot paths do not await one transport ACK send per IP packet. On the server, UDP ingress must not await a TUN enqueue for every packet; use the bounded ingress queue and keep probe/control replies explicit. TURN datapaths reuse send/receive packet buffers; do not reintroduce per-datagram large receive allocations. Reliable control retains congestion control, pacing, loss recovery and retransmission. Neither mode changes AEAD or replay checks. Prepare plaintext frames locally, wait for any reliable send credit, then seal immediately before each send so intervening ACKs cannot age a queued sequence out of the replay window.
 
+## Android packaging contract
+
+`tots-android` is a normal executable target, not a `cdylib`. Android Rust targets produce PIE/ET_DYN executables; release packaging renames that completed executable to `libtots.so` so an APK can keep it under `jniLibs/<abi>/`. Do not convert it into a shared-library entrypoint unless the app integration model is intentionally changed.
+
+Cargo build scripts execute before their package artifact exists. `tots-android/build.rs` therefore has two explicit modes: Cargo mode only emits Android linker metadata; standalone mode (compiled and launched by `scripts/build-android.sh`) runs the cross build and moves the final `tots-android` executable to `dist/android/<abi>/libtots.so`. Keep the standalone invocation guarded by the absence of `OUT_DIR` so it never recursively invokes Cargo from Cargo's own build-script execution.
+
+Keep `tots-android/src/bootstrap.rs` and `tots-android/src/workers.rs` behavior synchronized with the desktop equivalents unless an Android-specific divergence is explicitly documented. The Android host owns `VpnService.Builder`, route/DNS policy and app/UID exclusion/protection. `--tun-fd` duplicates the inherited descriptor before ToTS takes ownership. The host must configure the TUN with the same virtual IPv4 and MTU as the ToTS config. For full-tunnel use, prevent ToTS's own provider sockets from looping back through the VPN (for example by excluding the hosting package/UID or using an equivalent protected-socket strategy).
+
 ## Storage and lifecycle
 
 `tots-server/src/db.rs` owns SQLite. The default database is `/var/lib/tots/tots.db`; preserve it and `/etc/tots/server.env` on upgrades. The management API defaults to loopback.
 
 Persist Jazz invites in provider data. Restart restores active rooms. Revoke or provider replacement closes the previous bridge; periodic expiry maintenance closes expired room bridges. Each bridge owns its task and native path. Serialize lifecycle changes so a delayed restore cannot replace a newer configuration.
 
-The client accepts a server-issued URI with `--config tots://...` or explicit CLI fields; it does not load secret configuration from a local config file. Windows `--tun-default-route` uses a guard that owns only its route/DNS changes. Pin VPS/provider IPv4 endpoints through the physical gateway before installing full-tunnel routes. Normal exit, Ctrl+C and `--run-for-seconds` perform cleanup. Do not claim cleanup after force-killing a process. IPv6 routes are not managed; TURN/TCP/TLS is not implemented.
+The desktop and Android clients accept a server-issued URI with `--config tots://...` or explicit CLI fields; neither loads secret configuration from a local config file. Windows `--tun-default-route` uses a guard that owns only its route/DNS changes. Android has no equivalent route flag: the APK `VpnService` must establish/configure the TUN and pass an inherited descriptor through `--tun-fd`. Pin VPS/provider IPv4 endpoints through the physical gateway before installing full-tunnel routes. Normal exit, Ctrl+C and `--run-for-seconds` perform cleanup. Do not claim cleanup after force-killing a process. IPv6 routes are not managed; TURN/TCP/TLS is not implemented.
 
 ## Security invariants
 
@@ -79,12 +88,14 @@ The client accepts a server-issued URI with `--config tots://...` or explicit CL
 | `tots-core/src/flow.rs` | Five-tuple classification, small-UDP pinning, ~16 KiB bulk flowlets and adaptive ~2 Mbit/s-per-allocation scheduling weights |
 | `tots-core/src/session.rs` | Per-worker packet engine, ACK-range tracking and replay/delivery deduplication |
 | `tots-core/src/transport/` | Datagram paths, tuned UDP sockets, STUN/TURN, RTP envelope and probes |
-| `tots-client/src/main.rs`, `tun_io.rs`, `workers.rs`, `routes.rs` | Client lifecycle, TUN, worker pool/failover and Windows routing |
+| `tots-client/src/main.rs`, `tun_io.rs`, `workers.rs`, `routes.rs` | Desktop client lifecycle, TUN, worker pool/failover and Windows routing |
+| `tots-android/src/main.rs`, `tun_io.rs`, `workers.rs`, `bootstrap.rs` | Android executable lifecycle, inherited `VpnService` TUN fd and the mirrored worker/provider pool |
+| `tots-android/build.rs`, `scripts/build-android.sh` | Android cross-build and post-link executable rename to APK-safe `libtots.so` |
 | `tots-ios/src/lib.rs` | NetworkExtension C ABI |
 | `tots-server/src/api.rs`, `db.rs`, `bridge.rs`, `dataplane.rs` | Config lifecycle, persistence, provider bridge and UDP/TUN routing |
 | `scripts/`, `systemd/` | Installation, Linux NAT and service integration |
 
-Keep public structs serde-compatible unless the config protocol version changes. Test wire formats, config/lifecycle changes and route ownership at their actual boundaries. Record current multi-worker provider evidence in `docs/THROUGHPUT-RESULTS.md`; `docs/TEST-RESULTS.md` preserves earlier single-worker evidence. A direct UDP probe or unit test does not prove provider VPN egress. Keep release packaging reproducible: GitHub Actions publishes the Linux server and Windows client assets, while source archives keep instructions, reports and licenses. A PR is not required for local source delivery.
+Keep public structs serde-compatible unless the config protocol version changes. Test wire formats, config/lifecycle changes and route ownership at their actual boundaries. Record current multi-worker provider evidence in `docs/THROUGHPUT-RESULTS.md`; `docs/TEST-RESULTS.md` preserves earlier single-worker evidence. A direct UDP probe or unit test does not prove provider VPN egress. Keep release packaging reproducible: GitHub Actions publishes the Linux server, Windows client and Android arm64-v8a client assets, while source archives keep instructions, reports and licenses. A PR is not required for local source delivery.
 
 
 ## Native document/room providers

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tots-core", "tots-client", "tots-ios", "tots-server"]
+members = ["tots-core", "tots-client", "tots-android", "tots-ios", "tots-server"]
 exclude = ["Providers/jazz-session"]
 
 [workspace.package]

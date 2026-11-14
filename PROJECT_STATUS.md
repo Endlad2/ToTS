@@ -1,3 +1,11 @@
+## Android client crate (2026-11-14)
+
+Added a separate `tots-android` workspace crate based on the current desktop client worker/provider dataplane. It preserves multi-provider workers, `--workers_percent`, failover/recovery, flowlet scheduling, telemetry, relay/probe modes and config handling. Android TUN is supplied only through an inherited `VpnService` descriptor (`--tun-fd`); the crate does not create a Linux/Windows TUN or manage Android routes/DNS.
+
+`tots-android` is built as a normal PIE executable. `tots-android/build.rs` supports standalone builder mode used by `scripts/build-android.sh`: it cross-builds the executable and then moves the final artifact to `dist/android/<abi>/libtots.so`. Cargo-mode execution of the same build script only stamps the Android soname, avoiding recursive Cargo builds. CI/release now include arm64-v8a packaging under `jniLibs/arm64-v8a/libtots.so`.
+
+This packaging environment still has no Rust toolchain or Android NDK, so the new Android target could not be compiled locally. Static manifest/script/source checks are performed here; GitHub Android CI is the compile/link gate. Future APK integration must ensure ToTS's own transport sockets bypass the `VpnService` full-tunnel path, e.g. by excluding the hosting package/UID or an equivalent protected-socket mechanism.
+
 ## Native provider expansion (2026-11-14)
 
 Implemented native `ya-docs`, `mail-docs`, and `cups` provider modules directly in `Providers/`, integrated with `ProviderName`, `--workers_percent`, worker fallback/recovery, server bridge provisioning, DB restoration, and five-second provider counts. `cups` provisions independent worker rooms. `ya-docs` includes in-process Yandex proof-of-work handling. No OpenFlux binary, subprocess, SOCKS sidecar, or OpenFlux runtime dependency is present.

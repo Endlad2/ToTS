@@ -2991,6 +2991,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tots-android"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde_json",
+ "tokio",
+ "tots-core",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "tots-client"
 version = "0.1.0"
 dependencies = [

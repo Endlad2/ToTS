@@ -91,8 +91,60 @@ jobs:
           path: tots-client-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
 
+
+  android-client:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_API: "23"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Android arm64 executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/build-android.sh aarch64-linux-android
+          test -x dist/android/arm64-v8a/libtots.so
+          file dist/android/arm64-v8a/libtots.so
+          readelf -h dist/android/arm64-v8a/libtots.so | grep -q 'Machine:.*AArch64'
+
+      - name: Package Android client
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-android/jniLibs/arm64-v8a
+          cp dist/android/arm64-v8a/libtots.so dist-android/jniLibs/arm64-v8a/libtots.so
+          cp LICENSE NOTICE dist-android/
+          cp Providers/jazz-session/LICENSE dist-android/JAZZ-SESSION-LICENSE
+          cat > dist-android/README-ANDROID.txt <<'EOF'
+          ToTS Android client
+          ===================
+
+          jniLibs/arm64-v8a/libtots.so is a PIE executable renamed for APK native-library packaging.
+          It is not a JNI cdylib.
+
+          The Android VpnService host must:
+            1. create/configure the TUN interface;
+            2. use the virtual IPv4 and MTU from the tots:// config;
+            3. pass an inherited descriptor with --tun-fd;
+            4. keep ToTS's own transport sockets outside the VPN tunnel (for example by
+               excluding the hosting package/UID or using an equivalent protection strategy).
+
+          Example argv:
+            libtots.so --config tots://... --n 20 --relay-only --tun-fd 42
+          EOF
+          (cd dist-android && zip -r ../tots-android-arm64-v8a.zip .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-client
+          path: tots-android-arm64-v8a.zip
+          if-no-files-found: error
+
   publish:
-    needs: [linux-server, windows-client]
+    needs: [linux-server, windows-client, android-client]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -143,3 +195,4 @@ jobs:
           files: |
             release-assets/tots-server-x86_64-unknown-linux-gnu.tar.gz
             release-assets/tots-client-x86_64-pc-windows-msvc.zip
+            release-assets/tots-android-arm64-v8a.zip

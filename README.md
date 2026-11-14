@@ -7,7 +7,8 @@ ToTS carries encrypted L3 VPN packets through VK Calls TURN/UDP, the direct WebR
 ## Workspace
 
 - `tots-core`: packet protocol, encryption, fragmentation, probing and transport abstractions.
-- `tots-client`: Windows/Linux CLI and Android VPN-fd support.
+- `tots-client`: Windows/Linux CLI client with managed desktop TUN/routing support.
+- `tots-android`: Android CLI worker binary with `VpnService` TUN-fd support; release packaging renames the executable to `libtots.so` for APK `jniLibs` delivery.
 - `tots-ios`: C ABI/static library for a NetworkExtension host.
 - `tots-server`: Linux TUN, UDP ingress, SQLite and the local management API.
 - `Providers/`: native VK, Jazz, `ya-docs`, `mail-docs`, and `cups` adapters. No OpenFlux executable/sidecar is used. The bundled MIT-licensed `jazz-session` library remains a path dependency excluded from workspace membership.
@@ -95,7 +96,36 @@ For example, add `--run-for-seconds 75` for a bounded test. The route guard pins
 
 The client waits for the complete requested pool before creating the full-tunnel routes. Startup/reconnect connection work is capped at seven workers concurrently rather than serially staggering every worker. Any request that configures Jazz or Cups (primary or fallback) and exceeds its provisioned room count fails immediately.
 
-IPv6 routing is not managed. Automatic full-tunnel routing is currently Windows-only. On Android, an application can supply its `VpnService` fd with `--tun-fd`; iOS requires a NetworkExtension host.
+IPv6 routing is not managed. Automatic full-tunnel routing is currently Windows-only. Android uses the separate `tots-android` binary below; iOS requires a NetworkExtension host.
+
+## Android client
+
+`tots-android` carries the same worker/provider dataplane as `tots-client`: `--n`, `--workers_percent`, relay-only mode, provider fallback/recovery, flowlet scheduling and five-second traffic/worker telemetry are preserved. Android TUN ownership is intentionally different: the APK's `VpnService` creates/configures the interface, and the native binary receives the inherited descriptor with `--tun-fd`.
+
+The host `VpnService` must configure the same virtual IPv4 address and MTU contained in the `tots://` configuration. It also owns Android route/DNS/app-selection policy. To avoid the VPN process tunnelling its own provider/WebSocket/TURN sockets back into its TUN, the future APK should exclude its own package/UID from the VPN or otherwise protect the transport sockets before installing a full-tunnel route.
+
+Example process arguments inside an APK host:
+
+```text
+libtots.so --config tots://... --n 20 --workers_percent {"vk":50,"jazz":50} --relay-only --tun-fd 42
+```
+
+`libtots.so` is deliberately **not** a Rust `cdylib`: it is the normal PIE executable produced from `tots-android`, renamed after linking so Android packaging can place it under `jniLibs/<abi>/libtots.so`. The package `build.rs` has two modes. Under Cargo it stamps the Android ELF soname; when compiled/run standalone by `scripts/build-android.sh`, the same `build.rs` invokes the real Android Cargo build and moves the finished executable to `dist/android/<abi>/libtots.so`.
+
+Build arm64-v8a locally with an Android NDK installed:
+
+```bash
+export ANDROID_NDK_HOME=/path/to/android-ndk
+./scripts/build-android.sh aarch64-linux-android
+```
+
+The default Android API level is 23 and can be overridden with `ANDROID_API`. The build helper also understands `armv7-linux-androideabi`, `x86_64-linux-android`, and `i686-linux-android`. GitHub Release builds `arm64-v8a` and packages it at `jniLibs/arm64-v8a/libtots.so`.
+
+For a probe without consuming a TUN fd:
+
+```text
+libtots.so --config tots://... --n 20 --relay-only --probe-only
+```
 
 ## Transport and encryption
 
@@ -115,7 +145,7 @@ Every worker owns a distinct authenticated `session_id`, so workers from one dev
 
 ## Build and release delivery
 
-This source tree contains no private configuration or credentials. GitHub Actions builds the Linux server and Windows client release assets; local rebuilds use stable Rust. This revision was tested with Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`. The workspace lockfile predates the added native WebSocket/cookie dependencies in this snapshot; run Cargo once without `--locked` to refresh it before enforcing a locked build. The existing Jazz ICE pin remains in the manifest tree. See `PROJECT_STATUS.md` and `docs/THROUGHPUT-RESULTS.md` for measured validation and remaining limitations.
+This source tree contains no private configuration or credentials. GitHub Actions builds the Linux server, Windows client and Android arm64-v8a client release assets; local rebuilds use stable Rust. This revision was tested with Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`. The workspace lockfile predates the added native WebSocket/cookie dependencies in this snapshot; run Cargo once without `--locked` to refresh it before enforcing a locked build. The existing Jazz ICE pin remains in the manifest tree. See `PROJECT_STATUS.md` and `docs/THROUGHPUT-RESULTS.md` for measured validation and remaining limitations.
 
 ```bash
 cargo test --workspace
@@ -123,6 +153,6 @@ cargo test --manifest-path Providers/jazz-session/Cargo.toml --locked
 cargo build --workspace --release
 ```
 
-Distribute the built Windows executable with its matching official AMD64 `wintun.dll`, and include `LICENSE`, `NOTICE` and the Jazz MIT license. The Linux server package also needs the systemd unit and network setup script. Preserve `/var/lib/tots/tots.db` and `/etc/tots/server.env` when upgrading. Archive delivery does not require a pull request or published release.
+Distribute the built Windows executable with its matching official AMD64 `wintun.dll`, and include `LICENSE`, `NOTICE` and the Jazz MIT license. The Android release archive contains `jniLibs/arm64-v8a/libtots.so`; it is an executable PIE despite the `.so` filename. The Linux server package also needs the systemd unit and network setup script. Preserve `/var/lib/tots/tots.db` and `/etc/tots/server.env` when upgrading. Archive delivery does not require a pull request or published release.
 
 [AGENT.MD](AGENT.MD) describes architecture and ownership; [PROJECT_STATUS.md](PROJECT_STATUS.md) separates implementation from verified behavior. ToTS is a reference implementation and has not received an independent security audit.
