@@ -85,3 +85,11 @@ The client accepts a server-issued URI with `--config tots://...` or explicit CL
 | `scripts/`, `systemd/` | Installation, Linux NAT and service integration |
 
 Keep public structs serde-compatible unless the config protocol version changes. Test wire formats, config/lifecycle changes and route ownership at their actual boundaries. Record current multi-worker provider evidence in `docs/THROUGHPUT-RESULTS.md`; `docs/TEST-RESULTS.md` preserves earlier single-worker evidence. A direct UDP probe or unit test does not prove provider VPN egress. Keep release packaging reproducible: GitHub Actions publishes the Linux server and Windows client assets, while source archives keep instructions, reports and licenses. A PR is not required for local source delivery.
+
+## OpenFlux carrier boundary
+
+`Providers/openflux.rs` and `tots-core/src/transport/socks5.rs` implement an Apache-2.0 adapter around a separately installed OpenFlux executable. Supported provider names are `yandex`, `vyandex`, `boards`, `cupsonline`, and `mailru`. Do not copy OpenFlux GPLv3 transport implementation files into this workspace. The adapter launches/uses an OpenFlux client in SOCKS5 mode and carries ToTS encrypted UDP datagrams through SOCKS5 UDP ASSOCIATE. Keep ToTS session IDs, crypto, recovery, flow scheduling and provider fallback outside the sidecar.
+
+OpenFlux provider data requires `url`. Optional local runtime fields are `socks5_addr`, `target`, `auto_launch`, `openflux_binary`, `yandex_cookies_file` (`vyandex` only), `cookie_store`, and `route_hosts`. Prefer CLI `--openflux-binary` and `--yandex-cookies-file` for machine-local paths so server-issued `tots://` URIs stay portable. `target` defaults to the ToTS server `peer:turn_port`; do not assume loopback is valid for every OpenFlux exit mode.
+
+`--workers_percent` is generic across every `ProviderName`, not just VK/Jazz. When adding a provider, update `ProviderName::ALL`, config validation, provider construction, server DB persistence, worker telemetry and any keyed-provider migration detection. Jazz remains the only provider that requires one pre-provisioned room per possible worker fallback.

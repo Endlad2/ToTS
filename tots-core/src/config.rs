@@ -10,15 +10,35 @@ use uuid::Uuid;
 pub enum ProviderName {
     Vk,
     Jazz,
+    Yandex,
+    Vyandex,
+    Boards,
+    Cupsonline,
+    Mailru,
     #[serde(other)]
     Unknown,
 }
 
 impl ProviderName {
+    pub const ALL: [Self; 7] = [
+        Self::Vk,
+        Self::Jazz,
+        Self::Yandex,
+        Self::Vyandex,
+        Self::Boards,
+        Self::Cupsonline,
+        Self::Mailru,
+    ];
+
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "vk" => Ok(Self::Vk),
             "jazz" => Ok(Self::Jazz),
+            "yandex" => Ok(Self::Yandex),
+            "vyandex" => Ok(Self::Vyandex),
+            "boards" => Ok(Self::Boards),
+            "cupsonline" => Ok(Self::Cupsonline),
+            "mailru" => Ok(Self::Mailru),
             other => Err(Error::Config(format!("unsupported provider {other:?}"))),
         }
     }
@@ -27,8 +47,20 @@ impl ProviderName {
         match self {
             Self::Vk => "vk",
             Self::Jazz => "jazz",
+            Self::Yandex => "yandex",
+            Self::Vyandex => "vyandex",
+            Self::Boards => "boards",
+            Self::Cupsonline => "cupsonline",
+            Self::Mailru => "mailru",
             Self::Unknown => "unknown",
         }
+    }
+
+    pub const fn is_openflux_carrier(self) -> bool {
+        matches!(
+            self,
+            Self::Yandex | Self::Vyandex | Self::Boards | Self::Cupsonline | Self::Mailru
+        )
     }
 }
 
@@ -42,7 +74,7 @@ pub struct ConnectionConfig {
     pub device_id: Uuid,
     /// Preferred provider. Additional providers can be present in `provider_data`.
     pub provider: ProviderName,
-    /// Multi-provider layout: {"vk": {...}, "jazz": {...}}.
+    /// Multi-provider layout: {"vk": {...}, "jazz": {...}, "yandex": {...}, ...}.
     /// Legacy single-provider objects are still accepted for old server DB rows/config URIs.
     #[serde(default)]
     pub provider_data: Value,
@@ -140,14 +172,14 @@ impl ConnectionConfig {
 
     /// Primary provider first, then configured fallbacks in a deterministic order.
     pub fn provider_order(&self) -> Vec<ProviderName> {
-        let mut out = Vec::with_capacity(2);
+        let mut out = Vec::with_capacity(ProviderName::ALL.len());
         if self.provider != ProviderName::Unknown
             && (self.provider_data.get(self.provider.as_str()).is_some()
                 || !self.has_keyed_provider_data())
         {
             out.push(self.provider);
         }
-        for provider in [ProviderName::Vk, ProviderName::Jazz] {
+        for provider in ProviderName::ALL {
             if provider != self.provider && self.provider_data.get(provider.as_str()).is_some() {
                 out.push(provider);
             }
@@ -159,8 +191,10 @@ impl ConnectionConfig {
         self.provider_data_for(provider).is_some()
     }
 
-    fn has_keyed_provider_data(&self) -> bool {
-        self.provider_data.get("vk").is_some() || self.provider_data.get("jazz").is_some()
+    pub fn has_keyed_provider_data(&self) -> bool {
+        ProviderName::ALL
+            .iter()
+            .any(|provider| self.provider_data.get(provider.as_str()).is_some())
     }
 }
 
@@ -194,6 +228,45 @@ fn validate_provider(provider: ProviderName, data: &Value) -> Result<()> {
             {
                 return Err(Error::Config(
                     "provider_data.jazz requires a server-issued join_link".into(),
+                ));
+            }
+        }
+        ProviderName::Yandex
+        | ProviderName::Vyandex
+        | ProviderName::Boards
+        | ProviderName::Cupsonline
+        | ProviderName::Mailru => {
+            let url = data.get("url").and_then(Value::as_str).unwrap_or("").trim();
+            if url.is_empty() {
+                return Err(Error::Config(format!(
+                    "provider_data.{} requires url",
+                    provider.as_str()
+                )));
+            }
+            if data.get("socks5_addr").is_some_and(|value| !value.is_string())
+                || data.get("target").is_some_and(|value| !value.is_string())
+                || data.get("auto_launch").is_some_and(|value| !value.is_boolean())
+                || data
+                    .get("openflux_binary")
+                    .is_some_and(|value| !value.is_string())
+                || data
+                    .get("yandex_cookies_file")
+                    .is_some_and(|value| !value.is_string())
+                || data.get("cookie_store").is_some_and(|value| !value.is_string())
+                || data.get("route_hosts").is_some_and(|value| {
+                    value
+                        .as_array()
+                        .is_none_or(|items| items.iter().any(|item| !item.is_string()))
+                })
+            {
+                return Err(Error::Config(format!(
+                    "provider_data.{} has invalid OpenFlux runtime fields",
+                    provider.as_str()
+                )));
+            }
+            if provider != ProviderName::Vyandex && data.get("yandex_cookies_file").is_some() {
+                return Err(Error::Config(
+                    "yandex_cookies_file is only valid for vyandex".into(),
                 ));
             }
         }
@@ -233,6 +306,18 @@ mod tests {
             d.provider_order(),
             vec![ProviderName::Vk, ProviderName::Jazz]
         );
+    }
+
+    #[test]
+    fn openflux_carriers_are_keyed_providers() {
+        let mut c = base(serde_json::json!({
+            "vk":{"vk_call_links":["abc"]},
+            "mailru":{"url":"AbCdEfGh1/IjKlMnOp2"}
+        }));
+        c.provider = ProviderName::Mailru;
+        c.validate().unwrap();
+        assert_eq!(c.provider_order()[0], ProviderName::Mailru);
+        assert!(c.has_provider(ProviderName::Vk));
     }
 
     #[test]

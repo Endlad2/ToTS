@@ -212,6 +212,13 @@ struct WorkerSlot {
     recovery: Arc<Mutex<RecoveryController>>,
 }
 
+fn target_count(slots: &[Arc<WorkerSlot>], provider: ProviderName) -> usize {
+    slots
+        .iter()
+        .filter(|slot| slot.preferred_provider == provider)
+        .count()
+}
+
 pub struct WorkerManager {
     cfg: ConnectionConfig,
     slots: Vec<Arc<WorkerSlot>>,
@@ -290,20 +297,22 @@ impl WorkerManager {
                 relay_only,
             )));
         }
-        let vk_target = manager
-            .slots
-            .iter()
-            .filter(|slot| slot.preferred_provider == ProviderName::Vk)
-            .count();
-        let jazz_target = manager
-            .slots
-            .iter()
-            .filter(|slot| slot.preferred_provider == ProviderName::Jazz)
-            .count();
+        let vk_target = target_count(&manager.slots, ProviderName::Vk);
+        let jazz_target = target_count(&manager.slots, ProviderName::Jazz);
+        let yandex_target = target_count(&manager.slots, ProviderName::Yandex);
+        let vyandex_target = target_count(&manager.slots, ProviderName::Vyandex);
+        let boards_target = target_count(&manager.slots, ProviderName::Boards);
+        let cupsonline_target = target_count(&manager.slots, ProviderName::Cupsonline);
+        let mailru_target = target_count(&manager.slots, ProviderName::Mailru);
         info!(
             workers,
             workers_vk_target = vk_target,
             workers_jazz_target = jazz_target,
+            workers_yandex_target = yandex_target,
+            workers_vyandex_target = vyandex_target,
+            workers_boards_target = boards_target,
+            workers_cupsonline_target = cupsonline_target,
+            workers_mailru_target = mailru_target,
             startup_parallelism = STARTUP_PARALLELISM,
             "worker supervisors launched"
         );
@@ -436,6 +445,7 @@ impl WorkerManager {
                 warn!(%error, "VK bootstrap cleanup failed");
             }
         }
+        tots_core::providers::openflux::shutdown_sidecars().await;
     }
 
     pub fn log_status(&self) {
@@ -444,16 +454,18 @@ impl WorkerManager {
         let total = tx.saturating_add(rx);
         let mut vk_workers = 0usize;
         let mut jazz_workers = 0usize;
-        let vk_target = self
-            .slots
-            .iter()
-            .filter(|slot| slot.preferred_provider == ProviderName::Vk)
-            .count();
-        let jazz_target = self
-            .slots
-            .iter()
-            .filter(|slot| slot.preferred_provider == ProviderName::Jazz)
-            .count();
+        let mut yandex_workers = 0usize;
+        let mut vyandex_workers = 0usize;
+        let mut boards_workers = 0usize;
+        let mut cupsonline_workers = 0usize;
+        let mut mailru_workers = 0usize;
+        let vk_target = target_count(&self.slots, ProviderName::Vk);
+        let jazz_target = target_count(&self.slots, ProviderName::Jazz);
+        let yandex_target = target_count(&self.slots, ProviderName::Yandex);
+        let vyandex_target = target_count(&self.slots, ProviderName::Vyandex);
+        let boards_target = target_count(&self.slots, ProviderName::Boards);
+        let cupsonline_target = target_count(&self.slots, ProviderName::Cupsonline);
+        let mailru_target = target_count(&self.slots, ProviderName::Mailru);
         let mut cwnd_bytes = 0usize;
         let mut inflight_bytes = 0usize;
         let mut rtt_min_us = u128::MAX;
@@ -526,6 +538,11 @@ impl WorkerManager {
                 match *provider {
                     Some(ProviderName::Vk) => vk_workers += 1,
                     Some(ProviderName::Jazz) => jazz_workers += 1,
+                    Some(ProviderName::Yandex) => yandex_workers += 1,
+                    Some(ProviderName::Vyandex) => vyandex_workers += 1,
+                    Some(ProviderName::Boards) => boards_workers += 1,
+                    Some(ProviderName::Cupsonline) => cupsonline_workers += 1,
+                    Some(ProviderName::Mailru) => mailru_workers += 1,
                     _ => {}
                 }
             }
@@ -538,8 +555,18 @@ impl WorkerManager {
             workers_target = self.desired_count(),
             workers_vk = vk_workers,
             workers_jazz = jazz_workers,
+            workers_yandex = yandex_workers,
+            workers_vyandex = vyandex_workers,
+            workers_boards = boards_workers,
+            workers_cupsonline = cupsonline_workers,
+            workers_mailru = mailru_workers,
             workers_vk_target = vk_target,
             workers_jazz_target = jazz_target,
+            workers_yandex_target = yandex_target,
+            workers_vyandex_target = vyandex_target,
+            workers_boards_target = boards_target,
+            workers_cupsonline_target = cupsonline_target,
+            workers_mailru_target = mailru_target,
             turn_credentials_seen = self.bootstraps.credential_count(),
             cwnd_bytes,
             inflight_bytes,
@@ -806,7 +833,10 @@ async fn connect_path(
     };
     let peer_ip = cfg.peer_ip()?;
     let mut candidates: Vec<Arc<dyn DatagramPath>> = Vec::new();
-    if let Some(path) = provider.connect_native(&data).await? {
+    if let Some(path) = provider
+        .connect_native(&data, SocketAddr::new(peer_ip, cfg.turn_port))
+        .await?
+    {
         candidates.push(path);
     } else {
         if !relay_only {

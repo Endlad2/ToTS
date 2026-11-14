@@ -2,7 +2,7 @@
 
 **Development draft, 2026-11-12:** the 40 Mbit/s target is not achieved. Live speed measurements were made with a background VPN reportedly enabled and need an isolated repeat. Worker startup has both successful 30/50-worker runs and later incomplete-pool timeouts. See [current status](PROJECT_STATUS.md) and [the throughput investigation](docs/THROUGHPUT-RESULTS.md) before treating this snapshot as a release.
 
-ToTS carries encrypted L3 VPN packets through VK Calls TURN/UDP, the direct WebRTC-side ingress, or a live SaluteJazz RTP media session. The client runs an independent worker pool, keeps latency-sensitive small UDP pinned to one healthy worker, stripes bulk TCP/large UDP across workers in bounded flowlets, and can rebuild a failed worker on the preferred provider or a configured fallback. Windows IPv4 Internet egress through both providers has been verified against three IP services, with clean timed exits and full-tunnel route removal. The same Jazz config also passed a reconnect probe. See [test results](docs/TEST-RESULTS.md).
+ToTS carries encrypted L3 VPN packets through VK Calls TURN/UDP, the direct WebRTC-side ingress, a live SaluteJazz RTP media session, or optional OpenFlux carrier sidecars (`yandex`, `vyandex`, `boards`, `cupsonline`, `mailru`). The client runs an independent worker pool, keeps latency-sensitive small UDP pinned to one healthy worker, stripes bulk TCP/large UDP across workers in bounded flowlets, and can rebuild a failed worker on the preferred provider or a configured fallback. Windows IPv4 Internet egress through both providers has been verified against three IP services, with clean timed exits and full-tunnel route removal. The same Jazz config also passed a reconnect probe. See [test results](docs/TEST-RESULTS.md).
 
 ## Workspace
 
@@ -10,7 +10,7 @@ ToTS carries encrypted L3 VPN packets through VK Calls TURN/UDP, the direct WebR
 - `tots-client`: Windows/Linux CLI and Android VPN-fd support.
 - `tots-ios`: C ABI/static library for a NetworkExtension host.
 - `tots-server`: Linux TUN, UDP ingress, SQLite and the local management API.
-- `Providers/`: VK and Jazz adapters. The bundled MIT-licensed `jazz-session` library is a path dependency excluded from workspace membership, keeping four workspace crates.
+- `Providers/`: VK, Jazz and the OpenFlux sidecar adapter. The bundled MIT-licensed `jazz-session` library is a path dependency excluded from workspace membership, keeping four workspace crates. OpenFlux itself is not bundled because it is GPLv3 and runs as a separate process.
 
 ## Server and configuration
 
@@ -40,6 +40,8 @@ For parallel Jazz workers, request `"jazz": {"worker_count": 30}` and run the re
 
 Jazz also accepts the diagnostic `media_carrier` option: `audio` (default), `audio-wallclock` (same audio transport with timestamps derived from elapsed time), or `vp8-experimental` (opaque video RTP envelope). The API applies it to both server bridges and client worker rooms. The video variant adds VP8 framing metadata for forwarding tests; it is not a VP8 video encoder. Check the throughput report for physical-provider evidence before choosing an experimental carrier.
 
+The config format also accepts OpenFlux-backed carrier keys: `yandex`, `vyandex`, `boards`, `cupsonline`, and `mailru`. Each entry requires `url`; `target` is optional and otherwise defaults to the ToTS server `peer:turn_port`. The ToTS client talks to a separately installed OpenFlux process using SOCKS5 UDP ASSOCIATE, so the ToTS packet format, encryption, worker scheduling and fallback logic stay unchanged. See [OpenFlux carrier setup](docs/OPENFLUX_CARRIERS.md).
+
 If `TOTS_ADMIN_TOKEN` is configured, include its bearer authorization header. Store the returned `tots://` URI privately; it contains credentials. The database preserves the invite; server restart rejoins active rooms. Revoke, expiry and provider replacement close the old room bridge. Revoke a device with `DELETE /v1/configs/{device_id}`. The server bridges Jazz packets into its existing authenticated UDP/TUN dataplane.
 
 The server uses `10.77.0.0/16` for virtual addresses. `scripts/setup-network.sh` configures Linux forwarding/NAT; set `TOTS_UPLINK` if automatic uplink detection is unsuitable. Keep the management API on loopback unless remote access is explicitly configured.
@@ -58,7 +60,7 @@ To request a preferred startup split across configured providers, add `--workers
 .\tots-client.exe --config 'tots://...' --n 20 --workers_percent '{"jazz":"50","vk":"50"}' --relay-only --tun-default-route
 ```
 
-With that example, ten slots prefer Jazz and ten prefer VK. Each slot still retains the other configured provider as fallback, so the *actual* `workers_vk` / `workers_jazz` status can move away from 50/50 after failures. Omitting `--workers_percent` preserves the existing primary-provider-first behavior. If Jazz is present as a fallback, provision at least `worker_count = --n`, because any slot may eventually fail over to Jazz and must have a non-conflicting room.
+With that example, ten slots prefer Jazz and ten prefer VK. The same mechanism accepts the new carrier names, for example `{"yandex":25,"vk":75}`. Each slot still retains the other configured providers as fallbacks, so the actual five-second provider split can move away from the requested percentages after failures. Omitting `--workers_percent` preserves the existing primary-provider-first behavior. If Jazz is present as a fallback, provision at least `worker_count = --n`, because any slot may eventually fail over to Jazz and must have a non-conflicting room.
 
 Useful options:
 
@@ -67,6 +69,8 @@ Useful options:
 | `--config URI` | Decode one server-issued `tots://` config. |
 | `--n N` | Run `N` independent transport workers (1..256). |
 | `--workers_percent JSON` | Optional preferred provider split, e.g. `{"jazz":"50","vk":"50"}`; values must sum to 100. |
+| `--openflux-binary PATH` | Local OpenFlux executable for yandex/vyandex/boards/cupsonline/mailru carriers. |
+| `--yandex-cookies-file PATH` | Netscape `cookies.txt` passed only to the `vyandex` sidecar. |
 | `--mtu N` | Override the IPv4 TUN MTU, including with `--config`; valid range 576..1400. |
 | `--relay-only` | Exclude the direct VPS/WebRTC-side UDP path; use provider relay/native transport. |
 | `--probe-only` | Wait for every requested encrypted worker without opening TUN or installing routes. |
@@ -86,6 +90,8 @@ VK uses TURN/UDP allocation, authentication, permissions and channel binding. It
 Jazz uses actual WebSocket signalling and WebRTC RTP media through the restored `jazz-session` library. `preconnect_call` performs HTTP provisioning on the VPS; `join_preconnected` lets the PC connect directly to Jazz WSS/media endpoints. SSH is used for setup or private configuration retrieval, never for user traffic. Public media keepalives establish the remote track and are filtered before ToTS packet processing.
 
 The Jazz session publishes audio with `muted:false` and explicitly subscribes to remote unmuted AUDIO tracks, deduplicating updates and unsubscribing when tracks are muted. Encrypted path probes retry every 500 ms with fresh sequence numbers within an overall three-second deadline, allowing for initial packet loss during SFU renegotiation.
+
+OpenFlux carriers are adapter paths rather than copied OpenFlux implementations. ToTS auto-starts a local OpenFlux SOCKS5 client sidecar when needed (or uses an already-listening sidecar), creates a separate SOCKS5 UDP association for each ToTS worker, and probes it with the same encrypted ToTS health protocol. `yandex` uses Yandex.Docs, `vyandex` uses Yandex Volga, `boards` uses Yandex Board, `cupsonline` uses Centrifugo rooms, and `mailru` uses Mail.ru Docs. OpenFlux remains a separately licensed external executable.
 
 ToTS frames use XChaCha20-Poly1305 with an Argon2id-derived key, authenticated envelope metadata and replay protection. Each worker has its own session and sequence space; workers reuse the device key without repeating Argon2. Data frames receive their sequence number immediately before encrypted transmission. The replay window remains 128 packets. ACK-range feedback is delayed for at most about 2 ms and batched up to 32 received packet IDs per datagram, reducing control traffic and transport sends without changing authenticated packet numbering.
 

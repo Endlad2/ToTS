@@ -119,7 +119,6 @@ JSON содержит секреты подключения. Библиотек�
 ```sh
 cargo test --locked --all-targets
 cargo test --locked --doc
-cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 ```
 

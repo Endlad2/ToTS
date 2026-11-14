@@ -29,6 +29,7 @@ jobs:
           mkdir -p dist
           cp target/release/tots-server dist/
           cp scripts/setup-network.sh dist/
+          cp scripts/openflux-exit.sh dist/
           cp systemd/tots-server.service dist/
           cp tots-server/config.example.env dist/
           tar -C dist -czf tots-server-x86_64-unknown-linux-gnu.tar.gz .
@@ -79,6 +80,10 @@ jobs:
 
           Run tots-client.exe as Administrator.
           Keep wintun.dll in the same directory as tots-client.exe.
+
+          OpenFlux-backed carriers (yandex, vyandex, boards, cupsonline, mailru)
+          require a separately installed GPLv3 openflux.exe. Put it next to
+          tots-client.exe or pass --openflux-binary PATH.
 
           Example:
             tots-client.exe --config "tots://..."

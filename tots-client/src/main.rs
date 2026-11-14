@@ -5,7 +5,7 @@ mod workers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tots_core::config::{ConnectionConfig, ProviderName};
 use tracing::info;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ struct Args {
     /// Preferred provider. provider_data may also contain fallback providers.
     #[arg(long, default_value = "vk")]
     provider: String,
-    /// JSON object, preferably {"vk":{...},"jazz":{...}}.
+    /// Provider-keyed JSON object, e.g. {"vk":{...},"jazz":{...},"yandex":{...}}.
     #[arg(long)]
     provider_data: Option<String>,
     /// Number of independent transport workers.
@@ -40,6 +40,13 @@ struct Args {
     /// Underscore spelling is canonical; --workers-percent is accepted as an alias.
     #[arg(long = "workers_percent", visible_alias = "workers-percent")]
     workers_percent: Option<String>,
+    /// OpenFlux executable used by yandex/vyandex/boards/cupsonline/mailru carriers.
+    /// If omitted, tots-client first looks for openflux(.exe) next to itself, then in PATH.
+    #[arg(long)]
+    openflux_binary: Option<PathBuf>,
+    /// Netscape cookies.txt used by the vyandex carrier.
+    #[arg(long)]
+    yandex_cookies_file: Option<PathBuf>,
     #[arg(long)]
     tun_fd: Option<i32>,
     #[arg(long, default_value = "tots0")]
@@ -61,26 +68,78 @@ struct Args {
     run_for_seconds: Option<u64>,
 }
 
+fn apply_openflux_runtime_overrides(cfg: &mut ConnectionConfig, a: &Args) -> Result<()> {
+    let binary = a
+        .openflux_binary
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let cookies = a
+        .yandex_cookies_file
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    if binary.is_none() && cookies.is_none() {
+        return Ok(());
+    }
+
+    let primary = cfg.provider;
+    let keyed = cfg.has_keyed_provider_data();
+    for provider in ProviderName::ALL {
+        if !provider.is_openflux_carrier() || !cfg.has_provider(provider) {
+            continue;
+        }
+        let value = if keyed {
+            cfg.provider_data
+                .get_mut(provider.as_str())
+                .with_context(|| format!("missing provider_data.{}", provider.as_str()))?
+        } else if provider == primary {
+            &mut cfg.provider_data
+        } else {
+            continue;
+        };
+        let object = value
+            .as_object_mut()
+            .with_context(|| format!("provider_data.{} must be an object", provider.as_str()))?;
+        if let Some(binary) = binary.as_ref() {
+            object.insert(
+                "openflux_binary".into(),
+                serde_json::Value::String(binary.clone()),
+            );
+        }
+        if provider == ProviderName::Vyandex {
+            if let Some(cookies) = cookies.as_ref() {
+                object.insert(
+                    "yandex_cookies_file".into(),
+                    serde_json::Value::String(cookies.clone()),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn config_from_args(a: &Args) -> Result<ConnectionConfig> {
-    if let Some(uri) = &a.config {
+    let mut cfg = if let Some(uri) = &a.config {
         let mut cfg = ConnectionConfig::decode_uri(uri)?;
         if let Some(mtu) = a.mtu {
             cfg.mtu = mtu;
-            cfg.validate()?;
         }
-        return Ok(cfg);
-    }
-    Ok(ConnectionConfig {
-        version: 1,
-        peer: a.peer.clone().context("--peer required")?,
-        webrtc_port: a.webrtc_port.context("--webrtc-port required")?,
-        turn_port: a.turn_port.context("--turn-port required")?,
-        password: a.password.clone().context("--password required")?,
-        device_id: a.device_id.context("--device-id required")?,
-        provider: ProviderName::parse(&a.provider)?,
-        provider_data: serde_json::from_str(a.provider_data.as_deref().unwrap_or("{}"))?,
-        mtu: a.mtu.unwrap_or(1200),
-    })
+        cfg
+    } else {
+        ConnectionConfig {
+            version: 1,
+            peer: a.peer.clone().context("--peer required")?,
+            webrtc_port: a.webrtc_port.context("--webrtc-port required")?,
+            turn_port: a.turn_port.context("--turn-port required")?,
+            password: a.password.clone().context("--password required")?,
+            device_id: a.device_id.context("--device-id required")?,
+            provider: ProviderName::parse(&a.provider)?,
+            provider_data: serde_json::from_str(a.provider_data.as_deref().unwrap_or("{}"))?,
+            mtu: a.mtu.unwrap_or(1200),
+        }
+    };
+    apply_openflux_runtime_overrides(&mut cfg, a)?;
+    cfg.validate()?;
+    Ok(cfg)
 }
 
 #[tokio::main]
@@ -202,6 +261,41 @@ mod tests {
         let invalid =
             Args::try_parse_from(["tots-client", "--config", &uri, "--mtu", "500"]).unwrap();
         assert!(config_from_args(&invalid).is_err());
+    }
+
+    #[test]
+    fn openflux_runtime_flags_override_local_only_fields() {
+        let cfg = ConnectionConfig {
+            version: 1,
+            peer: "203.0.113.2".into(),
+            webrtc_port: 7800,
+            turn_port: 7801,
+            password: "test-password".into(),
+            device_id: Uuid::new_v4(),
+            provider: ProviderName::Vyandex,
+            provider_data: serde_json::json!({"vyandex":{"url":"https://docs.yandex.ru/example"}}),
+            mtu: 1200,
+        };
+        let uri = cfg.encode_uri().unwrap();
+        let args = Args::try_parse_from([
+            "tots-client",
+            "--config",
+            &uri,
+            "--openflux-binary",
+            "C:/tools/openflux.exe",
+            "--yandex-cookies-file",
+            "C:/cookies.txt",
+        ])
+        .unwrap();
+        let configured = config_from_args(&args).unwrap();
+        assert_eq!(
+            configured.provider_data["vyandex"]["openflux_binary"],
+            "C:/tools/openflux.exe"
+        );
+        assert_eq!(
+            configured.provider_data["vyandex"]["yandex_cookies_file"],
+            "C:/cookies.txt"
+        );
     }
 
     #[test]

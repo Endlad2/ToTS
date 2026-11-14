@@ -23,7 +23,7 @@ pub struct ApiState {
 pub struct CreateRequest {
     /// Preferred provider. provider_data can contain additional fallbacks.
     pub provider: String,
-    /// New layout: {"vk": {...}, "jazz": {...}}.
+    /// Multi-provider layout: {"vk": {...}, "jazz": {...}, "yandex": {...}, ...}.
     pub provider_data: Value,
     pub password: String,
     pub device_id: Uuid,
@@ -454,7 +454,10 @@ fn normalize_provider_data(primary: ProviderName, value: Value) -> Result<Value,
     let object = value
         .as_object()
         .ok_or_else(|| "provider_data must be an object".to_owned())?;
-    let value = if object.contains_key("vk") || object.contains_key("jazz") {
+    let keyed = ProviderName::ALL
+        .iter()
+        .any(|provider| object.contains_key(provider.as_str()));
+    let value = if keyed {
         value
     } else {
         // Migration path for existing API clients using a flat provider object.
@@ -470,7 +473,10 @@ fn normalize_provider_data(primary: ProviderName, value: Value) -> Result<Value,
 
 fn provider_entry(primary: ProviderName, data: &Value, provider: ProviderName) -> Option<&Value> {
     data.get(provider.as_str()).or_else(|| {
-        if primary == provider && data.get("vk").is_none() && data.get("jazz").is_none() {
+        let keyed = ProviderName::ALL
+            .iter()
+            .any(|candidate| data.get(candidate.as_str()).is_some());
+        if primary == provider && !keyed {
             Some(data)
         } else {
             None
