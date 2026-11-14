@@ -630,21 +630,81 @@ fn has_leading_zero_bits(bytes: &[u8], bits: usize) -> bool {
 }
 
 fn encode_fingerprint(nonce: &str) -> Result<String> {
-    let fingerprint = json!({
-        "b6":8,"b7":8,"b9":["en-US","en"],"c2":"","c4":"Win32","c5":[],"c9":USER_AGENT,
-        "f4":1080,"f5":1920,"f6":24,"f7":1080,"f8":true,"f9":[1920,1080],"g1":1920,
-        "g2":"Europe/Moscow","g3":-180,"j5":true,"m2":{"mTP":0,"tE":false,"tS":false},
-        "n6":false,"o2":0,"o3":"srgb","o4":0,"o5":"en-US","o8":null,"o9":null,
-        "p1":null,"p2":0,"p3":null,"p4":null,"p5":null,"p6":null,"p8":[],"p9":"111111111",
-        "j6":48000,"a1":"","a2":{"w":false,"d":""},
-        "a3":{"acos":1.4444399284962483,"asin":0.12349655394506357,"atan":0.4636476090008061,
-              "cos":-0.8390715290095377,"exp":2.718281828459045,"log1p":2.3978952727983707,
-              "sin":-0.9917788534431158,"tan":-0.23206847684369653},
-        "a4":{"minDelta":0.1,"maxDelta":1.2},"a5":null,"k4":[],
-        "j1":{"vn":"WebKit","vr":"WebKit WebGL","vU":"","r":"Mozilla","rU":"","sLV":"WebGL GLSL ES 1.0 (1.0)"},
-        "j2":{"cA":[],"p":[],"sP":[],"e":[],"eP":[]},"m10":nonce,"version":"1.5.0"
-    });
-    let raw = serde_json::to_vec(&fingerprint)
+    // Keep the fingerprint data identical, but do not build the whole object with one
+    // gigantic `json!` invocation. `serde_json::json!` is a recursive macro and this
+    // object is large enough to hit rustc's default macro recursion limit in tots-core.
+    let mut fingerprint = serde_json::Map::new();
+    fingerprint.insert("b6".into(), Value::from(8));
+    fingerprint.insert("b7".into(), Value::from(8));
+    fingerprint.insert("b9".into(), json!(["en-US", "en"]));
+    fingerprint.insert("c2".into(), Value::String(String::new()));
+    fingerprint.insert("c4".into(), Value::String("Win32".into()));
+    fingerprint.insert("c5".into(), json!([]));
+    fingerprint.insert("c9".into(), Value::String(USER_AGENT.into()));
+    fingerprint.insert("f4".into(), Value::from(1080));
+    fingerprint.insert("f5".into(), Value::from(1920));
+    fingerprint.insert("f6".into(), Value::from(24));
+    fingerprint.insert("f7".into(), Value::from(1080));
+    fingerprint.insert("f8".into(), Value::Bool(true));
+    fingerprint.insert("f9".into(), json!([1920, 1080]));
+    fingerprint.insert("g1".into(), Value::from(1920));
+    fingerprint.insert("g2".into(), Value::String("Europe/Moscow".into()));
+    fingerprint.insert("g3".into(), Value::from(-180));
+    fingerprint.insert("j5".into(), Value::Bool(true));
+    fingerprint.insert("m2".into(), json!({"mTP": 0, "tE": false, "tS": false}));
+    fingerprint.insert("n6".into(), Value::Bool(false));
+    fingerprint.insert("o2".into(), Value::from(0));
+    fingerprint.insert("o3".into(), Value::String("srgb".into()));
+    fingerprint.insert("o4".into(), Value::from(0));
+    fingerprint.insert("o5".into(), Value::String("en-US".into()));
+    fingerprint.insert("o8".into(), Value::Null);
+    fingerprint.insert("o9".into(), Value::Null);
+    fingerprint.insert("p1".into(), Value::Null);
+    fingerprint.insert("p2".into(), Value::from(0));
+    fingerprint.insert("p3".into(), Value::Null);
+    fingerprint.insert("p4".into(), Value::Null);
+    fingerprint.insert("p5".into(), Value::Null);
+    fingerprint.insert("p6".into(), Value::Null);
+    fingerprint.insert("p8".into(), json!([]));
+    fingerprint.insert("p9".into(), Value::String("111111111".into()));
+    fingerprint.insert("j6".into(), Value::from(48000));
+    fingerprint.insert("a1".into(), Value::String(String::new()));
+    fingerprint.insert("a2".into(), json!({"w": false, "d": ""}));
+    fingerprint.insert(
+        "a3".into(),
+        json!({
+            "acos": 1.4444399284962483,
+            "asin": 0.12349655394506357,
+            "atan": 0.4636476090008061,
+            "cos": -0.8390715290095377,
+            "exp": 2.718281828459045,
+            "log1p": 2.3978952727983707,
+            "sin": -0.9917788534431158,
+            "tan": -0.23206847684369653
+        }),
+    );
+    fingerprint.insert("a4".into(), json!({"minDelta": 0.1, "maxDelta": 1.2}));
+    fingerprint.insert("a5".into(), Value::Null);
+    fingerprint.insert("k4".into(), json!([]));
+    fingerprint.insert(
+        "j1".into(),
+        json!({
+            "vn": "WebKit",
+            "vr": "WebKit WebGL",
+            "vU": "",
+            "r": "Mozilla",
+            "rU": "",
+            "sLV": "WebGL GLSL ES 1.0 (1.0)"
+        }),
+    );
+    fingerprint.insert(
+        "j2".into(),
+        json!({"cA": [], "p": [], "sP": [], "e": [], "eP": []}),
+    );
+    fingerprint.insert("m10".into(), Value::String(nonce.to_owned()));
+    fingerprint.insert("version".into(), Value::String("1.5.0".into()));
+
+    let raw = serde_json::to_vec(&Value::Object(fingerprint))
         .map_err(|e| provider_error("ya-docs captcha fingerprint JSON", e))?;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder
