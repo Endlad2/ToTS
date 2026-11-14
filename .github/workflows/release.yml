@@ -95,7 +95,7 @@ jobs:
   android-client:
     runs-on: ubuntu-latest
     env:
-      ANDROID_API: "23"
+      ANDROID_API: "24"
     steps:
       - uses: actions/checkout@v4
 

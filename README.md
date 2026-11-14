@@ -119,7 +119,7 @@ export ANDROID_NDK_HOME=/path/to/android-ndk
 ./scripts/build-android.sh aarch64-linux-android
 ```
 
-The default Android API level is 23 and can be overridden with `ANDROID_API`. The build helper also understands `armv7-linux-androideabi`, `x86_64-linux-android`, and `i686-linux-android`. GitHub Release builds `arm64-v8a` and packages it at `jniLibs/arm64-v8a/libtots.so`.
+The minimum/default Android API level is 24 and can be overridden with `ANDROID_API` to a newer level. API 23 is not supported because the WebRTC networking stack uses `getifaddrs`/`freeifaddrs`, which Android exposes from API 24. The build helper also understands `armv7-linux-androideabi`, `x86_64-linux-android`, and `i686-linux-android`. GitHub Release builds `arm64-v8a` and packages it at `jniLibs/arm64-v8a/libtots.so`.
 
 For a probe without consuming a TUN fd:
 

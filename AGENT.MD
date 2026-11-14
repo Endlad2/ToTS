@@ -51,6 +51,10 @@ VK bootstrap is single-flight and generations remain spaced by three seconds, bu
 
 Best-effort TCP/UDP forwarding bypasses the outer ACK credit and pacing budget; inner transports retain congestion control. Bound its queues and keep at most 512 payload-free ACK diagnostic samples per worker. Range ACKs are delayed only briefly (currently up to 2 ms) and batched (currently up to 32 packet IDs) so RX hot paths do not await one transport ACK send per IP packet. On the server, UDP ingress must not await a TUN enqueue for every packet; use the bounded ingress queue and keep probe/control replies explicit. TURN datapaths reuse send/receive packet buffers; do not reintroduce per-datagram large receive allocations. Reliable control retains congestion control, pacing, loss recovery and retransmission. Neither mode changes AEAD or replay checks. Prepare plaintext frames locally, wait for any reliable send credit, then seal immediately before each send so intervening ACKs cannot age a queued sequence out of the replay window.
 
+## Android API floor
+
+Keep Android native builds at API level 24 or newer. The current WebRTC networking stack enumerates interfaces through bionic `getifaddrs`/`freeifaddrs`; Android exposes those symbols from API 24. `scripts/build-android.sh` intentionally rejects lower API levels. CI and release builds must not override this floor.
+
 ## Android packaging contract
 
 `tots-android` is a normal executable target, not a `cdylib`. Android Rust targets produce PIE/ET_DYN executables; release packaging renames that completed executable to `libtots.so` so an APK can keep it under `jniLibs/<abi>/`. Do not convert it into a shared-library entrypoint unless the app integration model is intentionally changed.

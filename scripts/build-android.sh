@@ -5,7 +5,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 TARGET="${1:-aarch64-linux-android}"
-API="${ANDROID_API:-23}"
+API="${ANDROID_API:-24}"
+
+if ! [[ "$API" =~ ^[0-9]+$ ]]; then
+  echo "ANDROID_API must be a numeric Android API level (minimum: 24), got: $API" >&2
+  exit 2
+fi
+if (( API < 24 )); then
+  echo "ANDROID_API=$API is too old: ToTS WebRTC dependencies use getifaddrs/freeifaddrs, available on Android from API 24." >&2
+  exit 2
+fi
 
 case "$TARGET" in
   aarch64-linux-android)

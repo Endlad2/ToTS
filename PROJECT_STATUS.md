@@ -1,3 +1,7 @@
+## Android API 24 linker fix (2026-11-14)
+
+Android arm64 builds now target API 24 by default and CI/Release pin `ANDROID_API=24`. The WebRTC interface-enumeration dependency references bionic `getifaddrs`/`freeifaddrs`, which are unavailable when linking against Android API 23. `scripts/build-android.sh` rejects API levels below 24 with a direct diagnostic so the undefined-symbol linker failure cannot silently return.
+
 ## Android client crate (2026-11-14)
 
 Added a separate `tots-android` workspace crate based on the current desktop client worker/provider dataplane. It preserves multi-provider workers, `--workers_percent`, failover/recovery, flowlet scheduling, telemetry, relay/probe modes and config handling. Android TUN is supplied only through an inherited `VpnService` descriptor (`--tun-fd`); the crate does not create a Linux/Windows TUN or manage Android routes/DNS.
