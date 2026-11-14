@@ -39,6 +39,89 @@ jobs:
           path: tots-server-x86_64-unknown-linux-gnu.tar.gz
           if-no-files-found: error
 
+
+  linux-client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Linux client
+        run: cargo build -p tots-client --release
+
+      - name: Package Linux client
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64"
+          mkdir -p dist-linux-client
+          cp target/release/tots-client dist-linux-client/
+          cp LICENSE NOTICE dist-linux-client/
+          cat > dist-linux-client/README-LINUX.txt <<'EOF'
+          ToTS Linux client
+          =================
+
+          Run with the privileges required to create/configure the TUN interface.
+
+          Example:
+            sudo ./tots-client --config "tots://..." --n 20 --relay-only --tun-default-route
+          EOF
+          tar -czf "$PWD/tots-client-x86_64-unknown-linux-gnu.tar.gz" -C dist-linux-client .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-client
+          path: tots-client-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+
+  macos-client:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build macOS client
+        run: cargo build -p tots-client --release
+
+      - name: Package macOS client
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            arm64)
+              TARGET_NAME="aarch64-apple-darwin"
+              ;;
+            x86_64)
+              TARGET_NAME="x86_64-apple-darwin"
+              ;;
+            *)
+              echo "Unsupported macOS runner architecture: $ARCH" >&2
+              exit 1
+              ;;
+          esac
+          mkdir -p dist-macos-client
+          cp target/release/tots-client dist-macos-client/
+          cp LICENSE NOTICE dist-macos-client/
+          cat > dist-macos-client/README-MACOS.txt <<'EOF'
+          ToTS macOS client
+          =================
+
+          Run with the privileges required to create/configure the TUN interface.
+
+          Example:
+            sudo ./tots-client --config "tots://..." --n 20 --relay-only --tun-default-route
+          EOF
+          tar -czf "$PWD/tots-client-${TARGET_NAME}.tar.gz" -C dist-macos-client .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-client
+          path: tots-client-*-apple-darwin.tar.gz
+          if-no-files-found: error
+
   windows-client:
     runs-on: windows-latest
     steps:
@@ -144,7 +227,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [linux-server, windows-client, android-client]
+    needs: [linux-server, linux-client, macos-client, windows-client, android-client]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -194,5 +277,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release-assets/tots-server-x86_64-unknown-linux-gnu.tar.gz
+            release-assets/tots-client-x86_64-unknown-linux-gnu.tar.gz
+            release-assets/tots-client-*-apple-darwin.tar.gz
             release-assets/tots-client-x86_64-pc-windows-msvc.zip
             release-assets/tots-android-arm64-v8a.zip
