@@ -120,6 +120,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let underlay = if args.tun_default_route {
+        match routes::capture_underlay().await {
+            Ok(underlay) => Some(underlay),
+            Err(error) => {
+                manager.shutdown().await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
     let mut tun = match tun_io::open(&cfg, &args.tun_name, args.tun_fd).await {
         Ok(tun) => tun,
         Err(error) => {
@@ -127,8 +139,8 @@ async fn main() -> Result<()> {
             return Err(error);
         }
     };
-    let routes = if args.tun_default_route {
-        match routes::install(tun_io::index(&tun)?, manager.route_ips().await).await {
+    let routes = if let Some(underlay) = underlay {
+        match routes::install(tun_io::index(&tun)?, manager.route_ips().await, underlay).await {
             Ok(routes) => Some(routes),
             Err(error) => {
                 manager.shutdown().await;

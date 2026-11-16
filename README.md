@@ -92,7 +92,17 @@ Useful options:
 | `--tun-default-route` | Install Windows IPv4 full-tunnel routing and TUN DNS. |
 | `--run-for-seconds N` | End the connected TUN run gracefully after a bounded interval. |
 
-For example, add `--run-for-seconds 75` for a bounded test. The route guard pins the VPS and provider endpoint IPv4 addresses to the physical gateway, then removes its owned routes and restores TUN DNS during normal exit, including Ctrl+C and the timer. Cleanup after force-killing the process is not guaranteed.
+For example, add `--run-for-seconds 75` for a bounded test. Before Wintun is opened, the client snapshots the active physical IPv4 underlay. The route guard then pins the VPS and provider endpoint IPv4 addresses to that captured interface/gateway **before** installing the two TUN `/1` routes, so later Windows connectivity/metric changes cannot make ToTS transport packets recurse through `tots0`. Known virtual/VPN adapters are excluded from automatic underlay selection. If Windows or a driver still reports the wrong adapter, set `TOTS_PHYSICAL_IFINDEX` to the desired Wi-Fi/Ethernet interface index before launching the client:
+
+```powershell
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+  Format-Table InterfaceIndex,NextHop,RouteMetric
+
+$env:TOTS_PHYSICAL_IFINDEX = '12'
+.\tots-client.exe --config 'tots://...' --n 20 --relay-only --tun-default-route
+```
+
+The forced index is validated to be Up, connected, and to own a usable active IPv4 default route; ToTS refuses to use the TUN's own interface index as its underlay. On normal exit the guard removes only routes it created and restores TUN DNS. Cleanup after force-killing the process is not guaranteed.
 
 The client waits for the complete requested pool before creating the full-tunnel routes. Startup/reconnect connection work is capped at seven workers concurrently rather than serially staggering every worker. Any request that configures Jazz or Cups (primary or fallback) and exceeds its provisioned room count fails immediately.
 

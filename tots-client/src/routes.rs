@@ -9,17 +9,46 @@ pub struct FullTunnelRoutes {
     changes: OwnedChanges,
 }
 
-pub async fn install(tun_index: i32, protected: Vec<Ipv4Addr>) -> Result<FullTunnelRoutes> {
+/// Physical/default underlay captured before Wintun is opened.
+///
+/// Capturing this first is deliberate: once Windows starts treating the ToTS
+/// adapter as Internet-capable, route/metric changes must not be able to make
+/// the VPN transport choose its own TUN as the underlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnderlayRoute {
+    index: u32,
+    gateway: Ipv4Addr,
+    metric: u64,
+}
+
+pub(crate) async fn capture_underlay() -> Result<UnderlayRoute> {
+    #[cfg(windows)]
+    {
+        tokio::task::spawn_blocking(capture_underlay_sync)
+            .await
+            .context("Windows underlay discovery task failed")?
+    }
+    #[cfg(not(windows))]
+    {
+        bail!("automatic full-tunnel routing is supported only on Windows")
+    }
+}
+
+pub async fn install(
+    tun_index: i32,
+    protected: Vec<Ipv4Addr>,
+    underlay: UnderlayRoute,
+) -> Result<FullTunnelRoutes> {
     #[cfg(windows)]
     {
         // A cancelled caller still lets this task finish; its returned guard is then dropped.
-        tokio::task::spawn_blocking(move || install_sync(tun_index, protected))
+        tokio::task::spawn_blocking(move || install_sync(tun_index, protected, underlay))
             .await
             .context("Windows route installation task failed")?
     }
     #[cfg(not(windows))]
     {
-        let _ = (tun_index, protected);
+        let _ = (tun_index, protected, underlay);
         bail!("automatic full-tunnel routing is supported only on Windows")
     }
 }
@@ -81,14 +110,6 @@ impl Drop for FullTunnelRoutes {
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DefaultRoute {
-    index: u32,
-    gateway: Ipv4Addr,
-    metric: u64,
-}
-
-#[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Route {
     address: Ipv4Addr,
     prefix: u8,
@@ -97,7 +118,7 @@ struct Route {
 }
 
 #[cfg(any(windows, test))]
-fn parse_default_route(json: &str, tun_index: u32) -> Result<DefaultRoute> {
+fn parse_default_route(json: &str, excluded_index: u32) -> Result<UnderlayRoute> {
     let value: serde_json::Value = serde_json::from_str(json.trim_start_matches('\u{feff}'))
         .context("parse physical default-route JSON")?;
     let rows = match &value {
@@ -131,9 +152,16 @@ fn parse_default_route(json: &str, tun_index: u32) -> Result<DefaultRoute> {
         {
             bail!("default route has no usable IPv4 gateway");
         }
-        let metric = u64::from(number("RouteMetric")?) + u64::from(number("InterfaceMetric")?);
-        if index != tun_index {
-            candidates.push(DefaultRoute {
+        let physical_rank = row
+            .get("PhysicalRank")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let metric = physical_rank
+            .saturating_mul(1_000_000)
+            .saturating_add(u64::from(number("RouteMetric")?))
+            .saturating_add(u64::from(number("InterfaceMetric")?));
+        if index != excluded_index {
+            candidates.push(UnderlayRoute {
                 index,
                 gateway,
                 metric,
@@ -147,7 +175,7 @@ fn parse_default_route(json: &str, tun_index: u32) -> Result<DefaultRoute> {
 }
 
 #[cfg(any(windows, test))]
-fn route_plan(tun_index: u32, default: DefaultRoute, mut protected: Vec<Ipv4Addr>) -> Vec<Route> {
+fn route_plan(tun_index: u32, default: UnderlayRoute, mut protected: Vec<Ipv4Addr>) -> Vec<Route> {
     protected.sort_unstable();
     protected.dedup();
     let mut routes: Vec<_> = protected
@@ -202,10 +230,132 @@ impl Route {
 }
 
 #[cfg(windows)]
-fn install_sync(tun_index: i32, protected: Vec<Ipv4Addr>) -> Result<FullTunnelRoutes> {
+fn capture_underlay_sync() -> Result<UnderlayRoute> {
+    let forced = match std::env::var("TOTS_PHYSICAL_IFINDEX") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let index: u32 = raw
+                .trim()
+                .parse()
+                .context("TOTS_PHYSICAL_IFINDEX must be a positive interface index")?;
+            if index == 0 || index > i32::MAX as u32 {
+                bail!("TOTS_PHYSICAL_IFINDEX is out of range");
+            }
+            Some(index)
+        }
+        _ => None,
+    };
+
+    let script = if let Some(index) = forced {
+        format!(
+            r#"
+            $rows = @()
+            $adapter = Get-NetAdapter -InterfaceIndex {index} -IncludeHidden -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $adapter -or $adapter.Status -ne 'Up') {{
+                throw 'TOTS_PHYSICAL_IFINDEX does not name an Up adapter'
+            }}
+            $ip = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {index} -ErrorAction SilentlyContinue |
+                Where-Object {{ $_.ConnectionState -eq 'Connected' }} | Select-Object -First 1
+            if ($null -eq $ip) {{
+                throw 'TOTS_PHYSICAL_IFINDEX has no connected IPv4 interface'
+            }}
+            $rows = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex {index} -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+                Where-Object {{ $_.NextHop -ne '0.0.0.0' }} |
+                ForEach-Object {{
+                    [PSCustomObject]@{{
+                        InterfaceIndex = [uint32]$_.InterfaceIndex
+                        NextHop = [string]$_.NextHop
+                        RouteMetric = [uint32]$_.RouteMetric
+                        InterfaceMetric = [uint32]$ip.InterfaceMetric
+                        PhysicalRank = [uint32]0
+                    }}
+                }})
+            if ($rows.Count -eq 0) {{
+                throw 'TOTS_PHYSICAL_IFINDEX has no usable active IPv4 default route'
+            }}
+            ConvertTo-Json -InputObject $rows -Compress
+            "#
+        )
+    } else {
+        r#"
+        $rows = @()
+        $virtualPattern = 'Wintun|(^|[^A-Za-z])TUN([^A-Za-z]|$)|(^|[^A-Za-z])TAP([^A-Za-z]|$)|Virtual|VPN|WireGuard|ZeroTier|Radmin|Hamachi|Loopback|Hyper-V|Tailscale|OpenVPN|ToTS'
+        $routes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction Stop |
+            Where-Object { $_.NextHop -ne '0.0.0.0' })
+        foreach ($route in $routes) {
+            $adapter = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $adapter -or $adapter.Status -ne 'Up') {
+                continue
+            }
+            $identity = [string]$adapter.Name + ' ' + [string]$adapter.InterfaceDescription
+            if ($identity -match $virtualPattern) {
+                continue
+            }
+            $ip = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue |
+                Where-Object { $_.ConnectionState -eq 'Connected' } | Select-Object -First 1
+            if ($null -eq $ip) {
+                continue
+            }
+
+            # Prefer adapters that Windows marks as real hardware. Some Wi-Fi/USB
+            # drivers report this incorrectly, so non-blacklisted candidates remain
+            # as a lower-priority fallback rather than making discovery fail.
+            $rank = 1
+            if (($adapter.HardwareInterface -eq $true) -and ($adapter.Virtual -ne $true)) {
+                $rank = 0
+            }
+            $rows += [PSCustomObject]@{
+                InterfaceIndex = [uint32]$route.InterfaceIndex
+                NextHop = [string]$route.NextHop
+                RouteMetric = [uint32]$route.RouteMetric
+                InterfaceMetric = [uint32]$ip.InterfaceMetric
+                PhysicalRank = [uint32]$rank
+            }
+        }
+        ConvertTo-Json -InputObject $rows -Compress
+        "#
+        .to_owned()
+    };
+
+    let output = powershell(&script).context("read physical IPv4 default route")?;
+    let json = String::from_utf8(output.stdout).context("default-route JSON was not UTF-8")?;
+    let underlay = parse_default_route(&json, 0)?;
+    tracing::info!(
+        physical_interface_index = underlay.index,
+        physical_gateway = %underlay.gateway,
+        forced = forced.is_some(),
+        "captured Windows transport underlay"
+    );
+    Ok(underlay)
+}
+
+#[cfg(any(windows, test))]
+fn validate_underlay(tun_index: u32, underlay: UnderlayRoute) -> Result<()> {
+    if underlay.index == 0 || underlay.index > i32::MAX as u32 {
+        bail!("invalid physical underlay interface index");
+    }
+    if underlay.index == tun_index {
+        bail!("refusing to route ToTS transport through its own TUN interface");
+    }
+    if underlay.gateway.is_unspecified()
+        || underlay.gateway.is_loopback()
+        || underlay.gateway.is_multicast()
+        || underlay.gateway.is_broadcast()
+    {
+        bail!("physical underlay has no usable IPv4 gateway");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_sync(
+    tun_index: i32,
+    protected: Vec<Ipv4Addr>,
+    underlay: UnderlayRoute,
+) -> Result<FullTunnelRoutes> {
     if tun_index <= 0 {
         bail!("invalid TUN interface index");
     }
+    validate_underlay(tun_index as u32, underlay)?;
     if protected.is_empty() {
         bail!("full tunnel requires at least one protected transport endpoint");
     }
@@ -215,40 +365,41 @@ fn install_sync(tun_index: i32, protected: Vec<Ipv4Addr>) -> Result<FullTunnelRo
     {
         bail!("protected transport endpoints must be usable IPv4 addresses");
     }
-    let json = powershell(r#"
-        $physical = @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' } | ForEach-Object { $_.ifIndex })
-        $rows = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction Stop | ForEach-Object {
-            $route = $_
-            if ($physical -contains $route.InterfaceIndex) {
-                $ip = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction Stop | Where-Object { $_.ConnectionState -eq 'Connected' } | Select-Object -First 1
-                if ($null -ne $ip) {
-                    [PSCustomObject]@{ InterfaceIndex = [uint32]$route.InterfaceIndex; NextHop = [string]$route.NextHop; RouteMetric = [uint32]$route.RouteMetric; InterfaceMetric = [uint32]$ip.InterfaceMetric }
-                }
-            }
-        })
-        ConvertTo-Json -InputObject $rows -Compress
-    "#).context("read original physical IPv4 default route")?;
-    let json = String::from_utf8(json.stdout).context("default-route JSON was not UTF-8")?;
-    let default = parse_default_route(&json, tun_index as u32)?;
+
     let mut guard = FullTunnelRoutes {
         changes: OwnedChanges::default(),
     };
     let result = (|| -> Result<()> {
-        for route in route_plan(tun_index as u32, default, protected) {
+        let plan = route_plan(tun_index as u32, underlay, protected);
+        let protected_count = plan.iter().filter(|route| route.prefix == 32).count();
+        tracing::info!(
+            physical_interface_index = underlay.index,
+            physical_gateway = %underlay.gateway,
+            protected_endpoints = protected_count,
+            "installing Windows full-tunnel escape routes"
+        );
+
+        // The /32 transport routes are deliberately first. Once the two /1 routes
+        // exist, every provider/VPS socket must already have a more-specific route
+        // through the captured physical gateway.
+        for route in plan {
             let output = powershell(&format!(
                 "$existing = @({}); if ($existing.Count -eq 0) {{ New-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null; exit 10 }}",
                 route.query(), route.destination(), route.index, route.gateway
-            )).with_context(|| format!("install IPv4 route {}", route.destination()))?;
+            ))
+            .with_context(|| format!("install IPv4 route {}", route.destination()))?;
             // An exit code cannot be confused by localized warnings on stdout.
             guard
                 .changes
                 .record(route, output.status.code() == Some(10));
         }
+
         // Mark before the call so a partially successful DNS update is also reset.
         guard.changes.dns_index = Some(tun_index as u32);
         powershell(&format!(
             "Set-DnsClientServerAddress -InterfaceIndex {tun_index} -ServerAddresses @('1.1.1.1','8.8.8.8') -ErrorAction Stop"
-        )).context("set TUN DNS servers")?;
+        ))
+        .context("set TUN DNS servers")?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -300,8 +451,8 @@ fn powershell(script: &str) -> Result<std::process::Output> {
 mod tests {
     use super::*;
 
-    fn default_route() -> DefaultRoute {
-        DefaultRoute {
+    fn default_route() -> UnderlayRoute {
+        UnderlayRoute {
             index: 12,
             gateway: "192.168.1.1".parse().unwrap(),
             metric: 30,
@@ -366,5 +517,20 @@ mod tests {
         owned.record(routes[1], true);
         assert_eq!(owned.routes, vec![routes[1]]);
         assert!(owned.dns_index.is_none());
+    }
+
+    #[test]
+    fn physical_rank_beats_a_virtual_default_with_lower_metric() {
+        let rows = r#"[
+          {"InterfaceIndex":11,"NextHop":"10.10.0.1","RouteMetric":1,"InterfaceMetric":1,"PhysicalRank":1},
+          {"InterfaceIndex":12,"NextHop":"192.168.1.1","RouteMetric":20,"InterfaceMetric":10,"PhysicalRank":0}
+        ]"#;
+        assert_eq!(parse_default_route(rows, 0).unwrap(), default_route());
+    }
+
+    #[test]
+    fn rejects_tun_as_captured_underlay() {
+        assert!(validate_underlay(12, default_route()).is_err());
+        assert!(validate_underlay(7, default_route()).is_ok());
     }
 }
