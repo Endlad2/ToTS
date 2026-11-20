@@ -1,8 +1,8 @@
 # ToTS — Traffic over Turn Server
 
-**Development draft, 2026-11-12:** the 40 Mbit/s target is not achieved. Live speed measurements were made with a background VPN reportedly enabled and need an isolated repeat. Worker startup has both successful 30/50-worker runs and later incomplete-pool timeouts. See [current status](PROJECT_STATUS.md) and [the throughput investigation](docs/THROUGHPUT-RESULTS.md) before treating this snapshot as a release.
+**Development draft, 2026-11-12:** the 40 Mbit/s target is not achieved. Live speed measurements were made with a background VPN reportedly enabled and need an isolated repeat. Normal client startup no longer blocks on every worker passing a health probe; workers connect in the background and the TUN transmit path waits for the first healthy worker. See [current status](PROJECT_STATUS.md) and [the throughput investigation](docs/THROUGHPUT-RESULTS.md) before treating this snapshot as a release.
 
-ToTS carries encrypted L3 VPN packets through VK Calls TURN/UDP, the direct WebRTC-side ingress, SaluteJazz RTP media, Yandex Docs WebSocket, Mail.ru Docs WebSocket, or Cups.online Centrifugo rooms. The client runs an independent worker pool, keeps latency-sensitive small UDP pinned to one healthy worker, stripes bulk TCP/large UDP across workers in bounded flowlets, and can rebuild a failed worker on the preferred provider or a configured fallback. Windows IPv4 Internet egress through both providers has been verified against three IP services, with clean timed exits and full-tunnel route removal. The same Jazz config also passed a reconnect probe. See [test results](docs/TEST-RESULTS.md).
+ToTS carries encrypted L3 VPN packets through VK Calls TURN/UDP, the direct WebRTC-side ingress, SaluteJazz RTP media, Yandex Docs WebSocket, Mail.ru Docs WebSocket, Cups.online Centrifugo rooms, or MAX Calls TURN/WebRTC signaling. The client runs an independent worker pool, keeps latency-sensitive small UDP pinned to one healthy worker, stripes bulk TCP/large UDP across workers in bounded flowlets, and can rebuild a failed worker on the preferred provider or a configured fallback. Windows IPv4 Internet egress through both providers has been verified against three IP services, with clean timed exits and full-tunnel route removal. The same Jazz config also passed a reconnect probe. See [test results](docs/TEST-RESULTS.md).
 
 ## Workspace
 
@@ -11,7 +11,7 @@ ToTS carries encrypted L3 VPN packets through VK Calls TURN/UDP, the direct WebR
 - `tots-android`: Android CLI worker binary with `VpnService` TUN-fd support; release packaging renames the executable to `libtots.so` for APK `jniLibs` delivery.
 - `tots-ios`: C ABI/static library for a NetworkExtension host.
 - `tots-server`: Linux TUN, UDP ingress, SQLite and the local management API.
-- `Providers/`: native VK, Jazz, `ya-docs`, `mail-docs`, and `cups` adapters. No OpenFlux executable/sidecar is used. The bundled MIT-licensed `jazz-session` library remains a path dependency excluded from workspace membership.
+- `Providers/`: native VK, Jazz, `ya-docs`, `mail-docs`, `cups`, and MAX adapters. MAX call setup uses KometTeam's permissively licensed `kolibri-net` protocol/signaling crate; no Komet GPL application code is copied. No OpenFlux executable/sidecar is used. The bundled MIT-licensed `jazz-session` library remains a path dependency excluded from workspace membership.
 
 ## Server and configuration
 
@@ -30,7 +30,8 @@ The request contains `provider` (the preferred provider), `provider_data`, a pas
   "provider": "vk",
   "provider_data": {
     "vk": {"vk_call_links": ["https://vk.ru/call/join/..."]},
-    "jazz": {}
+    "jazz": {},
+    "max": {"access_token": "<MAX access_token>"}
   }
 }
 ```
@@ -59,25 +60,33 @@ Native document/room providers use the same worker/fallback machinery:
 
 `cups` accepts `{"worker_count": N}` in the server API. The server provisions `N` independent Cups.online rooms, stores them in `worker_rooms`, and starts one native bridge per room. As with Jazz, if Cups is available as a fallback, provision `worker_count >= --n` so any failed slot can move to a non-conflicting room. Existing `room_id`/`worker_rooms` can also be reused on server restart.
 
-If `TOTS_ADMIN_TOKEN` is configured, include its bearer authorization header. Store the returned `tots://` URI privately; it contains credentials. The database preserves the invite; server restart rejoins active rooms. Revoke, expiry and provider replacement close the old room bridge. Revoke a device with `DELETE /v1/configs/{device_id}`. The server bridges Jazz/Yandex Docs/Mail.ru Docs/Cups packets into its existing authenticated UDP/TUN dataplane.
+`max` accepts `{"access_token": "..."}`. For a MAX-only device, set `"provider": "max"` and `"provider_data": {"max": {"access_token": "..."}}`. Each MAX worker logs in with that token, attempts to create a randomly named private group, starts an audio call to the same account to obtain call credentials, attempts to attach that call to the group, then reads ICE/TURN data from the call's WebRTC signaling handshake. No contacts are invited. MAX may reject attaching a self-only group call; in that case the transport still uses the call's TURN credentials and reports `group_call_attached: false`. MAX is a client-side provider, not a server-native bridge. It uses the Komet Android-style binary TCP/TLS session; supply an `access_token` accepted by the MAX mobile protocol (a web-only scoped token may require a separate WebSocket login mode).
+
+If `TOTS_ADMIN_TOKEN` is configured, include its bearer authorization header. Store the returned `tots://` URI privately; it contains credentials. The MAX `access_token` is part of `provider_data` and is stored in the server config database so clients can restore the provider after restart; protect the DB and treat the URI as a bearer secret. The database preserves the invite; server restart rejoins active rooms. Revoke, expiry and provider replacement close the old room bridge. Revoke a device with `DELETE /v1/configs/{device_id}`. The server bridges Jazz/Yandex Docs/Mail.ru Docs/Cups packets into its existing authenticated UDP/TUN dataplane.
 
 The server uses `10.77.0.0/16` for virtual addresses. `scripts/setup-network.sh` configures Linux forwarding/NAT; set `TOTS_UPLINK` if automatic uplink detection is unsuitable. Keep the management API on loopback unless remote access is explicitly configured.
 
 ## Windows client
 
-Extract the delivery archive and keep `wintun.dll` beside the Windows `tots-client.exe`. Run TUN operations as Administrator. Pass the server-returned URI directly:
+Extract the delivery archive and keep `wintun.dll` beside the Windows `tots-client.exe`. Run TUN operations as Administrator. Windows now enables full-tunnel routing by default: after one healthy route-ready worker per selected provider group is established, ToTS installs protected `/32` transport routes, both IPv4 `/1` routes and an IPv4 default route through Wintun. It snapshots/restores DNS on the physical and TUN interfaces, and blocks IPv6 egress while the IPv4-only tunnel is active so IPv6-capable applications cannot bypass it.
 
 ```powershell
-.\tots-client.exe --config 'tots://...' --n 10 --relay-only --tun-default-route
+.\tots-client.exe --config 'tots://...' --n 10 --relay-only
+```
+
+Use `--no-tun-default-route` only when you intentionally want to create the TUN without changing system-wide routes. `--tun-default-route` remains accepted for backwards compatibility. If the process is force-killed, remove any leftover ToTS IPv6 firewall rule from an elevated PowerShell window:
+
+```powershell
+Get-NetFirewallRule -Group 'ToTS Full Tunnel' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 ```
 
 To request a preferred startup split across configured providers, add `--workers_percent`. Values may be JSON strings or integers and must total 100:
 
 ```powershell
-.\tots-client.exe --config 'tots://...' --n 20 --workers_percent '{"vk":"40","jazz":"20","ya-docs":"20","mail-docs":"10","cups":"10"}' --relay-only --tun-default-route
+.\tots-client.exe --config 'tots://...' --n 20 --workers_percent '{"vk":"35","jazz":"20","ya-docs":"15","mail-docs":"10","cups":"10","max":"10"}' --relay-only --tun-default-route
 ```
 
-The split only controls each slot's preferred provider. Every slot still keeps the other configured providers in its fallback order, so the actual `workers_vk`, `workers_jazz`, `workers_ya_docs`, `workers_mail_docs`, and `workers_cups` counts can move away from the requested percentages after failures. Omitting `--workers_percent` preserves the existing primary-provider-first behavior. If Jazz is present as a fallback, provision at least `worker_count = --n`, because any slot may eventually fail over to Jazz and must have a non-conflicting room.
+The split only controls each slot's preferred provider. Every slot still keeps the other configured providers in its fallback order, so the actual `workers_vk`, `workers_jazz`, `workers_ya_docs`, `workers_mail_docs`, `workers_cups`, and `workers_max` counts can move away from the requested percentages after failures. Omitting `--workers_percent` preserves the existing primary-provider-first behavior. If Jazz is present as a fallback, provision at least `worker_count = --n`, because any slot may eventually fail over to Jazz and must have a non-conflicting room.
 
 Useful options:
 
@@ -85,11 +94,12 @@ Useful options:
 | --- | --- |
 | `--config URI` | Decode one server-issued `tots://` config. |
 | `--n N` | Run `N` independent transport workers (1..256). |
-| `--workers_percent JSON` | Optional preferred provider split across any configured `vk`/`jazz`/`ya-docs`/`mail-docs`/`cups`; values must sum to 100. |
+| `--workers_percent JSON` | Optional preferred provider split across any configured `vk`/`jazz`/`ya-docs`/`mail-docs`/`cups`/`max`; values must sum to 100. |
 | `--mtu N` | Override the IPv4 TUN MTU, including with `--config`; valid range 576..1400. |
 | `--relay-only` | Exclude the direct VPS/WebRTC-side UDP path; use provider relay/native transport. |
 | `--probe-only` | Wait for every requested encrypted worker without opening TUN or installing routes. |
-| `--tun-default-route` | Install Windows IPv4 full-tunnel routing and TUN DNS. |
+| `--tun-default-route` | Explicitly enable Windows full-tunnel routing (already enabled by default). |
+| `--no-tun-default-route` | Opt out of Windows full-tunnel routing; leave system routes unchanged. |
 | `--run-for-seconds N` | End the connected TUN run gracefully after a bounded interval. |
 
 For example, add `--run-for-seconds 75` for a bounded test. Before Wintun is opened, the client snapshots the active physical IPv4 underlay. The route guard then pins the VPS and provider endpoint IPv4 addresses to that captured interface/gateway **before** installing the two TUN `/1` routes, so later Windows connectivity/metric changes cannot make ToTS transport packets recurse through `tots0`. Known virtual/VPN adapters are excluded from automatic underlay selection. If Windows or a driver still reports the wrong adapter, set `TOTS_PHYSICAL_IFINDEX` to the desired Wi-Fi/Ethernet interface index before launching the client:
@@ -102,17 +112,17 @@ $env:TOTS_PHYSICAL_IFINDEX = '12'
 .\tots-client.exe --config 'tots://...' --n 20 --relay-only --tun-default-route
 ```
 
-The forced index is validated to be Up, connected, and to own a usable active IPv4 default route; ToTS refuses to use the TUN's own interface index as its underlay. On normal exit the guard removes only routes it created and restores TUN DNS. Cleanup after force-killing the process is not guaranteed.
+The forced index is validated to be Up, connected, and to own a usable active IPv4 default route; ToTS refuses to use the TUN's own interface index as its underlay. On normal exit the guard removes only routes it created and restores the original DNS servers on both affected interfaces. Cleanup after force-killing the process is not guaranteed; remove the leftover firewall rule with the command above if needed.
 
-The client waits for the complete requested pool before creating the full-tunnel routes. Startup/reconnect connection work is capped at seven workers concurrently rather than serially staggering every worker. Any request that configures Jazz or Cups (primary or fallback) and exceeds its provisioned room count fails immediately.
+The client waits only for one healthy route-ready worker per selected preferred-provider group before installing Windows full-tunnel routes; it does not wait for the complete worker pool. Remaining workers continue connecting in the background. Startup/reconnect connection work is capped at seven workers concurrently rather than serially staggering every worker. Any request that configures Jazz or Cups (primary or fallback) and exceeds its provisioned room count fails immediately.
 
-IPv6 routing is not managed. Automatic full-tunnel routing is currently Windows-only. Android uses the separate `tots-android` binary below; iOS requires a NetworkExtension host.
+The current dataplane is IPv4-only. On Windows, ToTS blocks IPv6 egress with a temporary Windows Defender Firewall rule for the lifetime of the full tunnel and removes it during normal shutdown. DNS on the physical adapter is changed to public IPv4 resolvers while connected and restored on shutdown. Automatic full-tunnel routing is currently Windows-only. Android uses the separate `tots-android` binary below; iOS requires a NetworkExtension host.
 
 ## Android client
 
 `tots-android` carries the same worker/provider dataplane as `tots-client`: `--n`, `--workers_percent`, relay-only mode, provider fallback/recovery, flowlet scheduling and five-second traffic/worker telemetry are preserved. Android TUN ownership is intentionally different: the APK's `VpnService` creates/configures the interface, and the native binary receives the inherited descriptor with `--tun-fd`.
 
-The host `VpnService` must configure the same virtual IPv4 address and MTU contained in the `tots://` configuration. It also owns Android route/DNS/app-selection policy. To avoid the VPN process tunnelling its own provider/WebSocket/TURN sockets back into its TUN, the future APK should exclude its own package/UID from the VPN or otherwise protect the transport sockets before installing a full-tunnel route.
+The host `VpnService` must configure the same virtual IPv4 address and MTU contained in the `tots://` configuration. It must pass a live, inherited TUN fd (clear `FD_CLOEXEC` in the parent before `exec`) and must not read/write that fd after handoff. The native client duplicates the fd, switches it to non-blocking mode, and uses epoll readiness so `EAGAIN` is not treated as process-fatal. It also owns Android route/DNS/app-selection policy. To avoid the VPN process tunnelling its own provider/WebSocket/TURN sockets back into its TUN, the future APK should exclude its own package/UID from the VPN or otherwise protect the transport sockets before installing a full-tunnel route.
 
 Example process arguments inside an APK host:
 
@@ -133,7 +143,7 @@ export ANDROID_NDK_HOME=/path/to/android-ndk
 
 The minimum/default Android API level is 24 and can be overridden with `ANDROID_API` to a newer level. API 23 is not supported because the WebRTC networking stack uses `getifaddrs`/`freeifaddrs`, which Android exposes from API 24. The build helper also understands `i686-linux-android` for local legacy builds. GitHub CI/Release build the three APK ABIs `arm64-v8a`, `armeabi-v7a`, and `x86_64` in parallel and package them together under `jniLibs/<abi>/libtots.so`.
 
-For a probe without consuming a TUN fd:
+Normal Android startup launches worker supervisors immediately and opens TUN without waiting for every worker health probe; the first outbound packet waits asynchronously for any worker to become ready. `--probe-only` retains the explicit full-pool readiness check. For a probe without consuming a TUN fd:
 
 ```text
 libtots.so --config tots://... --n 20 --relay-only --probe-only

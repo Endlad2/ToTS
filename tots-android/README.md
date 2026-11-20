@@ -2,7 +2,7 @@
 
 `tots-android` is the Android process-form client for ToTS. It reuses the desktop worker/provider architecture but does not create or configure a TUN interface itself.
 
-The APK host must create the interface with `VpnService.Builder`, configure the ToTS virtual IPv4/MTU, and pass an inherited descriptor with `--tun-fd`. If the host starts ToTS with `exec`, it must ensure the duplicated TUN descriptor is inheritable (not closed by `FD_CLOEXEC`).
+The APK host must create the interface with `VpnService.Builder`, configure the ToTS virtual IPv4/MTU, and pass an inherited descriptor with `--tun-fd`. If the host starts ToTS with `exec`, it must clear `FD_CLOEXEC` on the descriptor before the exec and must not read/write it after handoff. ToTS duplicates it, sets `O_NONBLOCK`, and registers it with epoll; this avoids treating Android TUN `EAGAIN` as a fatal file I/O error. A zero-length read is treated as an explicit TUN-closed error rather than a silent successful exit.
 
 Example argv:
 
@@ -17,4 +17,4 @@ export ANDROID_NDK_HOME=/path/to/android-ndk
 ../scripts/build-android.sh aarch64-linux-android
 ```
 
-The final file is `../dist/android/arm64-v8a/libtots.so`. It is a renamed PIE executable, not a JNI shared-library API.
+Normal startup does not wait for all workers to pass the health probe. It starts the TUN loop immediately and queues the first outbound packet until a worker is ready; `--probe-only` is the explicit slow readiness diagnostic. The final file is `../dist/android/arm64-v8a/libtots.so`. It is a renamed PIE executable, not a JNI shared-library API.

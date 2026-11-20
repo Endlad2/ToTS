@@ -38,6 +38,8 @@ pub mod cups;
 pub mod jazz;
 #[path = "../../../Providers/mail_docs.rs"]
 pub mod mail_docs;
+#[path = "../../../Providers/max.rs"]
+pub mod max;
 #[path = "../../../Providers/vk.rs"]
 pub mod vk;
 #[path = "../../../Providers/ya_docs.rs"]
@@ -50,6 +52,7 @@ pub fn make_provider(name: &ProviderName) -> Result<Box<dyn Provider>> {
         ProviderName::YaDocs => Ok(Box::new(ya_docs::YaDocsProvider)),
         ProviderName::MailDocs => Ok(Box::new(mail_docs::MailDocsProvider)),
         ProviderName::Cups => Ok(Box::new(cups::CupsProvider)),
+        ProviderName::Max => Ok(Box::new(max::MaxProvider::default())),
         ProviderName::Unknown => Err(Error::Provider("unknown provider".into())),
     }
 }

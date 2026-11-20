@@ -212,31 +212,20 @@ async fn connect_and_serve(
         .await
         .map_err(|e| provider_error("ya-docs WebSocket connect", e))?;
 
-    // Engine.IO open may be the first frame. It is harmless if the endpoint accepts auth sooner,
-    // but consuming it first avoids racing the Socket.IO namespace handshake.
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(message) = socket.next().await {
-            let message = message.map_err(|e| provider_error("ya-docs handshake read", e))?;
-            if let Message::Text(text) = message {
-                if text.starts_with("0{") {
-                    break;
-                }
-            }
-        }
-        Ok::<_, Error>(())
-    })
-    .await;
-
+    // Engine.IO must be opened before the Socket.IO namespace is joined. The
+    // old code ignored a timeout here and sent auth on a half-open socket.
+    wait_for_prefix(&mut socket, "0{", "ya-docs Engine.IO open").await?;
     socket
         .send(Message::Text(format!("40{{\"token\":\"{}\"}}", info.token).into()))
         .await
         .map_err(|e| provider_error("ya-docs Socket.IO connect", e))?;
+    wait_for_prefix(&mut socket, "40", "ya-docs Socket.IO namespace").await?;
     let auth = json!([
         "message",
         {
             "type":"auth",
             "docid":info.doc_id,
-            "token":"fghhfgsjdgfjs",
+            "token":info.token.clone(),
             "user":{"id":user_id},
             "editorType":0,
             "lastOtherSaveTime":-1,
@@ -292,7 +281,9 @@ async fn connect_and_serve(
                         }
                         for payload in cursor_payloads(text.as_str()) {
                             if let Ok(bytes) = STANDARD.decode(payload) {
-                                let _ = endpoint.inbound.try_send(bytes);
+                                endpoint.inbound.send(bytes).await.map_err(|_| {
+                                    Error::Transport("ya-docs inbound queue closed".into())
+                                })?;
                             }
                         }
                     }
@@ -320,6 +311,41 @@ async fn connect_and_serve(
             }
         }
     }
+}
+
+async fn wait_for_prefix<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    prefix: &str,
+    step: &str,
+) -> Result<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while let Some(message) = socket.next().await {
+            match message.map_err(|error| provider_error(step, error))? {
+                Message::Text(text) => {
+                    let text = text.as_str();
+                    if text.starts_with(prefix) {
+                        return Ok(text.to_owned());
+                    }
+                    if text == "2" {
+                        socket
+                            .send(Message::Text("3".into()))
+                            .await
+                            .map_err(|error| provider_error(step, error))?;
+                    } else if text.starts_with("41") || text.starts_with("44") {
+                        return Err(Error::Provider(format!("{step} was rejected")));
+                    }
+                }
+                Message::Close(_) => return Err(Error::Transport(format!("{step} closed"))),
+                _ => {}
+            }
+        }
+        Err(Error::Transport(format!("{step} closed")))
+    })
+    .await
+    .map_err(|_| Error::Provider(format!("{step} timed out")))?
 }
 
 fn cursor_message(data: &[u8]) -> Message {
@@ -445,8 +471,15 @@ async fn fetch_doc_info(client: &Client, jar: Arc<Jar>, raw_url: &str, user_id: 
     let host = balancer_url
         .host_str()
         .ok_or_else(|| Error::Provider("ya-docs balancer host missing".into()))?;
+    let port = balancer_url.port().map(|port| format!(":{port}")).unwrap_or_default();
+    let origin_scheme = match balancer_url.scheme() {
+        "http" | "ws" => "http",
+        "https" | "wss" => "https",
+        _ => return Err(Error::Provider("ya-docs balancer has an unsupported scheme".into())),
+    };
+    let origin = format!("{origin_scheme}://{host}{port}");
     let ws_url = format!(
-        "wss://{host}/2024.1.1-375/doc/{doc_id}/c/?EIO=4&transport=websocket"
+        "wss://{host}{port}/2024.1.1-375/doc/{doc_id}/c/?EIO=4&transport=websocket"
     );
     let cookie = jar
         .cookies(&final_url)
@@ -468,7 +501,7 @@ async fn fetch_doc_info(client: &Client, jar: Arc<Jar>, raw_url: &str, user_id: 
     Ok(DocInfo {
         token: token.to_owned(),
         doc_id: doc_id.to_owned(),
-        origin: balancer.to_owned(),
+        origin,
         ws_url,
         cookie,
         permissions,

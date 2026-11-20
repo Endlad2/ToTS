@@ -20,7 +20,7 @@ This environment does not contain a Rust toolchain and outbound package installa
 
 ## Implemented in this source snapshot
 
-- Multi-provider `provider_data` (`vk` / `jazz`) with a preferred `provider` and fallback order.
+- Multi-provider `provider_data` (`vk` / `jazz` / `ya-docs` / `mail-docs` / `cups` / `max`) with a preferred `provider` and fallback order.
 - Client `--n` worker pool, optional `--workers_percent` preferred-provider apportionment, per-worker session IDs, health logs and five-second TUN traffic/worker telemetry (including preferred and actual provider splits).
 - Worker recovery: preferred-provider retries, fallback-provider cycling, path re-probing on liveness/sustained-RTT degradation and authenticated session/path resumption.
 - Server multi-session routing per device so workers do not overwrite one another.
@@ -30,9 +30,17 @@ This environment does not contain a Rust toolchain and outbound package installa
 - 1200-byte encrypted datagram budget and best-effort 4 MiB UDP socket buffers.
 - Client configuration is passed as `--config tots://...` or explicit CLI fields; local secret-config loading is not part of the CLI.
 - Shared off-runtime device key derivation, bounded authenticated admission, independent server egress queues and periodic authorization refresh.
-- Paced VK credential acquisition with seven-worker credential cohorts, seven-way bounded concurrent worker connection/probing, and independent Jazz room/bridge pools for up to 50 workers; startup waits for the complete requested pool.
+- Paced VK credential acquisition with seven-worker credential cohorts, seven-way bounded concurrent worker connection/probing, and independent Jazz room/bridge pools for up to 50 workers; normal startup is not gated on complete-pool health, while `--probe-only` retains the explicit full-pool check.
 - Lazy frame sealing preserves the existing 128-packet replay check when data waits behind control packets.
 - Delayed ACK-range batching (up to 32 packet IDs / ~2 ms) on client and server, a non-blocking server UDP→TUN ingress hot path with a 16K-packet bounded queue, and reusable TURN send/receive buffers to remove per-datagram allocator churn.
+
+## MAX transport and startup/TUN fixes (2026-11-20)
+
+Added a MAX provider using KometTeam's `kolibri-net` protocol/signaling library and Android-style binary TCP/TLS session: access-token login, call-token exchange, attempted random private group creation, audio self-call setup, best-effort group attachment, VCP decoding, ws2 WebRTC signaling, and TURN/STUN extraction. The provider does not invite contacts. MAX may reject attaching a self-only group call; when that happens it still uses the call's TURN credentials and records `group_call_attached: false`. The supplied `access_token` remains in server `provider_data` and therefore in the config database; derived call/session/turn secrets are kept in memory.
+
+Removed the blocking all-workers-health barrier from normal Android and desktop startup. Worker supervisors connect in the background, and the TUN sender waits on a readiness watch for the first available worker. Android TUN I/O now uses a duplicated non-blocking fd registered with epoll, handles `EAGAIN` asynchronously, reports EOF explicitly, and uses SIGTERM as the Android process shutdown signal. Direct-UDP candidate failure no longer prevents trying TURN. Fixed silent inbound packet drops in Yandex Docs, Mail.ru Docs and Cups queues; tightened the Yandex Engine.IO/Socket.IO handshake; corrected Mail.ru numeric editor IDs and dynamic Origin; normalized Cups websocket URL/Origin and relative metadata URLs.
+
+No live MAX token or Android APK host was available, and this archive has no Rust toolchain. `Cargo.lock` could not be regenerated here; the first normal Cargo build must resolve the new `kolibri-net` git dependency before using `--locked`. Compile/live-provider verification remains outstanding.
 
 ## Validation status
 
@@ -40,4 +48,12 @@ The Sasha baseline recorded a workspace run on 2026-11-12 that passed 109 tests 
 
 Both VK and Jazz have connected 50 independent encrypted workers in earlier bounded Windows runs and returned the Linux server's public IPv4 address. Later starts also timed out with incomplete pools, so repeatable startup is still unresolved. The operator subsequently reported a continuously enabled background VPN, and running WireSock services were observed. Speed measurements are provisional until that additional path is disabled or a ToTS bypass is independently verified. The prior 40 Mbit/s acceptance target was not achieved in the recorded baseline. This revision specifically removes serial startup tails and per-packet ACK/TUN awaits, but no fixed “+10 Mbit/s” improvement is claimed without a clean live benchmark because VK relay capacity, RTT and loss dominate the result.
 
-IPv6 routing is not managed. Reconnected provider endpoints can require a client restart because bypass routes are installed from the initial pool. Permanently exited native bridges are not automatically replaced. Bounded tests do not establish long-duration stability.
+IPv6 is not transported by the dataplane; the Windows full-tunnel guard now blocks it while connected. Reconnected provider endpoints can still require a client restart because bypass routes are installed from the initial ready-path pool. Permanently exited native bridges are not automatically replaced. Bounded tests do not establish long-duration stability.
+
+## Windows full-tunnel routing fix (2026-11-20)
+
+Windows now enables full-tunnel mode by default unless `--no-tun-default-route` is passed. Before switching system routes, the client waits only for one route-ready worker per selected preferred-provider group, not the complete worker pool; this ensures provider/VPS endpoint escape routes exist before `/1` routes can redirect transport sockets into Wintun. The route plan installs protected `/32` underlay routes, both IPv4 `/1` routes, and an IPv4 `/0` route; the active route table and Wintun adapter state are verified before reporting full-tunnel readiness. The Wintun interface metric is set to 1.
+
+While the full tunnel is active, the client snapshots and replaces IPv4 DNS on the selected physical underlay and Wintun with public IPv4 resolvers, then restores the original server lists on normal shutdown. Because the dataplane is IPv4-only, a Windows Defender Firewall outbound rule blocks IPv6 (`::/0`) during the session and is removed during normal cleanup. If the process is force-killed, the persistent firewall rule may remain; the README includes the exact elevated-PowerShell cleanup command. A diagnostic PowerShell script reports adapter, route, firewall and DNS state.
+
+This environment has no Rust toolchain and cannot run a Windows/Wintun integration test. The code and scripts were statically inspected, but Windows compilation and live tests on the user's PC remain required before calling the fix verified.

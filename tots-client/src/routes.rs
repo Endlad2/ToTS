@@ -75,7 +75,7 @@ impl FullTunnelRoutes {
         for i in (0..self.changes.routes.len()).rev() {
             let route = self.changes.routes[i];
             match powershell(&format!(
-                "{} | Remove-NetRoute -Confirm:$false -ErrorAction Stop | Out-Null",
+                "$existing = @({}); if ($existing.Count -gt 0) {{ $existing | Remove-NetRoute -Confirm:$false -ErrorAction Stop | Out-Null }}",
                 route.query()
             )) {
                 Ok(_) => {
@@ -84,12 +84,40 @@ impl FullTunnelRoutes {
                 Err(error) => failures.push(format!("{}: {error:#}", route.destination())),
             }
         }
-        if let Some(index) = self.changes.dns_index {
-            match powershell(&format!(
-                "Set-DnsClientServerAddress -InterfaceIndex {index} -ResetServerAddresses -ErrorAction Stop"
-            )) {
-                Ok(_) => self.changes.dns_index = None,
-                Err(error) => failures.push(format!("reset TUN DNS: {error:#}")),
+        for i in (0..self.changes.dns.len()).rev() {
+            let snapshot = self.changes.dns[i].clone();
+            let restore = if snapshot.servers.is_empty() {
+                format!(
+                    "Set-DnsClientServerAddress -InterfaceIndex {} -AddressFamily IPv4 -ResetServerAddresses -ErrorAction Stop",
+                    snapshot.index
+                )
+            } else {
+                let servers = snapshot
+                    .servers
+                    .iter()
+                    .map(|ip| format!("'{}'", ip))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "Set-DnsClientServerAddress -InterfaceIndex {} -AddressFamily IPv4 -ServerAddresses @({servers}) -ErrorAction Stop",
+                    snapshot.index
+                )
+            };
+            match powershell(&restore) {
+                Ok(_) => {
+                    self.changes.dns.remove(i);
+                }
+                Err(error) => failures.push(format!("restore DNS on interface {}: {error:#}", snapshot.index)),
+            }
+        }
+        if let Some(rule) = self.changes.ipv6_rule.clone() {
+            let script = format!(
+                "$existing = Get-NetFirewallRule -Name '{}' -ErrorAction SilentlyContinue; if ($null -ne $existing) {{ Remove-NetFirewallRule -InputObject $existing -Confirm:$false -ErrorAction Stop | Out-Null }}",
+                rule
+            );
+            match powershell(&script) {
+                Ok(_) => self.changes.ipv6_rule = None,
+                Err(error) => failures.push(format!("remove IPv6 leak-protection rule: {error:#}")),
             }
         }
         if !failures.is_empty() {
@@ -187,10 +215,17 @@ fn route_plan(tun_index: u32, default: UnderlayRoute, mut protected: Vec<Ipv4Add
             gateway: default.gateway,
         })
         .collect();
-    for address in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(128, 0, 0, 0)] {
+    // Two /1 routes win over every ordinary IPv4 default route. Keep a /0 route
+    // as well so Windows NCSI and applications that explicitly inspect the default
+    // route see the Wintun adapter as the active IPv4 egress.
+    for (address, prefix) in [
+        (Ipv4Addr::UNSPECIFIED, 1),
+        (Ipv4Addr::new(128, 0, 0, 0), 1),
+        (Ipv4Addr::UNSPECIFIED, 0),
+    ] {
         routes.push(Route {
             address,
-            prefix: 1,
+            prefix,
             index: tun_index,
             gateway: Ipv4Addr::UNSPECIFIED,
         });
@@ -199,10 +234,18 @@ fn route_plan(tun_index: u32, default: UnderlayRoute, mut protected: Vec<Ipv4Add
 }
 
 #[cfg(any(windows, test))]
+#[derive(Clone, Debug)]
+struct DnsSnapshot {
+    index: u32,
+    servers: Vec<Ipv4Addr>,
+}
+
+#[cfg(any(windows, test))]
 #[derive(Default)]
 struct OwnedChanges {
     routes: Vec<Route>,
-    dns_index: Option<u32>,
+    dns: Vec<DnsSnapshot>,
+    ipv6_rule: Option<String>,
 }
 
 #[cfg(any(windows, test))]
@@ -210,6 +253,12 @@ impl OwnedChanges {
     fn record(&mut self, route: Route, created: bool) {
         if created {
             self.routes.push(route);
+        }
+    }
+
+    fn record_dns(&mut self, snapshot: DnsSnapshot) {
+        if !self.dns.iter().any(|existing| existing.index == snapshot.index) {
+            self.dns.push(snapshot);
         }
     }
 }
@@ -370,6 +419,15 @@ fn install_sync(
         changes: OwnedChanges::default(),
     };
     let result = (|| -> Result<()> {
+        // ToTS carries IPv4 only. Block IPv6 egress while the tunnel is up
+        // rather than silently letting IPv6-capable applications bypass Wintun.
+        let rule = format!("ToTS-IPv6-Block-{}", std::process::id());
+        guard.changes.ipv6_rule = Some(rule.clone());
+        powershell(&format!(
+            "$service = Get-Service -Name MpsSvc -ErrorAction Stop; if ($service.Status -ne 'Running') {{ throw 'Windows Defender Firewall service is not running; refusing an IPv6-leaking full tunnel' }}; $activeProfiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {{ switch ([string]$_.NetworkCategory) {{ 'DomainAuthenticated' {{ 'Domain' }} 'Private' {{ 'Private' }} default {{ 'Public' }} }} }} | Select-Object -Unique); if ($activeProfiles.Count -eq 0) {{ $activeProfiles = @('Public') }}; $disabled = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Where-Object {{ $activeProfiles -contains $_.Name -and $_.Enabled -ne $true }}); if ($disabled.Count -gt 0) {{ throw 'Windows Firewall is disabled for an active network profile; refusing an IPv6-leaking full tunnel' }}; New-NetFirewallRule -Name '{rule}' -DisplayName 'ToTS IPv6 leak protection' -Group 'ToTS Full Tunnel' -Description 'Temporary IPv6 egress block while the IPv4-only ToTS tunnel is active' -Direction Outbound -Action Block -RemoteAddress '::/0' -Profile Any -Enabled True -PolicyStore PersistentStore -ErrorAction Stop | Out-Null"
+        ))
+        .context("enable temporary IPv6 leak protection")?;
+
         let plan = route_plan(tun_index as u32, underlay, protected);
         let protected_count = plan.iter().filter(|route| route.prefix == 32).count();
         tracing::info!(
@@ -388,18 +446,35 @@ fn install_sync(
                 route.query(), route.destination(), route.index, route.gateway
             ))
             .with_context(|| format!("install IPv4 route {}", route.destination()))?;
-            // An exit code cannot be confused by localized warnings on stdout.
             guard
                 .changes
                 .record(route, output.status.code() == Some(10));
         }
 
-        // Mark before the call so a partially successful DNS update is also reset.
-        guard.changes.dns_index = Some(tun_index as u32);
+        // Verify the active route table instead of treating a successful PowerShell
+        // process exit as proof that Windows accepted the full-tunnel routes.
         powershell(&format!(
-            "Set-DnsClientServerAddress -InterfaceIndex {tun_index} -ServerAddresses @('1.1.1.1','8.8.8.8') -ErrorAction Stop"
+            "Set-NetIPInterface -InterfaceIndex {tun_index} -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 1 -ErrorAction Stop; $required = @('0.0.0.0/1','128.0.0.0/1','0.0.0.0/0'); foreach ($prefix in $required) {{ $found = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -InterfaceIndex {tun_index} -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object {{ $_.NextHop -eq '0.0.0.0' }}); if ($found.Count -eq 0) {{ throw ('missing ToTS route ' + $prefix + ' on interface {tun_index}') }} }}; $adapter = Get-NetAdapter -InterfaceIndex {tun_index} -IncludeHidden -ErrorAction Stop | Select-Object -First 1; if ($adapter.Status -ne 'Up') {{ throw 'ToTS Wintun adapter is not Up' }}"
         ))
-        .context("set TUN DNS servers")?;
+        .context("verify Windows full-tunnel routes")?;
+
+        // Snapshot and replace DNS on both the physical underlay and Wintun. This
+        // prevents Windows' multi-homed DNS client from continuing to query the
+        // router/ISP DNS server on the physical adapter.
+        for index in [underlay.index, tun_index as u32] {
+            let snapshot = snapshot_dns(index)?;
+            guard.changes.record_dns(snapshot);
+            powershell(&format!(
+                "Set-DnsClientServerAddress -InterfaceIndex {index} -AddressFamily IPv4 -ServerAddresses @('1.1.1.1','8.8.8.8') -ErrorAction Stop"
+            ))
+            .with_context(|| format!("set IPv4 DNS servers on interface {index}"))?;
+        }
+        tracing::info!(
+            tun_interface_index = tun_index,
+            physical_interface_index = underlay.index,
+            ipv6_egress_blocked = true,
+            "Windows full-tunnel routes, DNS and IPv6 leak protection are active"
+        );
         Ok(())
     })();
     if let Err(error) = result {
@@ -409,6 +484,32 @@ fn install_sync(
         };
     }
     Ok(guard)
+}
+
+#[cfg(windows)]
+fn snapshot_dns(index: u32) -> Result<DnsSnapshot> {
+    let output = powershell(&format!(
+        "$servers = @(Get-DnsClientServerAddress -InterfaceIndex {index} -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object {{ $_.ServerAddresses }} | Where-Object {{ $_ }}); ConvertTo-Json -InputObject $servers -Compress"
+    ))
+    .with_context(|| format!("snapshot IPv4 DNS servers on interface {index}"))?;
+    let raw = String::from_utf8(output.stdout).context("DNS snapshot was not UTF-8")?;
+    let value: serde_json::Value = serde_json::from_str(raw.trim())
+        .context("parse IPv4 DNS snapshot")?;
+    let entries: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Array(values) => values.iter().collect(),
+        serde_json::Value::String(_) => vec![&value],
+        serde_json::Value::Null => Vec::new(),
+        _ => bail!("unexpected IPv4 DNS snapshot format"),
+    };
+    let mut servers = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let raw = entry.as_str().context("DNS snapshot entry is not a string")?;
+        let ip = raw.parse::<Ipv4Addr>().context("invalid IPv4 DNS server in snapshot")?;
+        if !servers.contains(&ip) {
+            servers.push(ip);
+        }
+    }
+    Ok(DnsSnapshot { index, servers })
 }
 
 #[cfg(windows)]
@@ -487,7 +588,7 @@ mod tests {
     fn protects_unique_endpoints_before_split_defaults() {
         let endpoint: Ipv4Addr = "203.0.113.9".parse().unwrap();
         let routes = route_plan(7, default_route(), vec![endpoint, endpoint]);
-        assert_eq!(routes.len(), 3);
+        assert_eq!(routes.len(), 4);
         assert_eq!(
             routes[0],
             Route {
@@ -507,6 +608,33 @@ mod tests {
             }
         );
         assert_eq!(routes[2].address, Ipv4Addr::new(128, 0, 0, 0));
+        assert_eq!(routes[2].prefix, 1);
+        assert_eq!(routes[3].address, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(routes[3].prefix, 0);
+    }
+
+    #[test]
+    fn full_tunnel_route_plan_covers_all_ipv4_destinations_and_default() {
+        let routes = route_plan(7, default_route(), vec!["203.0.113.8".parse().unwrap()]);
+        assert!(routes.iter().any(|route| route.prefix == 32 && route.index == 12));
+        assert!(routes.iter().any(|route| route.address == Ipv4Addr::UNSPECIFIED && route.prefix == 1 && route.index == 7));
+        assert!(routes.iter().any(|route| route.address == Ipv4Addr::new(128, 0, 0, 0) && route.prefix == 1 && route.index == 7));
+        assert!(routes.iter().any(|route| route.address == Ipv4Addr::UNSPECIFIED && route.prefix == 0 && route.index == 7));
+    }
+
+    #[test]
+    fn owned_dns_snapshot_is_deduplicated_by_interface() {
+        let mut owned = OwnedChanges::default();
+        owned.record_dns(DnsSnapshot {
+            index: 12,
+            servers: vec!["1.1.1.1".parse().unwrap()],
+        });
+        owned.record_dns(DnsSnapshot {
+            index: 12,
+            servers: vec!["8.8.8.8".parse().unwrap()],
+        });
+        assert_eq!(owned.dns.len(), 1);
+        assert_eq!(owned.dns[0].servers, vec!["1.1.1.1".parse::<Ipv4Addr>().unwrap()]);
     }
 
     #[test]
@@ -516,7 +644,8 @@ mod tests {
         owned.record(routes[0], false);
         owned.record(routes[1], true);
         assert_eq!(owned.routes, vec![routes[1]]);
-        assert!(owned.dns_index.is_none());
+        assert!(owned.dns.is_empty());
+        assert!(owned.ipv6_rule.is_none());
     }
 
     #[test]

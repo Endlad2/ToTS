@@ -233,6 +233,7 @@ pub struct WorkerManager {
     slots: Vec<Arc<WorkerSlot>>,
     scheduler: Mutex<FlowScheduler>,
     shutdown_tx: watch::Sender<bool>,
+    ready_epoch_tx: watch::Sender<u64>,
     handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     bootstraps: Arc<BootstrapPool>,
     pub stats: Arc<TrafficStats>,
@@ -255,6 +256,7 @@ impl WorkerManager {
         .context("packet key derivation task failed")??;
         let bootstraps = Arc::new(BootstrapPool::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_epoch_tx, _) = watch::channel(0u64);
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
         let mut slots = Vec::with_capacity(workers);
         let mut receivers = Vec::with_capacity(workers);
@@ -280,6 +282,7 @@ impl WorkerManager {
             slots,
             scheduler: Mutex::new(FlowScheduler::default()),
             shutdown_tx,
+            ready_epoch_tx,
             handles: Mutex::new(Vec::new()),
             bootstraps: bootstraps.clone(),
             stats: Arc::new(TrafficStats::default()),
@@ -303,6 +306,7 @@ impl WorkerManager {
                 receiver,
                 inbound_tx.clone(),
                 shutdown_rx.clone(),
+                manager.ready_epoch_tx.clone(),
                 relay_only,
             )));
         }
@@ -311,6 +315,7 @@ impl WorkerManager {
         let ya_docs_target = target_count(&manager.slots, ProviderName::YaDocs);
         let mail_docs_target = target_count(&manager.slots, ProviderName::MailDocs);
         let cups_target = target_count(&manager.slots, ProviderName::Cups);
+        let max_target = target_count(&manager.slots, ProviderName::Max);
         info!(
             workers,
             workers_vk_target = vk_target,
@@ -318,26 +323,12 @@ impl WorkerManager {
             workers_ya_docs_target = ya_docs_target,
             workers_mail_docs_target = mail_docs_target,
             workers_cups_target = cups_target,
+            workers_max_target = max_target,
             startup_parallelism = STARTUP_PARALLELISM,
             "worker supervisors launched"
         );
         *manager.handles.lock().await = handles;
         Ok((manager, inbound_rx))
-    }
-
-    /// Wait only for the first usable path. Remaining workers connect in the background;
-    /// a slow or unavailable secondary provider must not hold the whole tunnel startup.
-    pub async fn wait_for_any_healthy(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.healthy_count() > 0 {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("no ToTS worker became ready before timeout");
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
     }
 
     pub async fn wait_for_healthy(&self, timeout: Duration) -> Result<()> {
@@ -387,63 +378,88 @@ impl WorkerManager {
 
     pub async fn send_ip(&self, packet: &[u8]) -> Result<()> {
         let reliability = FlowManager::classify(packet);
-        let mut candidates: Vec<u64> = self
-            .slots
-            .iter()
-            .filter(|slot| slot.healthy.load(Ordering::Acquire))
-            .map(|slot| slot.id as u64)
-            .collect();
+        let mut ready = self.ready_epoch_tx.subscribe();
+        let mut shutdown = self.shutdown_tx.subscribe();
 
-        while !candidates.is_empty() {
-            let decision = {
-                let mut scheduler = self.scheduler.lock().await;
-                scheduler.select(packet, &candidates)
-            };
-            let Some(decision) = decision else {
-                break;
-            };
-            let index = decision.worker_id as usize;
-            let Some(slot) = self.slots.get(index) else {
-                candidates.retain(|worker_id| *worker_id != decision.worker_id);
+        loop {
+            if *shutdown.borrow() {
+                anyhow::bail!("worker manager stopped before packet could be sent");
+            }
+            let mut candidates: Vec<u64> = self
+                .slots
+                .iter()
+                .filter(|slot| slot.healthy.load(Ordering::Acquire))
+                .map(|slot| slot.id as u64)
+                .collect();
+
+            if candidates.is_empty() {
+                tokio::select! {
+                    changed = ready.changed() => {
+                        changed.map_err(|_| anyhow!("worker readiness channel closed"))?;
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            anyhow::bail!("worker manager stopped before a worker became healthy");
+                        }
+                    }
+                }
                 continue;
-            };
-            let outbound = OutboundPacket {
-                assoc_id: decision.assoc_id,
-                bytes: packet.to_vec(),
-                reliability,
-                enqueued_at: Instant::now(),
-            };
-            match slot.sender.try_send(outbound) {
-                Ok(()) => {
-                    self.stats
-                        .tun_tx_bytes
-                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Err(mpsc::error::TrySendError::Full(outbound)) => {
-                    self.scheduler
-                        .lock()
-                        .await
-                        .mark_congested(decision.worker_id);
-                    // Keep the current flowlet ordered. Queue saturation lowers this
-                    // worker's future scheduling weight, while this packet applies
-                    // backpressure instead of being sprayed to another path.
-                    slot.sender
-                        .send(outbound)
-                        .await
-                        .map_err(|_| anyhow!("ToTS worker queue closed"))?;
-                    self.stats
-                        .tun_tx_bytes
-                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    slot.healthy.store(false, Ordering::Release);
+            }
+
+            while !candidates.is_empty() {
+                let decision = {
+                    let mut scheduler = self.scheduler.lock().await;
+                    scheduler.select(packet, &candidates)
+                };
+                let Some(decision) = decision else {
+                    anyhow::bail!("no schedulable ToTS worker for packet");
+                };
+                let index = decision.worker_id as usize;
+                let Some(slot) = self.slots.get(index) else {
                     candidates.retain(|worker_id| *worker_id != decision.worker_id);
+                    continue;
+                };
+                let outbound = OutboundPacket {
+                    assoc_id: decision.assoc_id,
+                    bytes: packet.to_vec(),
+                    reliability,
+                    enqueued_at: Instant::now(),
+                };
+                match slot.sender.try_send(outbound) {
+                    Ok(()) => {
+                        self.stats
+                            .tun_tx_bytes
+                            .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                        return Ok(());
+                    }
+                    Err(mpsc::error::TrySendError::Full(outbound)) => {
+                        self.scheduler
+                            .lock()
+                            .await
+                            .mark_congested(decision.worker_id);
+                        // Preserve flow ordering under queue pressure.
+                        match slot.sender.send(outbound).await {
+                            Ok(()) => {
+                                self.stats
+                                    .tun_tx_bytes
+                                    .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                                return Ok(());
+                            }
+                            Err(_) => {
+                                slot.healthy.store(false, Ordering::Release);
+                                candidates.retain(|worker_id| *worker_id != decision.worker_id);
+                            }
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        slot.healthy.store(false, Ordering::Release);
+                        candidates.retain(|worker_id| *worker_id != decision.worker_id);
+                    }
                 }
             }
+            // A worker may have gone away between selection and enqueue. Re-scan,
+            // then sleep on the readiness watch instead of terminating the TUN loop.
         }
-        Err(anyhow!("no healthy ToTS worker"))
     }
 
     pub fn stop(&self) {
@@ -476,11 +492,13 @@ impl WorkerManager {
         let mut ya_docs_workers = 0usize;
         let mut mail_docs_workers = 0usize;
         let mut cups_workers = 0usize;
+        let mut max_workers = 0usize;
         let vk_target = target_count(&self.slots, ProviderName::Vk);
         let jazz_target = target_count(&self.slots, ProviderName::Jazz);
         let ya_docs_target = target_count(&self.slots, ProviderName::YaDocs);
         let mail_docs_target = target_count(&self.slots, ProviderName::MailDocs);
         let cups_target = target_count(&self.slots, ProviderName::Cups);
+        let max_target = target_count(&self.slots, ProviderName::Max);
         let mut cwnd_bytes = 0usize;
         let mut inflight_bytes = 0usize;
         let mut rtt_min_us = u128::MAX;
@@ -556,6 +574,7 @@ impl WorkerManager {
                     Some(ProviderName::YaDocs) => ya_docs_workers += 1,
                     Some(ProviderName::MailDocs) => mail_docs_workers += 1,
                     Some(ProviderName::Cups) => cups_workers += 1,
+                    Some(ProviderName::Max) => max_workers += 1,
                     _ => {}
                 }
             }
@@ -571,11 +590,13 @@ impl WorkerManager {
             workers_ya_docs = ya_docs_workers,
             workers_mail_docs = mail_docs_workers,
             workers_cups = cups_workers,
+            workers_max = max_workers,
             workers_vk_target = vk_target,
             workers_jazz_target = jazz_target,
             workers_ya_docs_target = ya_docs_target,
             workers_mail_docs_target = mail_docs_target,
             workers_cups_target = cups_target,
+            workers_max_target = max_target,
             turn_credentials_seen = self.bootstraps.credential_count(),
             cwnd_bytes,
             inflight_bytes,
@@ -630,6 +651,7 @@ async fn worker_supervisor(
     mut outbound_rx: mpsc::Receiver<OutboundPacket>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     mut shutdown: watch::Receiver<bool>,
+    ready_epoch_tx: watch::Sender<u64>,
     relay_only: bool,
 ) {
     let engine = match SessionEngine::new_with_crypto(cfg.clone(), crypto) {
@@ -694,6 +716,7 @@ async fn worker_supervisor(
                 } = connected;
                 *slot.route_ips.write().await = route_ips;
                 slot.healthy.store(true, Ordering::Release);
+                ready_epoch_tx.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
                 info!(
                     worker = slot.id,
                     provider = provider.as_str(),
@@ -849,18 +872,32 @@ async fn connect_path(
     };
     let peer_ip = cfg.peer_ip()?;
     let mut candidates: Vec<Arc<dyn DatagramPath>> = Vec::new();
-    if let Some(path) = provider.connect_native(&data).await? {
+    let native_path = match provider.connect_native(&data).await {
+        Ok(path) => path,
+        Err(error) => {
+            if provider_name != ProviderName::Vk {
+                let _ = provider.cleanup(&data, &bootstrap).await;
+            }
+            return Err(error.into());
+        }
+    };
+    if let Some(path) = native_path {
         candidates.push(path);
     } else {
         if !relay_only {
-            let direct: Arc<dyn DatagramPath> = Arc::new(
-                DirectUdpPath::connect(
-                    format!("{}-webrtc", provider_name.as_str()),
-                    SocketAddr::new(peer_ip, cfg.webrtc_port),
-                )
-                .await?,
-            );
-            candidates.push(direct);
+            match DirectUdpPath::connect(
+                format!("{}-webrtc", provider_name.as_str()),
+                SocketAddr::new(peer_ip, cfg.webrtc_port),
+            )
+            .await
+            {
+                Ok(path) => candidates.push(Arc::new(path)),
+                Err(error) => warn!(
+                    provider = provider_name.as_str(),
+                    %error,
+                    "direct UDP candidate unavailable; trying provider TURN"
+                ),
+            }
         }
         let allocations: Vec<_> = bootstrap
             .turn
@@ -1381,6 +1418,7 @@ mod tests {
     #[tokio::test]
     async fn pool_readiness_waits_for_every_requested_worker() {
         let (shutdown_tx, _) = watch::channel(false);
+        let (ready_epoch_tx, _) = watch::channel(0u64);
         let slots = (0..20)
             .map(|id| {
                 let (sender, _) = mpsc::channel(1);
@@ -1414,6 +1452,7 @@ mod tests {
             slots,
             scheduler: Mutex::new(FlowScheduler::default()),
             shutdown_tx,
+            ready_epoch_tx,
             handles: Mutex::new(Vec::new()),
             stats: Arc::new(TrafficStats::default()),
             bootstraps: Arc::new(BootstrapPool::new()),
@@ -1429,6 +1468,60 @@ mod tests {
             .wait_for_healthy(Duration::from_millis(10))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_ip_waits_for_first_healthy_worker() {
+        let (shutdown_tx, _) = watch::channel(false);
+        let (ready_epoch_tx, _) = watch::channel(0u64);
+        let (sender, mut receiver) = mpsc::channel(1);
+        let slot = Arc::new(WorkerSlot {
+            id: 0,
+            preferred_provider: ProviderName::Vk,
+            healthy: AtomicBool::new(false),
+            provider: RwLock::new(None),
+            sender,
+            route_ips: RwLock::new(Vec::new()),
+            tx_packets: AtomicU64::new(0),
+            rx_packets: AtomicU64::new(0),
+            rx_replays: AtomicU64::new(0),
+            receive: ReceiveDiagnostics::default(),
+            recovery: Arc::new(Mutex::new(RecoveryController::default())),
+        });
+        let manager = Arc::new(WorkerManager {
+            cfg: ConnectionConfig {
+                version: 1,
+                peer: "127.0.0.1".into(),
+                webrtc_port: 1,
+                turn_port: 2,
+                password: "test-password".into(),
+                device_id: uuid::Uuid::new_v4(),
+                provider: ProviderName::Vk,
+                provider_data: serde_json::json!({"vk":{"vk_call_links":["test"]}}),
+                mtu: 1200,
+            },
+            slots: vec![slot.clone()],
+            scheduler: Mutex::new(FlowScheduler::default()),
+            shutdown_tx,
+            ready_epoch_tx: ready_epoch_tx.clone(),
+            handles: Mutex::new(Vec::new()),
+            bootstraps: Arc::new(BootstrapPool::new()),
+            stats: Arc::new(TrafficStats::default()),
+        });
+
+        let packet = vec![0x45; 20];
+        let send_task = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.send_ip(&packet).await })
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(receiver.try_recv().is_err(), "packet must wait while no worker is healthy");
+
+        slot.healthy.store(true, Ordering::Release);
+        ready_epoch_tx.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        send_task.await.unwrap().unwrap();
+        let outbound = receiver.recv().await.expect("ready worker receives packet");
+        assert_eq!(outbound.bytes, vec![0x45; 20]);
     }
 
     #[test]

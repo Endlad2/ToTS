@@ -53,12 +53,19 @@ struct Args {
     /// Check that all requested encrypted workers are healthy without opening a TUN device.
     #[arg(long)]
     probe_only: bool,
-    /// Route all IPv4 Internet traffic through the TUN (Windows).
+    /// Route all supported Internet traffic through the TUN (enabled by default on Windows).
     #[arg(long)]
     tun_default_route: bool,
+    /// Keep Windows system routes unchanged (disables automatic full-tunnel routing).
+    #[arg(long)]
+    no_tun_default_route: bool,
     /// Stop gracefully after this many seconds (for unattended testing).
     #[arg(long)]
     run_for_seconds: Option<u64>,
+}
+
+fn full_tunnel_enabled(args: &Args, is_windows: bool) -> bool {
+    args.tun_default_route || (is_windows && !args.no_tun_default_route)
 }
 
 fn config_from_args(a: &Args) -> Result<ConnectionConfig> {
@@ -101,26 +108,40 @@ async fn main() -> Result<()> {
         args.workers_percent.as_deref(),
     )
     .await?;
-    if let Err(error) = manager
-        .wait_for_any_healthy(Duration::from_secs(45))
-        .await
-    {
-        manager.shutdown().await;
-        return Err(error);
-    }
-    info!(
-        workers = manager.healthy_count(),
-        workers_target = manager.desired_count(),
-        virtual_ip = %cfg.virtual_ipv4(),
-        "ToTS worker pool ready"
-    );
     if args.probe_only {
+        if let Err(error) = manager
+            .wait_for_healthy(Duration::from_secs((45 + args.n as u64 * 5).min(300)))
+            .await
+        {
+            manager.shutdown().await;
+            return Err(error);
+        }
         manager.log_status();
         manager.shutdown().await;
         return Ok(());
     }
+    info!(
+        workers_healthy = manager.healthy_count(),
+        workers_target = manager.desired_count(),
+        virtual_ip = %cfg.virtual_ipv4(),
+        "ToTS worker supervisors launched; full worker-pool health is not a startup gate"
+    );
 
-    let underlay = if args.tun_default_route {
+    let full_tunnel = full_tunnel_enabled(&args, cfg!(windows));
+    if full_tunnel {
+        info!(
+            "waiting for one healthy transport path per selected provider before switching Windows routes"
+        );
+        if let Err(error) = manager
+            .wait_for_route_representatives(Duration::from_secs(90))
+            .await
+        {
+            manager.shutdown().await;
+            return Err(error.context("no initial transport routes became ready; system routes were left unchanged"));
+        }
+    }
+
+    let underlay = if full_tunnel {
         match routes::capture_underlay().await {
             Ok(underlay) => Some(underlay),
             Err(error) => {
@@ -150,7 +171,17 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    info!(workers = manager.healthy_count(), "ToTS TUN connected");
+    if routes.is_some() {
+        info!(
+            workers = manager.healthy_count(),
+            "ToTS Windows full-tunnel connected; system IPv4 routes point to Wintun"
+        );
+    } else {
+        info!(
+            workers = manager.healthy_count(),
+            "ToTS TUN connected without changing system default routes"
+        );
+    }
 
     let status_manager = Arc::clone(&manager);
     let status_task = tokio::spawn(async move {
@@ -232,8 +263,16 @@ mod tests {
         ])
         .unwrap();
         assert!(args.relay_only && args.probe_only && args.tun_default_route);
+        assert!(full_tunnel_enabled(&args, true));
         assert_eq!(args.run_for_seconds, Some(30));
         assert_eq!(args.n, 12);
         assert_eq!(args.workers_percent.as_deref(), Some(r#"{"jazz":"50","vk":"50"}"#));
+
+        let defaults = Args::try_parse_from(["tots-client"]).unwrap();
+        assert!(full_tunnel_enabled(&defaults, true));
+        assert!(!full_tunnel_enabled(&defaults, false));
+
+        let split = Args::try_parse_from(["tots-client", "--no-tun-default-route"]).unwrap();
+        assert!(!full_tunnel_enabled(&split, true));
     }
 }

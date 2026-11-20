@@ -34,3 +34,5 @@ uuid.workspace = true
 yawc.workspace = true
 argon2 = "0.5"
 jazz-session = { path = "../Providers/jazz-session" }
+kolibri-net = { git = "https://github.com/KometTeam/kolibri", package = "kolibri-net", version = "0.1.4" }
+rmpv = "1"

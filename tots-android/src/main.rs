@@ -97,28 +97,27 @@ async fn main() -> Result<()> {
         args.workers_percent.as_deref(),
     )
     .await?;
-    if let Err(error) = manager
-        .wait_for_any_healthy(Duration::from_secs(45))
-        .await
-    {
-        manager.shutdown().await;
-        return Err(error);
-    }
-
-    let route_endpoint_count = manager.route_ips().await.len();
-    info!(
-        workers = manager.healthy_count(),
-        workers_target = manager.desired_count(),
-        route_endpoints = route_endpoint_count,
-        virtual_ip = %cfg.virtual_ipv4(),
-        "ToTS Android worker pool ready"
-    );
-
     if args.probe_only {
+        if let Err(error) = manager
+            .wait_for_healthy(Duration::from_secs((45 + args.n as u64 * 5).min(300)))
+            .await
+        {
+            manager.shutdown().await;
+            return Err(error);
+        }
         manager.log_status();
         manager.shutdown().await;
         return Ok(());
     }
+
+    let route_endpoint_count = manager.route_ips().await.len();
+    info!(
+        workers_healthy = manager.healthy_count(),
+        workers_target = manager.desired_count(),
+        route_endpoints = route_endpoint_count,
+        virtual_ip = %cfg.virtual_ipv4(),
+        "ToTS Android worker supervisors launched; TUN startup is not gated on worker health"
+    );
 
     let mut tun = match tun_io::open(args.tun_fd).await {
         Ok(tun) => tun,
@@ -170,7 +169,17 @@ async fn main() -> Result<()> {
 }
 
 async fn shutdown_signal() -> Result<()> {
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
+    {
+        // Android stops native VPN processes with SIGTERM. Avoid installing the
+        // console Ctrl+C handler there: it is not a meaningful lifecycle signal
+        // for a VpnService child process.
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("install Android SIGTERM handler")?;
+        terminate.recv().await;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "android")))]
     {
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .context("install SIGTERM handler")?;

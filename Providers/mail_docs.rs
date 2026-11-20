@@ -26,6 +26,7 @@ struct DocInfo {
     token: String,
     doc_key: String,
     ws_url: String,
+    origin: String,
     file_type: String,
     doc_url: String,
     title: String,
@@ -176,7 +177,7 @@ async fn connect_and_serve(
     let mut request = HttpRequestBuilder::new()
         .header("User-Agent", USER_AGENT)
         .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Origin", "https://docs.datacloudmail.ru");
+        .header("Origin", info.origin.as_str());
     if !info.cookie.is_empty() {
         request = request.header("Cookie", info.cookie.as_str());
     }
@@ -206,7 +207,7 @@ async fn connect_and_serve(
             "type":"auth",
             "docid":info.doc_key,
             "documentCallbackUrl":info.callback_url,
-            "token":"fghhfgsjdgfjs",
+            "token":info.token.clone(),
             "user":{"id":user_id,"username":random_user_id(),"indexUser":-1},
             "editorType":0,
             "lastOtherSaveTime":-1,
@@ -282,7 +283,9 @@ async fn connect_and_serve(
                         }
                         for payload in cursor_payloads(text.as_ref()) {
                             if let Ok(bytes) = STANDARD.decode(payload) {
-                                let _ = endpoint.inbound.try_send(bytes);
+                                endpoint.inbound.send(bytes).await.map_err(|_| {
+                                    Error::Transport("mail-docs inbound queue closed".into())
+                                })?;
                             }
                         }
                     }
@@ -413,6 +416,17 @@ async fn fetch_doc_info(client: &Client, jar: Arc<Jar>, weblink: &str) -> Result
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Error::Provider("mail-docs document key missing".into()))?;
+    let api_url = url::Url::parse(api).map_err(|e| provider_error("mail-docs API URL", e))?;
+    let origin_scheme = match api_url.scheme() {
+        "https" | "wss" => "https",
+        "http" | "ws" => "http",
+        _ => return Err(Error::Provider("mail-docs API URL has an unsupported scheme".into())),
+    };
+    let api_host = api_url
+        .host_str()
+        .ok_or_else(|| Error::Provider("mail-docs API URL has no host".into()))?;
+    let api_port = api_url.port().map(|port| format!(":{port}")).unwrap_or_default();
+    let origin = format!("{origin_scheme}://{api_host}{api_port}");
     let ws_base = if let Some(rest) = api.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = api.strip_prefix("http://") {
@@ -430,12 +444,27 @@ async fn fetch_doc_info(client: &Client, jar: Arc<Jar>, weblink: &str) -> Result
         token: token.to_owned(),
         doc_key: doc_key.to_owned(),
         ws_url,
+        origin,
         file_type: document.get("fileType").and_then(Value::as_str).unwrap_or("docx").to_owned(),
-        doc_url: document.get("url").and_then(Value::as_str).unwrap_or("").to_owned(),
+        doc_url: document
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("https://cloud.mail.ru/public/{weblink}")),
         title: document.get("title").and_then(Value::as_str).unwrap_or("ToTS").to_owned(),
         permissions: document.get("permissions").cloned().unwrap_or_else(|| json!({})),
         callback_url: editor.get("callbackUrl").and_then(Value::as_str).unwrap_or("").to_owned(),
-        editor_user_id: editor.get("user").and_then(Value::as_object).and_then(|user| user.get("id")).and_then(Value::as_str).unwrap_or("").to_owned(),
+        editor_user_id: editor
+            .get("user")
+            .and_then(Value::as_object)
+            .and_then(|user| user.get("id"))
+            .map(|id| match id {
+                Value::String(value) => value.clone(),
+                Value::Number(value) => value.to_string(),
+                _ => String::new(),
+            })
+            .unwrap_or_default(),
         cookie,
     })
 }

@@ -1095,6 +1095,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn max_provider_data_is_normalized_without_rewriting_the_token() {
+        let direct = normalize_provider_data(
+            ProviderName::Max,
+            json!({"access_token":"max-secret"}),
+        )
+        .unwrap();
+        assert_eq!(direct["max"]["access_token"], "max-secret");
+
+        let keyed = normalize_provider_data(
+            ProviderName::Max,
+            json!({"max":{"access_token":"max-secret"}}),
+        )
+        .unwrap();
+        assert_eq!(keyed, direct);
+    }
+
     #[tokio::test]
     async fn matching_active_pool_restores_all_bridges() {
         let fixture = Fixture::new().await;

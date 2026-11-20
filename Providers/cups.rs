@@ -81,7 +81,6 @@ pub fn worker_room_data(data: &Value, worker_id: usize) -> Result<Value> {
         let room_id = room
             .get("room_id")
             .and_then(Value::as_str)
-            .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Error::Provider("cups worker room has no room_id".into()))?;
         return Ok(json!({"room_id":room_id}));
@@ -165,10 +164,15 @@ async fn run(
         if *endpoint.shutdown.borrow() {
             return Ok(());
         }
-        let room_url = requested_room
-            .as_ref()
-            .map(|room| format!("{BASE_ROOM_URL}?room={room}"))
-            .unwrap_or_else(|| BASE_ROOM_URL.to_owned());
+        let room_url = match requested_room.as_deref() {
+            Some(room) => {
+                let mut url = url::Url::parse(BASE_ROOM_URL)
+                    .map_err(|error| provider_error("cups base room URL", error))?;
+                url.query_pairs_mut().append_pair("room", room);
+                url.to_string()
+            }
+            None => BASE_ROOM_URL.to_owned(),
+        };
         let auth = match authorize(&client, jar.clone(), &room_url).await {
             Ok(auth) => auth,
             Err(error) => {
@@ -250,8 +254,18 @@ async fn authorize(client: &Client, jar: Arc<Jar>, room_url: &str) -> Result<Aut
         .ok_or_else(|| Error::Provider("cups connection token missing".into()))?;
     let conn_url = meta_content(&html, "centrifuge-connection-url")
         .ok_or_else(|| Error::Provider("cups connection URL missing".into()))?;
+    let conn_url = final_url
+        .join(&conn_url)
+        .or_else(|_| url::Url::parse(&conn_url))
+        .map_err(|e| provider_error("cups connection URL", e))?
+        .to_string();
     let sub_url = meta_content(&html, "centrifuge-subscription-token-url")
         .ok_or_else(|| Error::Provider("cups subscription URL missing".into()))?;
+    let sub_url = final_url
+        .join(&sub_url)
+        .or_else(|_| url::Url::parse(&sub_url))
+        .map_err(|e| provider_error("cups subscription URL", e))?
+        .to_string();
     let cookie = jar
         .cookies(&final_url)
         .and_then(|value| value.to_str().ok().map(str::to_owned))
@@ -305,14 +319,7 @@ async fn connect_and_serve(
     pending: &mut Option<Vec<u8>>,
     ready: &mut Option<oneshot::Sender<std::result::Result<String, String>>>,
 ) -> Result<()> {
-    let ws_base = if let Some(rest) = auth.conn_url.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = auth.conn_url.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        auth.conn_url.clone()
-    };
-    let ws_url = format!("{}/websocket", ws_base.trim_end_matches('/'));
+    let ws_url = cups_websocket_url(&auth.conn_url)?;
     let mut request = ws_url
         .into_client_request()
         .map_err(|e| provider_error("cups WebSocket request", e))?;
@@ -391,8 +398,8 @@ async fn connect_and_serve(
             }
             incoming = read.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(text))) => handle_cups_frame(text.as_bytes(), &auth, endpoint, &socket_tx).await,
-                    Some(Ok(Message::Binary(data))) => handle_cups_frame(&data, &auth, endpoint, &socket_tx).await,
+                    Some(Ok(Message::Text(text))) => handle_cups_frame(text.as_bytes(), &auth, endpoint, &socket_tx).await?,
+                    Some(Ok(Message::Binary(data))) => handle_cups_frame(&data, &auth, endpoint, &socket_tx).await?,
                     Some(Ok(Message::Close(_))) | None => return Err(Error::Transport("cups WebSocket closed".into())),
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(provider_error("cups WebSocket read", error)),
@@ -500,11 +507,14 @@ async fn handle_cups_frame(
     auth: &Auth,
     endpoint: &ChannelEndpoint,
     socket_tx: &tokio::sync::mpsc::Sender<Message>,
-) {
+) -> Result<()> {
     for line in bytes.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line == b"{}" {
-            let _ = socket_tx.send(Message::Text("{}".into())).await;
+            socket_tx
+                .send(Message::Text("{}".into()))
+                .await
+                .map_err(|_| Error::Transport("cups writer stopped".into()))?;
             continue;
         }
         let Ok(value) = serde_json::from_slice::<Value>(line) else { continue; };
@@ -540,8 +550,13 @@ async fn handle_cups_frame(
         if len == 0 || len + 2 > decoded.len() {
             continue;
         }
-        let _ = endpoint.inbound.try_send(decoded[2..2 + len].to_vec());
+        endpoint
+            .inbound
+            .send(decoded[2..2 + len].to_vec())
+            .await
+            .map_err(|_| Error::Transport("cups inbound queue closed".into()))?;
     }
+    Ok(())
 }
 
 fn pack_numbers(bytes: &[u8]) -> Vec<u64> {
@@ -575,34 +590,49 @@ fn unpack_numbers(numbers: &[u64]) -> Vec<u8> {
 }
 
 fn meta_content(html: &str, name: &str) -> Option<String> {
-    let needle = format!("name=\"{name}\"");
-    let pos = html.find(&needle)?;
+    let double_quoted = format!("name=\"{name}\"");
+    let single_quoted = format!("name='{name}'");
+    let pos = html
+        .find(&double_quoted)
+        .or_else(|| html.find(&single_quoted))?;
     let tag_start = html[..pos].rfind("<meta")?;
     let tag_end = html[pos..].find('>')? + pos;
     let tag = &html[tag_start..=tag_end];
-    attr_value(tag, "content").map(str::to_owned)
+    attr_value_any(tag, "content").map(str::to_owned)
 }
 
 fn extract_html_uuid(html: &str, attr: &str) -> Option<String> {
-    let needle = format!("{attr}=\"");
-    let pos = html.find(&needle)?;
-    let value = &html[pos + needle.len()..];
-    let uuid = value.find("uuid&quot;")? + "uuid&quot;".len();
-    let after_uuid = &value[uuid..];
-    let colon = after_uuid.find(':')? + 1;
-    let after_colon = after_uuid[colon..].trim_start();
-    let quote = after_colon.find("&quot;")? + "&quot;".len();
-    let rest = &after_colon[quote..];
-    let end = rest.find("&quot;")?;
-    Some(rest[..end].to_owned())
+    let value = attr_value_any(html, attr)?;
+    let (after_key, encoded_quote) = if let Some(index) = value.find("uuid&quot;") {
+        (&value[index + "uuid&quot;".len()..], true)
+    } else if let Some(index) = value.find("\"uuid\"") {
+        (&value[index + "\"uuid\"".len()..], false)
+    } else {
+        return None;
+    };
+    let colon = after_key.find(':')? + 1;
+    let after_colon = after_key[colon..].trim_start();
+    let rest = if encoded_quote {
+        after_colon.strip_prefix("&quot;")?
+    } else {
+        after_colon.strip_prefix('\"')?
+    };
+    let end = if encoded_quote { rest.find("&quot;")? } else { rest.find('\"')? };
+    let id = rest[..end].to_owned();
+    uuid::Uuid::parse_str(&id).ok()?;
+    Some(id)
 }
 
-fn attr_value<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
-    let needle = format!("{attr}=\"");
-    let start = tag.find(&needle)? + needle.len();
-    let rest = &tag[start..];
-    let end = rest.find('"')?;
-    Some(&rest[..end])
+fn attr_value_any<'a>(html: &'a str, attr: &str) -> Option<&'a str> {
+    for quote in ['\"', '\''] {
+        let needle = format!("{attr}={quote}");
+        if let Some(start) = html.find(&needle) {
+            let rest = &html[start + needle.len()..];
+            let end = rest.find(quote)?;
+            return Some(&rest[..end]);
+        }
+    }
+    None
 }
 
 fn origin_of(raw: &str) -> Result<String> {
@@ -611,5 +641,85 @@ fn origin_of(raw: &str) -> Result<String> {
         .host_str()
         .ok_or_else(|| Error::Provider("cups URL has no host".into()))?;
     let port = url.port().map(|port| format!(":{port}")).unwrap_or_default();
-    Ok(format!("{}://{}{}", url.scheme(), host, port))
+    let scheme = match url.scheme() {
+        "https" | "wss" => "https",
+        "http" | "ws" => "http",
+        _ => return Err(Error::Provider("cups URL has an unsupported scheme".into())),
+    };
+    Ok(format!("{scheme}://{host}{port}"))
+}
+
+fn cups_websocket_url(raw: &str) -> Result<String> {
+    let mut url = url::Url::parse(raw).map_err(|e| provider_error("invalid cups connection URL", e))?;
+    let scheme = match url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        "wss" => "wss",
+        "ws" => "ws",
+        _ => return Err(Error::Provider("cups connection URL has an unsupported scheme".into())),
+    };
+    url.set_scheme(scheme)
+        .map_err(|_| Error::Provider("cups connection URL scheme could not be normalized".into()))?;
+    let path = url.path().trim_end_matches('/');
+    if !path.ends_with("/websocket") {
+        url.set_path(&format!("{path}/websocket"));
+    }
+    Ok(url.to_string())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_header_uses_http_scheme_for_websocket_urls() {
+        assert_eq!(
+            origin_of("wss://centrifugo.example.com/connection/websocket").unwrap(),
+            "https://centrifugo.example.com"
+        );
+        assert_eq!(
+            origin_of("ws://centrifugo.example.com:8080/connection/websocket").unwrap(),
+            "http://centrifugo.example.com:8080"
+        );
+    }
+
+    #[test]
+    fn websocket_suffix_is_not_duplicated() {
+        assert_eq!(
+            cups_websocket_url("https://centrifugo.example.com/connection/websocket").unwrap(),
+            "wss://centrifugo.example.com/connection/websocket"
+        );
+        assert_eq!(
+            cups_websocket_url("https://centrifugo.example.com/connection/").unwrap(),
+            "wss://centrifugo.example.com/connection/websocket"
+        );
+    }
+
+    #[test]
+    fn meta_content_accepts_single_and_double_quoted_attributes() {
+        assert_eq!(
+            meta_content(r#"<meta name="centrifuge-connection-url" content="/connection">"#, "centrifuge-connection-url").as_deref(),
+            Some("/connection")
+        );
+        assert_eq!(
+            meta_content("<meta name='centrifuge-connection-url' content='/connection'>", "centrifuge-connection-url").as_deref(),
+            Some("/connection")
+        );
+    }
+
+    #[test]
+    fn room_uuid_parser_handles_encoded_and_raw_attributes() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let encoded = format!(r#"<div data-room="{{&quot;uuid&quot;: &quot;{uuid}&quot;}}">"#);
+        let raw = format!(r#"<div data-room='{{"uuid":"{uuid}"}}'>"#);
+        assert_eq!(extract_html_uuid(&encoded, "data-room").as_deref(), Some(uuid));
+        assert_eq!(extract_html_uuid(&raw, "data-room").as_deref(), Some(uuid));
+    }
+
+    #[test]
+    fn packed_cups_numbers_round_trip_full_six_byte_words() {
+        let bytes = (0u8..18).collect::<Vec<_>>();
+        assert_eq!(unpack_numbers(&pack_numbers(&bytes)), bytes);
+    }
 }

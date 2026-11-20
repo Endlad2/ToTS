@@ -67,6 +67,7 @@ impl Db {
                 ProviderName::YaDocs => "ya-docs",
                 ProviderName::MailDocs => "mail-docs",
                 ProviderName::Cups => "cups",
+                ProviderName::Max => "max",
                 ProviderName::Unknown => "unknown",
             };
             c.execute(
@@ -119,6 +120,7 @@ impl Db {
                 "ya-docs" => ProviderName::YaDocs,
                 "mail-docs" => ProviderName::MailDocs,
                 "cups" => ProviderName::Cups,
+                "max" => ProviderName::Max,
                 _ => ProviderName::Unknown,
             };
             let provider_data = serde_json::from_str(&pd)?;
