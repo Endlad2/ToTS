@@ -218,11 +218,41 @@ fn validate_provider(provider: ProviderName, data: &Value) -> Result<()> {
         ProviderName::MailDocs => validate_url_provider("mail-docs", data)?,
         ProviderName::Cups => {
             let room = data.get("room_id").and_then(Value::as_str).unwrap_or("").trim();
-            let rooms = data.get("worker_rooms").and_then(Value::as_array);
-            if room.is_empty() && rooms.is_none_or(|rooms| rooms.is_empty()) {
+            if let Some(value) = data.get("worker_rooms") {
+                let rooms = value.as_array().ok_or_else(|| {
+                    Error::Config("provider_data.cups.worker_rooms must be an array".into())
+                })?;
+                if rooms.is_empty() || rooms.len() > 50 {
+                    return Err(Error::Config(
+                        "provider_data.cups.worker_rooms must contain 1..=50 rooms".into(),
+                    ));
+                }
+                for (index, entry) in rooms.iter().enumerate() {
+                    let id = entry.get("room_id").and_then(Value::as_str).unwrap_or("").trim();
+                    if id.is_empty() {
+                        return Err(Error::Config(format!(
+                            "provider_data.cups.worker_rooms[{index}].room_id is required"
+                        )));
+                    }
+                }
+                if let Some(count) = data.get("worker_count") {
+                    if count.as_u64() != Some(rooms.len() as u64) {
+                        return Err(Error::Config(
+                            "provider_data.cups.worker_count must match worker_rooms length".into(),
+                        ));
+                    }
+                }
+            } else if room.is_empty() {
                 return Err(Error::Config(
                     "provider_data.cups requires server-issued room_id/worker_rooms".into(),
                 ));
+            }
+            if let Some(count) = data.get("worker_count") {
+                if count.as_u64().is_none_or(|n| !(1..=50).contains(&n)) {
+                    return Err(Error::Config(
+                        "provider_data.cups.worker_count must be 1..=50".into(),
+                    ));
+                }
             }
         }
         ProviderName::Unknown => return Err(Error::Config("unknown provider".into())),
@@ -296,6 +326,25 @@ mod tests {
             d.provider_order(),
             vec![ProviderName::Vk, ProviderName::Jazz]
         );
+    }
+
+    #[test]
+    fn cups_worker_rooms_must_be_well_formed_and_match_count() {
+        let mut cfg = base(serde_json::json!({
+            "cups": {
+                "worker_rooms": [{"room_id":"room-a"},{"room_id":"room-b"}],
+                "worker_count": 2
+            }
+        }));
+        cfg.provider = ProviderName::Cups;
+        cfg.validate().unwrap();
+
+        cfg.provider_data["cups"]["worker_rooms"][1]["room_id"] = Value::String("  ".into());
+        assert!(cfg.validate().is_err());
+
+        cfg.provider_data["cups"]["worker_rooms"][1]["room_id"] = Value::String("room-b".into());
+        cfg.provider_data["cups"]["worker_count"] = Value::from(3);
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

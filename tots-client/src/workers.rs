@@ -325,6 +325,21 @@ impl WorkerManager {
         Ok((manager, inbound_rx))
     }
 
+    /// Wait only for the first usable path. Remaining workers connect in the background;
+    /// a slow or unavailable secondary provider must not hold the whole tunnel startup.
+    pub async fn wait_for_any_healthy(&self, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.healthy_count() > 0 {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("no ToTS worker became ready before timeout");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn wait_for_healthy(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {

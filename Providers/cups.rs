@@ -81,6 +81,7 @@ pub fn worker_room_data(data: &Value, worker_id: usize) -> Result<Value> {
         let room_id = room
             .get("room_id")
             .and_then(Value::as_str)
+            .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Error::Provider("cups worker room has no room_id".into()))?;
         return Ok(json!({"room_id":room_id}));

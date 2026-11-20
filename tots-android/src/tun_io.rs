@@ -62,7 +62,9 @@ where
         loop {
             let n = rd.read(&mut buf).await?;
             if n == 0 {
-                break;
+                return Err(anyhow::anyhow!(
+                    "Android TUN descriptor reached EOF; VpnService closed the interface"
+                ));
             }
             tx_manager.send_ip(&buf[..n]).await?;
         }

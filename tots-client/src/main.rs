@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
     )
     .await?;
     if let Err(error) = manager
-        .wait_for_healthy(Duration::from_secs((45 + args.n as u64 * 5).min(300)))
+        .wait_for_any_healthy(Duration::from_secs(45))
         .await
     {
         manager.shutdown().await;
