@@ -68,7 +68,7 @@ The server uses `10.77.0.0/16` for virtual addresses. `scripts/setup-network.sh`
 
 ## Windows client
 
-Extract the delivery archive and keep `wintun.dll` beside the Windows `tots-client.exe`. Run TUN operations as Administrator. Windows now enables full-tunnel routing by default: after one healthy route-ready worker per selected provider group is established, ToTS installs protected `/32` transport routes, both IPv4 `/1` routes and an IPv4 default route through Wintun. It snapshots/restores DNS on the physical and TUN interfaces, and blocks IPv6 egress while the IPv4-only tunnel is active so IPv6-capable applications cannot bypass it.
+Extract the delivery archive and keep `wintun.dll` beside the Windows `tots-client.exe`. Run TUN operations as Administrator. Windows now enables full-tunnel routing by default: after one healthy route-ready worker per selected provider group is established, ToTS installs protected `/32` transport routes, both IPv4 `/1` routes and an IPv4 default route through Wintun. It snapshots/restores DNS on the physical and TUN interfaces, and blocks IPv6 Internet egress with Windows Firewall's `Internet6` address keyword while the IPv4-only tunnel is active so IPv6-capable applications cannot bypass it.
 
 ```powershell
 .\tots-client.exe --config 'tots://...' --n 10 --relay-only

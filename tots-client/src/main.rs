@@ -174,7 +174,9 @@ async fn main() -> Result<()> {
     if routes.is_some() {
         info!(
             workers = manager.healthy_count(),
-            "ToTS Windows full-tunnel connected; system IPv4 routes point to Wintun"
+            workers_target = manager.desired_count(),
+            full_tunnel = true,
+            "ToTS TUN connected; Windows full-tunnel routes point to Wintun"
         );
     } else {
         info!(

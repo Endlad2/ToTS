@@ -395,6 +395,48 @@ fn validate_underlay(tun_index: u32, underlay: UnderlayRoute) -> Result<()> {
     Ok(())
 }
 
+/// Build the Windows Defender Firewall rule used to prevent IPv6 Internet
+/// traffic from bypassing this IPv4-only tunnel. NetSecurity's address filter
+/// accepts the `Internet6` keyword; `::/0` is not accepted consistently by
+/// Windows Firewall's address-prefix parser and fails on some Windows builds.
+#[cfg(any(windows, test))]
+fn ipv6_block_rule_script(rule: &str) -> String {
+    // The rule name is generated locally from the process id and contains only
+    // ASCII letters, digits and hyphens. Keep the PowerShell body raw so its
+    // braces are not interpreted as Rust format placeholders.
+    let template = r#"
+$service = Get-Service -Name MpsSvc -ErrorAction Stop
+if ($service.Status -ne 'Running') {
+    throw 'Windows Defender Firewall service is not running; refusing an IPv6-leaking full tunnel'
+}
+$activeProfiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {
+    switch ([string]$_.NetworkCategory) {
+        'DomainAuthenticated' { 'Domain' }
+        'Private' { 'Private' }
+        default { 'Public' }
+    }
+} | Select-Object -Unique)
+if ($activeProfiles.Count -eq 0) { $activeProfiles = @('Public') }
+$disabled = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Where-Object {
+    $activeProfiles -contains $_.Name -and $_.Enabled -ne $true
+})
+if ($disabled.Count -gt 0) {
+    throw 'Windows Firewall is disabled for an active network profile; refusing an IPv6-leaking full tunnel'
+}
+$stale = Get-NetFirewallRule -Name '__TOTS_RULE__' -ErrorAction SilentlyContinue
+if ($null -ne $stale) {
+    Remove-NetFirewallRule -InputObject $stale -Confirm:$false -ErrorAction Stop | Out-Null
+}
+New-NetFirewallRule -Name '__TOTS_RULE__' -DisplayName 'ToTS IPv6 leak protection' -Group 'ToTS Full Tunnel' -Description 'Temporary IPv6 Internet egress block while the IPv4-only ToTS tunnel is active' -Direction Outbound -Action Block -RemoteAddress 'Internet6' -Profile Any -Enabled True -PolicyStore PersistentStore -ErrorAction Stop | Out-Null
+$created = Get-NetFirewallRule -Name '__TOTS_RULE__' -ErrorAction Stop
+$addressFilter = $created | Get-NetFirewallAddressFilter -ErrorAction Stop
+if (@($addressFilter.RemoteAddress) -notcontains 'Internet6') {
+    throw 'ToTS IPv6 leak-protection rule was created without the Internet6 address filter'
+}
+"#;
+    template.replace("__TOTS_RULE__", rule)
+}
+
 #[cfg(windows)]
 fn install_sync(
     tun_index: i32,
@@ -423,10 +465,8 @@ fn install_sync(
         // rather than silently letting IPv6-capable applications bypass Wintun.
         let rule = format!("ToTS-IPv6-Block-{}", std::process::id());
         guard.changes.ipv6_rule = Some(rule.clone());
-        powershell(&format!(
-            "$service = Get-Service -Name MpsSvc -ErrorAction Stop; if ($service.Status -ne 'Running') {{ throw 'Windows Defender Firewall service is not running; refusing an IPv6-leaking full tunnel' }}; $activeProfiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {{ switch ([string]$_.NetworkCategory) {{ 'DomainAuthenticated' {{ 'Domain' }} 'Private' {{ 'Private' }} default {{ 'Public' }} }} }} | Select-Object -Unique); if ($activeProfiles.Count -eq 0) {{ $activeProfiles = @('Public') }}; $disabled = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Where-Object {{ $activeProfiles -contains $_.Name -and $_.Enabled -ne $true }}); if ($disabled.Count -gt 0) {{ throw 'Windows Firewall is disabled for an active network profile; refusing an IPv6-leaking full tunnel' }}; New-NetFirewallRule -Name '{rule}' -DisplayName 'ToTS IPv6 leak protection' -Group 'ToTS Full Tunnel' -Description 'Temporary IPv6 egress block while the IPv4-only ToTS tunnel is active' -Direction Outbound -Action Block -RemoteAddress '::/0' -Profile Any -Enabled True -PolicyStore PersistentStore -ErrorAction Stop | Out-Null"
-        ))
-        .context("enable temporary IPv6 leak protection")?;
+        powershell(&ipv6_block_rule_script(&rule))
+            .context("enable temporary IPv6 leak protection")?;
 
         let plan = route_plan(tun_index as u32, underlay, protected);
         let protected_count = plan.iter().filter(|route| route.prefix == 32).count();
@@ -558,6 +598,15 @@ mod tests {
             gateway: "192.168.1.1".parse().unwrap(),
             metric: 30,
         }
+    }
+
+    #[test]
+    fn ipv6_firewall_rule_uses_supported_internet6_keyword() {
+        let script = ipv6_block_rule_script("ToTS-IPv6-Block-1234");
+        assert!(script.contains("-RemoteAddress 'Internet6'"));
+        assert!(script.contains("-Action Block"));
+        assert!(script.contains("ToTS-IPv6-Block-1234"));
+        assert!(!script.contains("::/0"));
     }
 
     #[test]

@@ -24,6 +24,7 @@ if ($rules.Count -eq 0) {
     Write-Host 'MISSING' -ForegroundColor Red
 } else {
     $rules | Format-Table Name, Enabled, Direction, Action, Profile -AutoSize
+    $rules | Get-NetFirewallAddressFilter | Format-Table RemoteAddress -AutoSize
 }
 
 Write-Host "`n=== DNS servers ==="
