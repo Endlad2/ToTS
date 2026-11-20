@@ -1,5 +1,5 @@
 use crate::providers::{Provider, ProviderBootstrap};
-use crate::transport::{DatagramPath, TurnCredentials};
+use crate::transport::{turn::TurnCredentials, DatagramPath};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use kolibri_net::calls::{parse_connection, ws2_url_from_endpoint, ConversationParams, Ws2ClientInfo, Ws2Signaling};
@@ -70,10 +70,6 @@ impl MaxSessionState {
 
 #[async_trait]
 impl Provider for MaxProvider {
-    fn name(&self) -> &'static str {
-        "max"
-    }
-
     async fn bootstrap(&self, data: &Value) -> Result<ProviderBootstrap> {
         let mut state_guard = self.state.lock().await;
         if state_guard.is_some() {
@@ -363,8 +359,7 @@ async fn build_bootstrap(state: &mut MaxSessionState, access_token: &str) -> Res
                     .await
                     .map_err(|_| Error::Provider("MAX WebRTC signaling stream closed".into()))?;
                 if notification.get("notification").and_then(Value::as_str) == Some("connection") {
-                    return parse_connection(&notification)
-                        .map_err(|_| Error::Provider("MAX WebRTC connection parameters are invalid".into()));
+                    return Ok(parse_connection(&notification));
                 }
                 if notification.get("notification").and_then(Value::as_str) == Some("hungup") {
                     return Err(Error::Provider("MAX call ended before WebRTC setup completed".into()));
