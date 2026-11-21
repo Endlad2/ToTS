@@ -7,7 +7,8 @@ ToTS carries encrypted L3 VPN packets through VK Calls TURN/UDP, the direct WebR
 ## Workspace
 
 - `tots-core`: packet protocol, encryption, fragmentation, probing and transport abstractions.
-- `tots-client`: Windows/Linux CLI client with managed desktop TUN/routing support.
+- `tots-client`: shared Windows/Linux CLI client library and desktop executable with managed desktop TUN/routing support.
+- `tots-openwrt`: dedicated OpenWrt executable entrypoint, sharing the exact `tots-client` dataplane/provider implementation and adding config-file/status-file service integration.
 - `tots-android`: Android CLI worker binary with `VpnService` TUN-fd support; release packaging renames the executable to `libtots.so` for APK `jniLibs` delivery.
 - `tots-ios`: C ABI/static library for a NetworkExtension host.
 - `tots-server`: Linux TUN, UDP ingress, SQLite and the local management API.
@@ -149,6 +150,33 @@ Normal Android startup launches worker supervisors immediately and opens TUN wit
 libtots.so --config tots://... --n 20 --relay-only --probe-only
 ```
 
+
+## OpenWrt client build
+
+OpenWrt is a dedicated binary build of the shared ToTS client, not a second
+provider implementation. The `tots-openwrt` crate reuses `tots-client` and
+produces a standalone `tots-openwrt` executable for musl-based router targets.
+It can read a private URI from a file and atomically publish status/traffic
+counters for a router manager:
+
+Install Zig 0.13.x, Rust stable and `cargo-zigbuild` first:
+
+```sh
+cargo install cargo-zigbuild --locked
+./scripts/build-openwrt.sh aarch64
+./scripts/build-openwrt.sh x86_64
+./scripts/build-openwrt.sh armv7
+```
+
+GitHub Release publishes `tots-openwrt-aarch64.tar.gz`,
+`tots-openwrt-x86_64.tar.gz`, and `tots-openwrt-armv7.tar.gz`. Each archive
+contains `/usr/bin/tots-openwrt`, an optional procd init script, and a sample
+UCI config. The init script reads `/etc/tots/config.uri`, creates `tots0`,
+and writes `/var/run/tots/status.json`. The binary owns the TUN device and
+transport workers; it deliberately does not install firewall/NAT or LAN policy
+routes. Router-wide policy routing remains the responsibility of the router
+manager (LaLune in this integration).
+
 ## Transport and encryption
 
 VK uses TURN/UDP allocation, authentication, permissions and channel binding. Its relay requires a 12-byte RTP envelope around each encrypted ToTS datagram. The server recognizes that envelope while continuing to accept raw ToTS datagrams for the direct/legacy path.
@@ -167,7 +195,7 @@ Every worker owns a distinct authenticated `session_id`, so workers from one dev
 
 ## Build and release delivery
 
-This source tree contains no private configuration or credentials. GitHub Actions builds the Linux server, Linux/macOS/Windows clients and Android arm64-v8a/armeabi-v7a/x86_64 client release assets; local rebuilds use stable Rust. This revision was tested with Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`. The workspace lockfile predates the added native WebSocket/cookie dependencies in this snapshot. Android's standalone builder therefore lets Cargo refresh the lock during the build. Jazz still pins `webrtc-ice = 0.17.2` explicitly, so refreshing the lock cannot silently move that relay-sensitive dependency to 0.17.3. See `PROJECT_STATUS.md` and `docs/THROUGHPUT-RESULTS.md` for measured validation and remaining limitations.
+This source tree contains no private configuration or credentials. GitHub Actions builds the Linux server, Linux/macOS/Windows clients, Android arm64-v8a/armeabi-v7a/x86_64 payloads, and OpenWrt aarch64/x86_64/armv7 musl binaries; local rebuilds use stable Rust. This revision was tested with Rust `1.99.1`; workspace/Jazz minimum-version metadata is `1.89`. The workspace lockfile predates the added native WebSocket/cookie dependencies in this snapshot. Android's standalone builder therefore lets Cargo refresh the lock during the build. Jazz still pins `webrtc-ice = 0.17.2` explicitly, so refreshing the lock cannot silently move that relay-sensitive dependency to 0.17.3. See `PROJECT_STATUS.md` and `docs/THROUGHPUT-RESULTS.md` for measured validation and remaining limitations.
 
 ```bash
 cargo test --workspace

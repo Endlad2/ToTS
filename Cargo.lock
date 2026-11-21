@@ -3060,6 +3060,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tots-openwrt"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "tots-client",
+]
+
+[[package]]
 name = "tots-server"
 version = "0.1.0"
 dependencies = [

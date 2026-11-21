@@ -82,3 +82,10 @@ jobs:
           test -x "dist/android/${{ matrix.abi }}/libtots.so"
           file "dist/android/${{ matrix.abi }}/libtots.so"
           readelf -h "dist/android/${{ matrix.abi }}/libtots.so" | grep -q "Machine:.*${{ matrix.machine }}"
+
+  openwrt-build-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate OpenWrt build helper
+        run: bash -n scripts/build-openwrt.sh

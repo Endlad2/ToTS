@@ -28,7 +28,7 @@ This environment does not contain a Rust toolchain and outbound package installa
 - Symmetric client/server flowlet scheduling: small UDP pinning, automatic promotion of high-rate UDP to bulk, ~16 KiB bulk striping, and adaptive per-allocation scheduling weights based on ~247 kB/s (~2 Mbit/s).
 - Reliable/unreliable transport policy (TCP/UDP default to low-latency unreliable recovery; stale queued unreliable packets are dropped after outages; control traffic can be recovered).
 - 1200-byte encrypted datagram budget and best-effort 4 MiB UDP socket buffers.
-- Client configuration is passed as `--config tots://...` or explicit CLI fields; local secret-config loading is not part of the CLI.
+- Client configuration is passed as `--config tots://...`, `--config-file /path/to/uri`, or explicit CLI fields; OpenWrt service mode reads the URI from a mode-0600 file and atomically publishes runtime status/traffic counters with `--status-file`.
 - Shared off-runtime device key derivation, bounded authenticated admission, independent server egress queues and periodic authorization refresh.
 - Paced VK credential acquisition with seven-worker credential cohorts, seven-way bounded concurrent worker connection/probing, and independent Jazz room/bridge pools for up to 50 workers; normal startup is not gated on complete-pool health, while `--probe-only` retains the explicit full-pool check.
 - Lazy frame sealing preserves the existing 128-packet replay check when data waits behind control packets.
@@ -41,6 +41,25 @@ Added a MAX provider using KometTeam's `kolibri-net` protocol/signaling library 
 Removed the blocking all-workers-health barrier from normal Android and desktop startup. Worker supervisors connect in the background, and the TUN sender waits on a readiness watch for the first available worker. Android TUN I/O now uses a duplicated non-blocking fd registered with epoll, handles `EAGAIN` asynchronously, reports EOF explicitly, and uses SIGTERM as the Android process shutdown signal. Direct-UDP candidate failure no longer prevents trying TURN. Fixed silent inbound packet drops in Yandex Docs, Mail.ru Docs and Cups queues; tightened the Yandex Engine.IO/Socket.IO handshake; corrected Mail.ru numeric editor IDs and dynamic Origin; normalized Cups websocket URL/Origin and relative metadata URLs.
 
 No live MAX token or Android APK host was available, and this archive has no Rust toolchain. `Cargo.lock` could not be regenerated here; the first normal Cargo build must resolve the new `kolibri-net` git dependency before using `--locked`. Compile/live-provider verification remains outstanding.
+
+
+## OpenWrt build target (2026-11-21)
+
+Added a dedicated `tots-openwrt` workspace crate. It is a thin OpenWrt binary
+entrypoint over the shared `tots-client` library, so it reuses the same
+providers, worker pool, recovery and TUN dataplane instead of maintaining a
+fork. The client CLI now supports `--config-file` and an atomic JSON
+`--status-file`; Unix shutdown handles SIGTERM for procd. The optional procd
+service reads `/etc/tots/config.uri`, creates `tots0`, and writes
+`/var/run/tots/status.json`.
+
+`scripts/build-openwrt.sh` uses `cargo-zigbuild` to produce musl binaries for
+`aarch64`, `x86_64`, and `armv7`; the release workflow publishes one tarball
+per ABI with the binary, init script, sample UCI config and licenses. The ToTS
+binary intentionally does not configure firewall/NAT or LAN policy routing;
+that remains the router manager's responsibility (LaLune in this integration).
+This environment has no Rust/Cargo/Zig toolchain, so target compilation remains
+a GitHub Actions gate rather than a locally verified result.
 
 ## Validation status
 

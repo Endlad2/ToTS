@@ -276,8 +276,59 @@ jobs:
           path: tots-android-multiabi.zip
           if-no-files-found: error
 
+  openwrt-client:
+    name: OpenWrt client (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: aarch64
+            target: aarch64-unknown-linux-musl
+            machine: AArch64
+          - abi: x86_64
+            target: x86_64-unknown-linux-musl
+            machine: Advanced Micro Devices X86-64
+          - abi: armv7
+            target: armv7-unknown-linux-musleabihf
+            machine: ARM
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build and package OpenWrt binary
+        run: bash scripts/build-openwrt.sh "${{ matrix.abi }}"
+
+      - name: Verify binary architecture and archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/tots-openwrt"
+          test -x "$BIN"
+          readelf -h "$BIN" | grep -F "${{ matrix.machine }}"
+          tar -tzf "dist/tots-openwrt-${{ matrix.abi }}.tar.gz" | grep -Fx './usr/bin/tots-openwrt'
+          (cd dist && sha256sum -c "tots-openwrt-${{ matrix.abi }}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-client-${{ matrix.abi }}
+          path: |
+            dist/tots-openwrt-${{ matrix.abi }}.tar.gz
+            dist/tots-openwrt-${{ matrix.abi }}.tar.gz.sha256
+          if-no-files-found: error
+
   publish:
-    needs: [linux-server, linux-client, macos-client, windows-client, android-package]
+    needs: [linux-server, linux-client, macos-client, windows-client, android-package, openwrt-client]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -331,3 +382,9 @@ jobs:
             release-assets/tots-client-*-apple-darwin.tar.gz
             release-assets/tots-client-x86_64-pc-windows-msvc.zip
             release-assets/tots-android-multiabi.zip
+            release-assets/tots-openwrt-aarch64.tar.gz
+            release-assets/tots-openwrt-aarch64.tar.gz.sha256
+            release-assets/tots-openwrt-x86_64.tar.gz
+            release-assets/tots-openwrt-x86_64.tar.gz.sha256
+            release-assets/tots-openwrt-armv7.tar.gz
+            release-assets/tots-openwrt-armv7.tar.gz.sha256
