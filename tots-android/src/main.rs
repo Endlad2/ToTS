@@ -41,6 +41,11 @@ struct Args {
     /// Inherited Android VpnService TUN file descriptor. Required unless --probe-only.
     #[arg(long)]
     tun_fd: Option<i32>,
+    /// Android abstract Unix socket used to receive the VpnService TUN fd via SCM_RIGHTS.
+    /// Preferred over descriptor inheritance because Android ProcessBuilder may close
+    /// non-standard file descriptors while starting a child process.
+    #[arg(long)]
+    tun_fd_socket: Option<String>,
     /// Override the URI's IPv4 TUN MTU (576..=1400); the VpnService must use the same MTU.
     #[arg(long)]
     mtu: Option<usize>,
@@ -119,7 +124,7 @@ async fn main() -> Result<()> {
         "ToTS Android worker supervisors launched; TUN startup is not gated on worker health"
     );
 
-    let mut tun = match tun_io::open(args.tun_fd).await {
+    let mut tun = match tun_io::open(args.tun_fd, args.tun_fd_socket.as_deref()).await {
         Ok(tun) => tun,
         Err(error) => {
             manager.shutdown().await;
@@ -216,6 +221,14 @@ mod tests {
         assert_eq!(args.run_for_seconds, Some(30));
         assert_eq!(args.n, 12);
         assert_eq!(args.workers_percent.as_deref(), Some(r#"{"jazz":"50","vk":"50"}"#));
+
+        let fd_handoff = Args::try_parse_from([
+            "tots-android",
+            "--tun-fd-socket",
+            "lalune-tots-test",
+        ])
+        .unwrap();
+        assert_eq!(fd_handoff.tun_fd_socket.as_deref(), Some("lalune-tots-test"));
     }
 
     #[test]

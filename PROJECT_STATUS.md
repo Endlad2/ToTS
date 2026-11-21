@@ -4,7 +4,7 @@ Android arm64 builds now target API 24 by default and CI/Release pin `ANDROID_AP
 
 ## Android client crate (2026-11-14)
 
-Added a separate `tots-android` workspace crate based on the current desktop client worker/provider dataplane. It preserves multi-provider workers, `--workers_percent`, failover/recovery, flowlet scheduling, telemetry, relay/probe modes and config handling. Android TUN is supplied only through an inherited `VpnService` descriptor (`--tun-fd`); the crate does not create a Linux/Windows TUN or manage Android routes/DNS.
+Added a separate `tots-android` workspace crate based on the current desktop client worker/provider dataplane. It preserves multi-provider workers, `--workers_percent`, failover/recovery, flowlet scheduling, telemetry, relay/probe modes and config handling. Android TUN is supplied through `VpnService` with `SCM_RIGHTS` over an abstract local socket (`--tun-fd-socket`); legacy inherited `--tun-fd` remains for launchers that guarantee descriptor inheritance. The crate does not create a Linux/Windows TUN or manage Android routes/DNS.
 
 `tots-android` is built as a normal PIE executable. `tots-android/build.rs` supports standalone builder mode used by `scripts/build-android.sh`: it cross-builds the executable and then moves the final artifact to `dist/android/<abi>/libtots.so`. Cargo-mode execution of the same build script only stamps the Android soname, avoiding recursive Cargo builds. CI/release now build `arm64-v8a`, `armeabi-v7a`, and `x86_64`; the release packages all three under `jniLibs/<abi>/libtots.so`.
 
@@ -52,8 +52,16 @@ IPv6 is not transported by the dataplane; the Windows full-tunnel guard now bloc
 
 ## Windows full-tunnel routing fix (2026-11-20)
 
-Windows now enables full-tunnel mode by default unless `--no-tun-default-route` is passed. Before switching system routes, the client waits only for one route-ready worker per selected preferred-provider group, not the complete worker pool; this ensures provider/VPS endpoint escape routes exist before `/1` routes can redirect transport sockets into Wintun. The route plan installs protected `/32` underlay routes, both IPv4 `/1` routes, and an IPv4 `/0` route; the active route table and Wintun adapter state are verified before reporting full-tunnel readiness. The Wintun interface metric is set to 1.
+Windows now enables full-tunnel mode by default unless `--no-tun-default-route` is passed. Wintun is created immediately; before switching system routes, the client waits only for the first healthy worker, not every selected provider group or the complete worker pool. The route plan installs protected `/32` underlay routes, both IPv4 `/1` routes, and an IPv4 `/0` route; the active route table and Wintun adapter state are verified before reporting full-tunnel readiness. The Wintun interface metric is set to 1. Additional provider endpoints are pinned to the captured physical underlay as workers discover them.
 
 While the full tunnel is active, the client snapshots and replaces IPv4 DNS on the selected physical underlay and Wintun with public IPv4 resolvers, then restores the original server lists on normal shutdown. Because the dataplane is IPv4-only, a Windows Defender Firewall outbound rule blocks IPv6 Internet egress using the Windows Firewall `Internet6` address keyword during the session and is removed during normal cleanup. If the process is force-killed, the persistent firewall rule may remain; the README includes the exact elevated-PowerShell cleanup command. A diagnostic PowerShell script reports adapter, route, firewall and DNS state.
 
 This environment has no Rust toolchain and cannot run a Windows/Wintun integration test. The code and scripts were statically inspected, but Windows compilation and live tests on the user's PC remain required before calling the fix verified.
+
+## Windows and Android startup regression fixes (2026-11-21)
+
+Android ToTS now supports explicit TUN descriptor transfer over an abstract AF_UNIX socket with `SCM_RIGHTS`, avoiding Android `ProcessBuilder`'s unreliable inheritance of arbitrary file descriptors. LaLune creates the local server before launching ToTS, sends the `VpnService` descriptor, and only marks the TUN ready after ToTS reports successful epoll registration.
+
+Windows now creates Wintun before waiting for provider health and waits for the first healthy worker rather than one worker per selected provider group. Full-tunnel routes are installed in a batched PowerShell operation; newly discovered provider endpoints are added to the physical underlay escape routes in the background. Removed the unsupported `-AddressFamily` argument from every `Set-DnsClientServerAddress` call, which was the failure shown in the user's log and caused route rollback.
+
+Compilation and live Android/Windows tests remain outstanding because this environment does not have Cargo/Rust, Android SDK/NDK or a Windows host. SCM_RIGHTS semantics were smoke-tested on a local abstract Unix socket; the app-side Android handoff and Windows routing still require device/host verification.

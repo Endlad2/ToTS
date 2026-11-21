@@ -348,35 +348,20 @@ impl WorkerManager {
         }
     }
 
-    /// Wait only for one route-ready worker per preferred provider group. Windows must
-    /// install host escape routes for the active transport endpoints before it switches
-    /// the system's IPv4 defaults into Wintun; waiting for the entire pool is unnecessary.
-    pub async fn wait_for_route_representatives(&self, timeout: Duration) -> Result<()> {
-        let required: HashSet<ProviderName> = self
-            .slots
-            .iter()
-            .map(|slot| slot.preferred_provider)
-            .collect();
+    /// Wait for the first healthy worker with a known underlay endpoint. Windows
+    /// only needs one working path before it can safely switch the default routes.
+    /// Waiting for every selected provider (especially a slow Jazz room) delays
+    /// the whole VPN even when VK is already carrying traffic.
+    pub async fn wait_for_first_route_ready(&self, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let mut ready = HashSet::new();
-            for slot in &self.slots {
-                if !slot.healthy.load(Ordering::Acquire) {
-                    continue;
-                }
-                if !slot.route_ips.read().await.is_empty() {
-                    ready.insert(slot.preferred_provider);
-                }
-            }
-            if required.iter().all(|provider| ready.contains(provider)) {
+            // The configured ToTS peer address is always included in the
+            // Windows escape-route set, so one healthy worker is sufficient.
+            if self.healthy_count() > 0 {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "only {}/{} preferred-provider groups established a transport route before timeout",
-                    ready.len(),
-                    required.len()
-                );
+                anyhow::bail!("no healthy worker established a transport route before timeout");
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1495,6 +1480,12 @@ mod tests {
             .wait_for_healthy(Duration::from_millis(10))
             .await
             .is_err());
+        // Windows full-tunnel startup must not wait for the remaining workers
+        // or a slow secondary provider once one route-ready worker is active.
+        manager
+            .wait_for_first_route_ready(Duration::from_millis(10))
+            .await
+            .unwrap();
         for slot in &manager.slots {
             slot.healthy.store(true, Ordering::Release);
         }

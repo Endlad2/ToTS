@@ -68,7 +68,7 @@ The server uses `10.77.0.0/16` for virtual addresses. `scripts/setup-network.sh`
 
 ## Windows client
 
-Extract the delivery archive and keep `wintun.dll` beside the Windows `tots-client.exe`. Run TUN operations as Administrator. Windows now enables full-tunnel routing by default: after one healthy route-ready worker per selected provider group is established, ToTS installs protected `/32` transport routes, both IPv4 `/1` routes and an IPv4 default route through Wintun. It snapshots/restores DNS on the physical and TUN interfaces, and blocks IPv6 Internet egress with Windows Firewall's `Internet6` address keyword while the IPv4-only tunnel is active so IPv6-capable applications cannot bypass it.
+Extract the delivery archive and keep `wintun.dll` beside the Windows `tots-client.exe`. Run TUN operations as Administrator. Windows now creates Wintun immediately, then waits only for the first healthy worker before switching system routes. ToTS installs protected `/32` transport routes, both IPv4 `/1` routes and an IPv4 default route through Wintun. Additional provider endpoints discovered later are added to the underlay escape-route set. It snapshots/restores DNS on the physical and TUN interfaces, and blocks IPv6 Internet egress with Windows Firewall's `Internet6` address keyword while the IPv4-only tunnel is active so IPv6-capable applications cannot bypass it.
 
 ```powershell
 .\tots-client.exe --config 'tots://...' --n 10 --relay-only
@@ -114,20 +114,20 @@ $env:TOTS_PHYSICAL_IFINDEX = '12'
 
 The forced index is validated to be Up, connected, and to own a usable active IPv4 default route; ToTS refuses to use the TUN's own interface index as its underlay. On normal exit the guard removes only routes it created and restores the original DNS servers on both affected interfaces. Cleanup after force-killing the process is not guaranteed; remove the leftover firewall rule with the command above if needed.
 
-The client waits only for one healthy route-ready worker per selected preferred-provider group before installing Windows full-tunnel routes; it does not wait for the complete worker pool. Remaining workers continue connecting in the background. Startup/reconnect connection work is capped at seven workers concurrently rather than serially staggering every worker. Any request that configures Jazz or Cups (primary or fallback) and exceeds its provisioned room count fails immediately.
+The client waits only for the first healthy worker before installing Windows full-tunnel routes; it does not wait for every selected provider group or the complete worker pool. Remaining workers continue connecting in the background. Startup/reconnect connection work is capped at seven workers concurrently rather than serially staggering every worker. Any request that configures Jazz or Cups (primary or fallback) and exceeds its provisioned room count fails immediately.
 
 The current dataplane is IPv4-only. On Windows, ToTS blocks IPv6 egress with a temporary Windows Defender Firewall rule for the lifetime of the full tunnel and removes it during normal shutdown. DNS on the physical adapter is changed to public IPv4 resolvers while connected and restored on shutdown. Automatic full-tunnel routing is currently Windows-only. Android uses the separate `tots-android` binary below; iOS requires a NetworkExtension host.
 
 ## Android client
 
-`tots-android` carries the same worker/provider dataplane as `tots-client`: `--n`, `--workers_percent`, relay-only mode, provider fallback/recovery, flowlet scheduling and five-second traffic/worker telemetry are preserved. Android TUN ownership is intentionally different: the APK's `VpnService` creates/configures the interface, and the native binary receives the inherited descriptor with `--tun-fd`.
+`tots-android` carries the same worker/provider dataplane as `tots-client`: `--n`, `--workers_percent`, relay-only mode, provider fallback/recovery, flowlet scheduling and five-second traffic/worker telemetry are preserved. Android TUN ownership is intentionally different: the APK's `VpnService` creates/configures the interface, and the native binary receives the descriptor over an abstract local socket with `SCM_RIGHTS` (`--tun-fd-socket`).
 
-The host `VpnService` must configure the same virtual IPv4 address and MTU contained in the `tots://` configuration. It must pass a live, inherited TUN fd (clear `FD_CLOEXEC` in the parent before `exec`) and must not read/write that fd after handoff. The native client duplicates the fd, switches it to non-blocking mode, and uses epoll readiness so `EAGAIN` is not treated as process-fatal. It also owns Android route/DNS/app-selection policy. To avoid the VPN process tunnelling its own provider/WebSocket/TURN sockets back into its TUN, the future APK should exclude its own package/UID from the VPN or otherwise protect the transport sockets before installing a full-tunnel route.
+The host `VpnService` must configure the same virtual IPv4 address and MTU contained in the `tots://` configuration. Prefer passing the live TUN fd over an abstract local socket using `SCM_RIGHTS` and `--tun-fd-socket`; Android `ProcessBuilder` does not reliably preserve arbitrary descriptors even when `FD_CLOEXEC` is cleared. The legacy `--tun-fd` form remains for launchers that guarantee descriptor inheritance. The native client owns the received fd, switches it to non-blocking mode, and uses epoll readiness so `EAGAIN` is not treated as process-fatal. The Android host owns route/DNS/app-selection policy and must exclude its own package/UID or otherwise protect provider sockets from routing back into its TUN.
 
 Example process arguments inside an APK host:
 
 ```text
-libtots.so --config tots://... --n 20 --workers_percent {"vk":50,"jazz":50} --relay-only --tun-fd 42
+libtots.so --config tots://... --n 20 --workers_percent {"vk":50,"jazz":50} --relay-only --tun-fd-socket lalune-tots-random
 ```
 
 `libtots.so` is deliberately **not** a Rust `cdylib`: it is the normal PIE executable produced from `tots-android`, renamed after linking so Android packaging can place it under `jniLibs/<abi>/libtots.so`. The package `build.rs` has two modes. Under Cargo it stamps the Android ELF soname; when compiled/run standalone by `scripts/build-android.sh`, the same `build.rs` invokes the real Android Cargo build and moves the finished executable to `dist/android/<abi>/libtots.so`.

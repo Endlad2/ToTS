@@ -7,6 +7,10 @@ use std::net::Ipv4Addr;
 pub struct FullTunnelRoutes {
     #[cfg(windows)]
     changes: OwnedChanges,
+    #[cfg(windows)]
+    underlay: UnderlayRoute,
+    #[cfg(windows)]
+    protected: std::collections::BTreeSet<Ipv4Addr>,
 }
 
 /// Physical/default underlay captured before Wintun is opened.
@@ -54,6 +58,68 @@ pub async fn install(
 }
 
 impl FullTunnelRoutes {
+    /// Add escape routes for provider endpoints discovered after the first
+    /// transport became healthy. This lets slow/fallback providers reconnect
+    /// directly after the system default route has moved to Wintun.
+    pub async fn refresh_protected(&mut self, endpoints: Vec<Ipv4Addr>) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let candidates: Vec<Ipv4Addr> = endpoints
+                .into_iter()
+                .filter(|ip| {
+                    !ip.is_unspecified()
+                        && !ip.is_loopback()
+                        && !ip.is_multicast()
+                        && !ip.is_broadcast()
+                        && !self.protected.contains(ip)
+                })
+                .collect();
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            let underlay = self.underlay;
+            let (created, installed, failures) = tokio::task::spawn_blocking(move || {
+                let mut created = Vec::new();
+                let mut installed = Vec::new();
+                let mut failures = Vec::new();
+                for address in candidates {
+                    let route = Route {
+                        address,
+                        prefix: 32,
+                        index: underlay.index,
+                        gateway: underlay.gateway,
+                    };
+                    let script = format!(
+                        "$existing = @({}); if ($existing.Count -eq 0) {{ New-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null; exit 10 }}",
+                        route.query(), route.destination(), route.index, route.gateway
+                    );
+                    match powershell(&script) {
+                        Ok(output) => {
+                            if output.status.code() == Some(10) {
+                                created.push(route);
+                            }
+                            installed.push(address);
+                        }
+                        Err(error) => failures.push(format!("{address}: {error:#}")),
+                    }
+                }
+                (created, installed, failures)
+            })
+            .await
+            .context("Windows dynamic endpoint-route task failed")?;
+            self.changes.routes.extend(created);
+            self.protected.extend(installed);
+            for failure in failures {
+                tracing::warn!(error = %failure, "could not add a Windows provider escape route; will retry");
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = endpoints;
+        }
+        Ok(())
+    }
+
     pub async fn cleanup(mut self) -> Result<()> {
         #[cfg(windows)]
         {
@@ -86,23 +152,7 @@ impl FullTunnelRoutes {
         }
         for i in (0..self.changes.dns.len()).rev() {
             let snapshot = self.changes.dns[i].clone();
-            let restore = if snapshot.servers.is_empty() {
-                format!(
-                    "Set-DnsClientServerAddress -InterfaceIndex {} -AddressFamily IPv4 -ResetServerAddresses -ErrorAction Stop",
-                    snapshot.index
-                )
-            } else {
-                let servers = snapshot
-                    .servers
-                    .iter()
-                    .map(|ip| format!("'{}'", ip))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!(
-                    "Set-DnsClientServerAddress -InterfaceIndex {} -AddressFamily IPv4 -ServerAddresses @({servers}) -ErrorAction Stop",
-                    snapshot.index
-                )
-            };
+            let restore = restore_dns_script(&snapshot);
             match powershell(&restore) {
                 Ok(_) => {
                     self.changes.dns.remove(i);
@@ -231,6 +281,74 @@ fn route_plan(tun_index: u32, default: UnderlayRoute, mut protected: Vec<Ipv4Add
         });
     }
     routes
+}
+
+#[cfg(windows)]
+fn install_route_plan(plan: &[Route]) -> Result<Vec<Route>> {
+    if plan.is_empty() {
+        bail!("Windows route plan is empty");
+    }
+    let rows = plan
+        .iter()
+        .map(|route| {
+            format!(
+                "[PSCustomObject]@{{Address='{}'; Prefix={}; InterfaceIndex={}; NextHop='{}'}}",
+                route.address, route.prefix, route.index, route.gateway
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        r#"
+$plan = @({rows})
+$created = @()
+try {{
+    $active = @(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop)
+    for ($i = 0; $i -lt $plan.Count; $i++) {{
+        $route = $plan[$i]
+        $prefix = [string]$route.Address + '/' + [string]$route.Prefix
+        $existing = @($active | Where-Object {{
+            $_.InterfaceIndex -eq $route.InterfaceIndex -and
+            $_.DestinationPrefix -eq $prefix -and
+            $_.NextHop -eq $route.NextHop
+        }})
+        if ($existing.Count -eq 0) {{
+            New-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -InterfaceIndex $route.InterfaceIndex -NextHop $route.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+            $created += $i
+        }}
+    }}
+    [Console]::Out.WriteLine(($created -join ','))
+}} catch {{
+    for ($j = $created.Count - 1; $j -ge 0; $j--) {{
+        $route = $plan[$created[$j]]
+        $prefix = [string]$route.Address + '/' + [string]$route.Prefix
+        Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+            Where-Object {{ $_.InterfaceIndex -eq $route.InterfaceIndex -and $_.DestinationPrefix -eq $prefix -and $_.NextHop -eq $route.NextHop }} |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    }}
+    throw
+}}
+"#
+    );
+    let output = powershell(&script).context("install Windows IPv4 route plan")?;
+    let raw = String::from_utf8(output.stdout).context("route plan response was not UTF-8")?;
+    let created: Vec<usize> = if raw.trim().is_empty() {
+        Vec::new()
+    } else {
+        raw.trim()
+            .split(',')
+            .map(|value| value.parse::<usize>().context("invalid created route index"))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut routes = Vec::with_capacity(created.len());
+    for index in created {
+        let route = plan
+            .get(index)
+            .copied()
+            .context("PowerShell returned an invalid created-route index")?;
+        routes.push(route);
+    }
+    Ok(routes)
 }
 
 #[cfg(any(windows, test))]
@@ -409,6 +527,41 @@ $service = Get-Service -Name MpsSvc -ErrorAction Stop
 if ($service.Status -ne 'Running') {
     throw 'Windows Defender Firewall service is not running; refusing an IPv6-leaking full tunnel'
 }
+
+#[cfg(any(windows, test))]
+fn restore_dns_script(snapshot: &DnsSnapshot) -> String {
+    if snapshot.servers.is_empty() {
+        // Set-DnsClientServerAddress has no -AddressFamily parameter.
+        format!(
+            "Set-DnsClientServerAddress -InterfaceIndex {} -ResetServerAddresses -ErrorAction Stop",
+            snapshot.index
+        )
+    } else {
+        let servers = snapshot
+            .servers
+            .iter()
+            .map(|ip| format!("'{}'", ip))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses @({servers}) -ErrorAction Stop",
+            snapshot.index
+        )
+    }
+}
+
+#[cfg(any(windows, test))]
+fn set_ipv4_dns_script(indices: &[u32]) -> String {
+    let commands = indices
+        .iter()
+        .map(|index| {
+            format!(
+                "Set-DnsClientServerAddress -InterfaceIndex {index} -ServerAddresses @('1.1.1.1','8.8.8.8') -ErrorAction Stop"
+            )
+        })
+        .collect::<Vec<_>>();
+    commands.join("; ")
+}
 $activeProfiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {
     switch ([string]$_.NetworkCategory) {
         'DomainAuthenticated' { 'Domain' }
@@ -459,6 +612,8 @@ fn install_sync(
 
     let mut guard = FullTunnelRoutes {
         changes: OwnedChanges::default(),
+        underlay,
+        protected: protected.iter().copied().collect(),
     };
     let result = (|| -> Result<()> {
         // ToTS carries IPv4 only. Block IPv6 egress while the tunnel is up
@@ -480,15 +635,9 @@ fn install_sync(
         // The /32 transport routes are deliberately first. Once the two /1 routes
         // exist, every provider/VPS socket must already have a more-specific route
         // through the captured physical gateway.
-        for route in plan {
-            let output = powershell(&format!(
-                "$existing = @({}); if ($existing.Count -eq 0) {{ New-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null; exit 10 }}",
-                route.query(), route.destination(), route.index, route.gateway
-            ))
-            .with_context(|| format!("install IPv4 route {}", route.destination()))?;
-            guard
-                .changes
-                .record(route, output.status.code() == Some(10));
+        let created_routes = install_route_plan(&plan)?;
+        for route in created_routes {
+            guard.changes.record(route, true);
         }
 
         // Verify the active route table instead of treating a successful PowerShell
@@ -501,14 +650,16 @@ fn install_sync(
         // Snapshot and replace DNS on both the physical underlay and Wintun. This
         // prevents Windows' multi-homed DNS client from continuing to query the
         // router/ISP DNS server on the physical adapter.
-        for index in [underlay.index, tun_index as u32] {
+        let dns_indices = [underlay.index, tun_index as u32];
+        for index in dns_indices {
             let snapshot = snapshot_dns(index)?;
             guard.changes.record_dns(snapshot);
-            powershell(&format!(
-                "Set-DnsClientServerAddress -InterfaceIndex {index} -AddressFamily IPv4 -ServerAddresses @('1.1.1.1','8.8.8.8') -ErrorAction Stop"
-            ))
-            .with_context(|| format!("set IPv4 DNS servers on interface {index}"))?;
         }
+        // One PowerShell invocation for both adapters. Set-DnsClientServerAddress
+        // infers the family from the supplied IPv4 addresses and has no
+        // -AddressFamily parameter (unlike Get-DnsClientServerAddress).
+        powershell(&set_ipv4_dns_script(&dns_indices))
+        .context("set IPv4 DNS servers on physical and Wintun interfaces")?;
         tracing::info!(
             tun_interface_index = tun_index,
             physical_interface_index = underlay.index,
@@ -607,6 +758,24 @@ mod tests {
         assert!(script.contains("-Action Block"));
         assert!(script.contains("ToTS-IPv6-Block-1234"));
         assert!(!script.contains("::/0"));
+    }
+
+    #[test]
+    fn dns_set_and_restore_commands_do_not_use_unsupported_address_family_parameter() {
+        let set_dns = set_ipv4_dns_script(&[7, 12]);
+        let reset_dns = restore_dns_script(&DnsSnapshot {
+            index: 7,
+            servers: Vec::new(),
+        });
+        let restore_dns = restore_dns_script(&DnsSnapshot {
+            index: 12,
+            servers: vec!["192.168.1.1".parse().unwrap()],
+        });
+        assert!(set_dns.contains("-InterfaceIndex 7"));
+        assert!(set_dns.contains("-InterfaceIndex 12"));
+        assert!(!set_dns.contains("-AddressFamily"));
+        assert!(!reset_dns.contains("-AddressFamily"));
+        assert!(!restore_dns.contains("-AddressFamily"));
     }
 
     #[test]

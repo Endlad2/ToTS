@@ -128,19 +128,6 @@ async fn main() -> Result<()> {
     );
 
     let full_tunnel = full_tunnel_enabled(&args, cfg!(windows));
-    if full_tunnel {
-        info!(
-            "waiting for one healthy transport path per selected provider before switching Windows routes"
-        );
-        if let Err(error) = manager
-            .wait_for_route_representatives(Duration::from_secs(90))
-            .await
-        {
-            manager.shutdown().await;
-            return Err(error.context("no initial transport routes became ready; system routes were left unchanged"));
-        }
-    }
-
     let underlay = if full_tunnel {
         match routes::capture_underlay().await {
             Ok(underlay) => Some(underlay),
@@ -160,7 +147,22 @@ async fn main() -> Result<()> {
             return Err(error);
         }
     };
-    let routes = if let Some(underlay) = underlay {
+
+    // Create Wintun immediately. Do not make the adapter itself wait for slow
+    // provider health checks; keep system default routes untouched until the
+    // first usable transport path is ready.
+    if full_tunnel {
+        info!("Windows TUN created; waiting for the first healthy transport before switching system routes");
+        if let Err(error) = manager
+            .wait_for_first_route_ready(Duration::from_secs(45))
+            .await
+        {
+            manager.shutdown().await;
+            return Err(error.context("no initial transport route became ready; system routes were left unchanged"));
+        }
+    }
+
+    let mut routes = if let Some(underlay) = underlay {
         match routes::install(tun_io::index(&tun)?, manager.route_ips().await, underlay).await {
             Ok(routes) => Some(routes),
             Err(error) => {
@@ -204,8 +206,25 @@ async fn main() -> Result<()> {
             std::future::pending::<()>().await;
         }
     };
+    let route_refresh_manager = Arc::clone(&manager);
+    let route_refresh = async {
+        if let Some(route_guard) = routes.as_mut() {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let endpoints = route_refresh_manager.route_ips().await;
+                if let Err(error) = route_guard.refresh_protected(endpoints).await {
+                    tracing::warn!(%error, "Windows provider escape-route refresh failed");
+                }
+            }
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
     let result = tokio::select! {
         result = tun_io::run(&mut tun, manager.clone(), inbound) => result,
+        _ = route_refresh => Ok(()),
         result = tokio::signal::ctrl_c() => result.map_err(Into::into),
         _ = deadline => Ok(()),
     };
