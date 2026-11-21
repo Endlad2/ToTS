@@ -65,3 +65,7 @@ Android ToTS now supports explicit TUN descriptor transfer over an abstract AF_U
 Windows now creates Wintun before waiting for provider health and waits for the first healthy worker rather than one worker per selected provider group. Full-tunnel routes are installed in a batched PowerShell operation; newly discovered provider endpoints are added to the physical underlay escape routes in the background. Removed the unsupported `-AddressFamily` argument from every `Set-DnsClientServerAddress` call, which was the failure shown in the user's log and caused route rollback.
 
 Compilation and live Android/Windows tests remain outstanding because this environment does not have Cargo/Rust, Android SDK/NDK or a Windows host. SCM_RIGHTS semantics were smoke-tested on a local abstract Unix socket; the app-side Android handoff and Windows routing still require device/host verification.
+
+## Windows DNS helper compile fix (2026-11-21)
+
+Moved `restore_dns_script` and `set_ipv4_dns_script` out of the IPv6 PowerShell raw string and back to module scope. They remain gated with `#[cfg(any(windows, test))]`, so the Windows implementation and its unit tests can resolve them. Removed the now-unused `HashSet` import from `tots-client/src/workers.rs`. The source-level checks confirm each helper is defined once, outside the raw PowerShell string, and that `Set-DnsClientServerAddress` calls do not pass the unsupported `-AddressFamily` parameter. A Cargo build/test could not be run in this environment because Rust/Cargo are unavailable.

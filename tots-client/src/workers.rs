@@ -1,7 +1,7 @@
 use crate::bootstrap::{BootstrapPool, VK_WORKERS_PER_BOOTSTRAP};
 use anyhow::{anyhow, Context, Result};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},

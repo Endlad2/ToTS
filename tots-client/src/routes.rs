@@ -528,40 +528,6 @@ if ($service.Status -ne 'Running') {
     throw 'Windows Defender Firewall service is not running; refusing an IPv6-leaking full tunnel'
 }
 
-#[cfg(any(windows, test))]
-fn restore_dns_script(snapshot: &DnsSnapshot) -> String {
-    if snapshot.servers.is_empty() {
-        // Set-DnsClientServerAddress has no -AddressFamily parameter.
-        format!(
-            "Set-DnsClientServerAddress -InterfaceIndex {} -ResetServerAddresses -ErrorAction Stop",
-            snapshot.index
-        )
-    } else {
-        let servers = snapshot
-            .servers
-            .iter()
-            .map(|ip| format!("'{}'", ip))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses @({servers}) -ErrorAction Stop",
-            snapshot.index
-        )
-    }
-}
-
-#[cfg(any(windows, test))]
-fn set_ipv4_dns_script(indices: &[u32]) -> String {
-    let commands = indices
-        .iter()
-        .map(|index| {
-            format!(
-                "Set-DnsClientServerAddress -InterfaceIndex {index} -ServerAddresses @('1.1.1.1','8.8.8.8') -ErrorAction Stop"
-            )
-        })
-        .collect::<Vec<_>>();
-    commands.join("; ")
-}
 $activeProfiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {
     switch ([string]$_.NetworkCategory) {
         'DomainAuthenticated' { 'Domain' }
@@ -588,6 +554,43 @@ if (@($addressFilter.RemoteAddress) -notcontains 'Internet6') {
 }
 "#;
     template.replace("__TOTS_RULE__", rule)
+}
+
+// These helpers must be Rust items, not part of the PowerShell raw string above.
+// Set-DnsClientServerAddress infers IPv4 from ServerAddresses and does not accept
+// the -AddressFamily switch supported by Get-DnsClientServerAddress.
+#[cfg(any(windows, test))]
+fn restore_dns_script(snapshot: &DnsSnapshot) -> String {
+    if snapshot.servers.is_empty() {
+        format!(
+            "Set-DnsClientServerAddress -InterfaceIndex {} -ResetServerAddresses -ErrorAction Stop",
+            snapshot.index
+        )
+    } else {
+        let servers = snapshot
+            .servers
+            .iter()
+            .map(|ip| format!("'{}'", ip))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "Set-DnsClientServerAddress -InterfaceIndex {} -ServerAddresses @({servers}) -ErrorAction Stop",
+            snapshot.index
+        )
+    }
+}
+
+#[cfg(any(windows, test))]
+fn set_ipv4_dns_script(indices: &[u32]) -> String {
+    indices
+        .iter()
+        .map(|index| {
+            format!(
+                "Set-DnsClientServerAddress -InterfaceIndex {index} -ServerAddresses @('1.1.1.1','8.8.8.8') -ErrorAction Stop"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(windows)]
