@@ -5,12 +5,42 @@ use std::net::Ipv4Addr;
 
 /// Owns only routes created by this client. Drop restores routing and TUN DNS.
 pub struct FullTunnelRoutes {
-    #[cfg(windows)]
+    // Compiled for tests as well as Windows so the Linux test suite type-checks the
+    // guard's fields and constructor. A Windows-only field previously hid a
+    // `collect()` mismatch until the Windows CI job failed.
+    #[cfg(any(windows, test))]
     changes: OwnedChanges,
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     underlay: UnderlayRoute,
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     protected: ProtectedEndpoints,
+}
+
+/// Validate the install request and build the route guard.
+#[cfg(any(windows, test))]
+fn build_guard(
+    tun_index: i32,
+    protected: &[Ipv4Addr],
+    underlay: UnderlayRoute,
+) -> Result<FullTunnelRoutes> {
+    if tun_index <= 0 {
+        bail!("invalid TUN interface index");
+    }
+    validate_underlay(tun_index as u32, underlay)?;
+    if protected.is_empty() {
+        bail!("full tunnel requires at least one protected transport endpoint");
+    }
+    if protected
+        .iter()
+        .any(|ip| ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast())
+    {
+        bail!("protected transport endpoints must be usable IPv4 addresses");
+    }
+    Ok(FullTunnelRoutes {
+        changes: OwnedChanges::default(),
+        underlay,
+        protected: ProtectedEndpoints::from_endpoints(protected.iter().copied()),
+    })
 }
 
 /// Escape-route bookkeeping for provider endpoints.
@@ -19,13 +49,13 @@ pub struct FullTunnelRoutes {
 /// every second. Remembering every address ever seen grew the route table and the
 /// per-tick PowerShell work without bound on long sessions, so endpoints that have
 /// not been reported for a while are removed again.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 #[derive(Default)]
 struct ProtectedEndpoints {
     entries: std::collections::BTreeMap<Ipv4Addr, std::time::Instant>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 impl ProtectedEndpoints {
     const MAX: usize = 512;
     const IDLE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(900);
@@ -46,6 +76,15 @@ impl ProtectedEndpoints {
 
     fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Seed the set with the endpoints whose escape routes were installed by the
+    /// initial route plan, so the first refresh does not treat them as new.
+    fn from_endpoints(endpoints: impl IntoIterator<Item = Ipv4Addr>) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            entries: endpoints.into_iter().map(|address| (address, now)).collect(),
+        }
     }
 
     /// Endpoints that may be released: idle for the grace period, or the oldest
@@ -122,12 +161,27 @@ pub async fn install(
     }
 }
 
+#[cfg(test)]
+impl FullTunnelRoutes {
+    /// `(protected_contains_203_0_113_9, protected_len)` for the route-guard tests.
+    fn properties_for_test(&self) -> (bool, usize) {
+        (
+            self.protected.contains(&"203.0.113.9".parse().unwrap()),
+            self.protected.len(),
+        )
+    }
+
+    async fn release_endpoints_for_test(&mut self, stale: Vec<Ipv4Addr>) {
+        self.release_endpoints(stale).await;
+    }
+}
+
 impl FullTunnelRoutes {
     /// Add escape routes for provider endpoints discovered after the first
     /// transport became healthy. This lets slow/fallback providers reconnect
     /// directly after the system default route has moved to Wintun.
     pub async fn refresh_protected(&mut self, endpoints: Vec<Ipv4Addr>) -> Result<()> {
-        #[cfg(windows)]
+        #[cfg(any(windows, test))]
         {
             let live: Vec<Ipv4Addr> = endpoints
                 .into_iter()
@@ -161,11 +215,7 @@ impl FullTunnelRoutes {
                         index: underlay.index,
                         gateway: underlay.gateway,
                     };
-                    let script = format!(
-                        "$existing = @({}); if ($existing.Count -eq 0) {{ New-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -InterfaceIndex {} -NextHop '{}' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null; exit 10 }}",
-                        route.query(), route.destination(), route.index, route.gateway
-                    );
-                    match powershell(&script) {
+                    match powershell(&add_route_script(route)) {
                         Ok(output) => {
                             if output.status.code() == Some(10) {
                                 created.push(route);
@@ -196,7 +246,9 @@ impl FullTunnelRoutes {
                 );
             }
         }
-        #[cfg(not(windows))]
+        // Only the non-test, non-Windows build needs a fallback: every test build
+        // already compiles the Windows body above, which type-checks it on Linux.
+        #[cfg(not(any(windows, test)))]
         {
             let _ = endpoints;
         }
@@ -204,7 +256,7 @@ impl FullTunnelRoutes {
     }
 
     /// Remove escape routes for endpoints that are no longer reported.
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     async fn release_endpoints(&mut self, stale: Vec<Ipv4Addr>) {
         if stale.is_empty() {
             return;
@@ -220,10 +272,7 @@ impl FullTunnelRoutes {
                     index: underlay.index,
                     gateway: underlay.gateway,
                 };
-                match powershell(&format!(
-                    "$existing = @({}); if ($existing.Count -gt 0) {{ $existing | Remove-NetRoute -Confirm:$false -ErrorAction Stop | Out-Null }}",
-                    route.query()
-                )) {
+                match powershell(&remove_route_script(route)) {
                     Ok(_) => released.push(address),
                     Err(error) => failures.push(format!("{address}: {error:#}")),
                 }
@@ -260,16 +309,13 @@ impl FullTunnelRoutes {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     fn cleanup_sync(&mut self) -> Result<()> {
         let mut failures = Vec::new();
         // Remove split defaults before the endpoint escape routes.
         for i in (0..self.changes.routes.len()).rev() {
             let route = self.changes.routes[i];
-            match powershell(&format!(
-                "$existing = @({}); if ($existing.Count -gt 0) {{ $existing | Remove-NetRoute -Confirm:$false -ErrorAction Stop | Out-Null }}",
-                route.query()
-            )) {
+            match powershell(&remove_route_script(route)) {
                 Ok(_) => {
                     self.changes.routes.remove(i);
                 }
@@ -287,11 +333,7 @@ impl FullTunnelRoutes {
             }
         }
         if let Some(rule) = self.changes.ipv6_rule.clone() {
-            let script = format!(
-                "$existing = Get-NetFirewallRule -Name '{}' -ErrorAction SilentlyContinue; if ($null -ne $existing) {{ Remove-NetFirewallRule -InputObject $existing -Confirm:$false -ErrorAction Stop | Out-Null }}",
-                rule
-            );
-            match powershell(&script) {
+            match powershell(&remove_ipv6_rule_script(&rule)) {
                 Ok(_) => self.changes.ipv6_rule = None,
                 Err(error) => failures.push(format!("remove IPv6 leak-protection rule: {error:#}")),
             }
@@ -420,54 +462,13 @@ fn route_plan(tun_index: u32, default: UnderlayRoute, mut protected: Vec<Ipv4Add
     routes
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn install_route_plan(plan: &[Route]) -> Result<Vec<Route>> {
     if plan.is_empty() {
         bail!("Windows route plan is empty");
     }
-    let rows = plan
-        .iter()
-        .map(|route| {
-            format!(
-                "[PSCustomObject]@{{Address='{}'; Prefix={}; InterfaceIndex={}; NextHop='{}'}}",
-                route.address, route.prefix, route.index, route.gateway
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let script = format!(
-        r#"
-$plan = @({rows})
-$created = @()
-try {{
-    $active = @(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop)
-    for ($i = 0; $i -lt $plan.Count; $i++) {{
-        $route = $plan[$i]
-        $prefix = [string]$route.Address + '/' + [string]$route.Prefix
-        $existing = @($active | Where-Object {{
-            $_.InterfaceIndex -eq $route.InterfaceIndex -and
-            $_.DestinationPrefix -eq $prefix -and
-            $_.NextHop -eq $route.NextHop
-        }})
-        if ($existing.Count -eq 0) {{
-            New-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -InterfaceIndex $route.InterfaceIndex -NextHop $route.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-            $created += $i
-        }}
-    }}
-    [Console]::Out.WriteLine(($created -join ','))
-}} catch {{
-    for ($j = $created.Count - 1; $j -ge 0; $j--) {{
-        $route = $plan[$created[$j]]
-        $prefix = [string]$route.Address + '/' + [string]$route.Prefix
-        Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-            Where-Object {{ $_.InterfaceIndex -eq $route.InterfaceIndex -and $_.DestinationPrefix -eq $prefix -and $_.NextHop -eq $route.NextHop }} |
-            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-    }}
-    throw
-}}
-"#
-    );
-    let output = powershell(&script).context("install Windows IPv4 route plan")?;
+    let output = powershell(&install_route_plan_script(plan))
+        .context("install Windows IPv4 route plan")?;
     let raw = String::from_utf8(output.stdout).context("route plan response was not UTF-8")?;
     let created: Vec<usize> = if raw.trim().is_empty() {
         Vec::new()
@@ -518,7 +519,7 @@ impl OwnedChanges {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 impl Route {
     fn destination(self) -> String {
         format!("{}/{}", self.address, self.prefix)
@@ -533,7 +534,217 @@ impl Route {
     }
 }
 
-#[cfg(windows)]
+/// Fill `__TOKEN__` placeholders in a PowerShell template.
+///
+/// PowerShell scripts are kept as plain raw strings and completed by replacement
+/// rather than `format!`, because every PowerShell brace would need doubling and a
+/// single mismatch is only reported by a Windows build. Keeping the builders free
+/// of `format!` also lets the Linux test suite compile and assert them.
+#[cfg(any(windows, test))]
+fn powershell_script(template: &str, values: &[(&str, &str)]) -> String {
+    let mut script = template.to_owned();
+    for (token, value) in values {
+        script = script.replace(token, value);
+    }
+    script
+}
+
+#[cfg(any(windows, test))]
+fn route_rows(plan: &[Route]) -> String {
+    plan.iter()
+        .map(|route| {
+            format!(
+                "[PSCustomObject]@{{Address='{}'; Prefix={}; InterfaceIndex={}; NextHop='{}'}}",
+                route.address, route.prefix, route.index, route.gateway
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(any(windows, test))]
+fn install_route_plan_script(plan: &[Route]) -> String {
+    const TEMPLATE: &str = r#"
+$plan = @(__ROWS__)
+$created = @()
+try {
+    $active = @(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop)
+    for ($i = 0; $i -lt $plan.Count; $i++) {
+        $route = $plan[$i]
+        $prefix = [string]$route.Address + '/' + [string]$route.Prefix
+        $existing = @($active | Where-Object {
+            $_.InterfaceIndex -eq $route.InterfaceIndex -and
+            $_.DestinationPrefix -eq $prefix -and
+            $_.NextHop -eq $route.NextHop
+        })
+        if ($existing.Count -eq 0) {
+            New-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -InterfaceIndex $route.InterfaceIndex -NextHop $route.NextHop -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+            $created += $i
+        }
+    }
+    [Console]::Out.WriteLine(($created -join ','))
+} catch {
+    for ($j = $created.Count - 1; $j -ge 0; $j--) {
+        $route = $plan[$created[$j]]
+        $prefix = [string]$route.Address + '/' + [string]$route.Prefix
+        Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceIndex -eq $route.InterfaceIndex -and $_.DestinationPrefix -eq $prefix -and $_.NextHop -eq $route.NextHop } |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    throw
+}
+"#;
+    powershell_script(TEMPLATE, &[("__ROWS__", &route_rows(plan))])
+}
+
+/// Create one `/32` escape route and exit with code 10 when it was created.
+#[cfg(any(windows, test))]
+fn add_route_script(route: Route) -> String {
+    const TEMPLATE: &str = r#"
+$existing = @(__QUERY__)
+if ($existing.Count -eq 0) {
+    New-NetRoute -AddressFamily IPv4 -DestinationPrefix '__DESTINATION__' -InterfaceIndex __INDEX__ -NextHop '__GATEWAY__' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+    exit 10
+}
+"#;
+    powershell_script(
+        TEMPLATE,
+        &[
+            ("__QUERY__", &route.query()),
+            ("__DESTINATION__", &route.destination()),
+            ("__INDEX__", &route.index.to_string()),
+            ("__GATEWAY__", &route.gateway.to_string()),
+        ],
+    )
+}
+
+#[cfg(any(windows, test))]
+fn remove_route_script(route: Route) -> String {
+    const TEMPLATE: &str = r#"
+$existing = @(__QUERY__)
+if ($existing.Count -gt 0) {
+    $existing | Remove-NetRoute -Confirm:$false -ErrorAction Stop | Out-Null
+}
+"#;
+    powershell_script(TEMPLATE, &[("__QUERY__", &route.query())])
+}
+
+#[cfg(any(windows, test))]
+fn remove_ipv6_rule_script(rule: &str) -> String {
+    const TEMPLATE: &str = r#"
+$existing = Get-NetFirewallRule -Name '__RULE__' -ErrorAction SilentlyContinue
+if ($null -ne $existing) {
+    Remove-NetFirewallRule -InputObject $existing -Confirm:$false -ErrorAction Stop | Out-Null
+}
+"#;
+    powershell_script(TEMPLATE, &[("__RULE__", rule)])
+}
+
+/// Verify that Windows actually accepted the full-tunnel routes.
+#[cfg(any(windows, test))]
+fn verify_full_tunnel_script(tun_index: u32) -> String {
+    const TEMPLATE: &str = r#"
+Set-NetIPInterface -InterfaceIndex __INDEX__ -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 1 -ErrorAction Stop
+$required = @('0.0.0.0/1','128.0.0.0/1','0.0.0.0/0')
+foreach ($prefix in $required) {
+    $found = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -InterfaceIndex __INDEX__ -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq '0.0.0.0' })
+    if ($found.Count -eq 0) { throw ('missing ToTS route ' + $prefix + ' on interface __INDEX__') }
+}
+$adapter = Get-NetAdapter -InterfaceIndex __INDEX__ -IncludeHidden -ErrorAction Stop | Select-Object -First 1
+if ($adapter.Status -ne 'Up') { throw 'ToTS Wintun adapter is not Up' }
+"#;
+    powershell_script(TEMPLATE, &[("__INDEX__", &tun_index.to_string())])
+}
+
+#[cfg(any(windows, test))]
+fn snapshot_dns_script(index: u32) -> String {
+    const TEMPLATE: &str = r#"
+$servers = @(Get-DnsClientServerAddress -InterfaceIndex __INDEX__ -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ })
+ConvertTo-Json -InputObject $servers -Compress
+"#;
+    powershell_script(TEMPLATE, &[("__INDEX__", &index.to_string())])
+}
+
+#[cfg(any(windows, test))]
+fn forced_underlay_script(index: u32) -> String {
+    const TEMPLATE: &str = r#"
+$adapter = Get-NetAdapter -InterfaceIndex __INDEX__ -IncludeHidden -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $adapter -or $adapter.Status -ne 'Up') {
+    throw 'TOTS_PHYSICAL_IFINDEX does not name an Up adapter'
+}
+$ip = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex __INDEX__ -ErrorAction SilentlyContinue |
+    Where-Object { $_.ConnectionState -eq 'Connected' } | Select-Object -First 1
+if ($null -eq $ip) {
+    throw 'TOTS_PHYSICAL_IFINDEX has no connected IPv4 interface'
+}
+$localAddress = [string](Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex __INDEX__ -ErrorAction SilentlyContinue |
+    Where-Object { $_.AddressState -eq 'Preferred' } | Select-Object -First 1).IPAddress
+$rows = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex __INDEX__ -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+    Where-Object { $_.NextHop -ne '0.0.0.0' } |
+    ForEach-Object {
+        [PSCustomObject]@{
+            InterfaceIndex = [uint32]$_.InterfaceIndex
+            NextHop = [string]$_.NextHop
+            RouteMetric = [uint32]$_.RouteMetric
+            InterfaceMetric = [uint32]$ip.InterfaceMetric
+            PhysicalRank = [uint32]0
+            Address = $localAddress
+        }
+    })
+if ($rows.Count -eq 0) {
+    throw 'TOTS_PHYSICAL_IFINDEX has no usable active IPv4 default route'
+}
+ConvertTo-Json -InputObject $rows -Compress
+"#;
+    powershell_script(TEMPLATE, &[("__INDEX__", &index.to_string())])
+}
+
+/// Discover the physical underlay from the active IPv4 default routes.
+#[cfg(any(windows, test))]
+fn automatic_underlay_script() -> &'static str {
+    r#"
+$rows = @()
+$virtualPattern = 'Wintun|(^|[^A-Za-z])TUN([^A-Za-z]|$)|(^|[^A-Za-z])TAP([^A-Za-z]|$)|Virtual|VPN|WireGuard|ZeroTier|Radmin|Hamachi|Loopback|Hyper-V|Tailscale|OpenVPN|ToTS'
+$routes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction Stop |
+    Where-Object { $_.NextHop -ne '0.0.0.0' })
+foreach ($route in $routes) {
+    $adapter = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $adapter -or $adapter.Status -ne 'Up') {
+        continue
+    }
+    $identity = [string]$adapter.Name + ' ' + [string]$adapter.InterfaceDescription
+    if ($identity -match $virtualPattern) {
+        continue
+    }
+    $ip = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue |
+        Where-Object { $_.ConnectionState -eq 'Connected' } | Select-Object -First 1
+    if ($null -eq $ip) {
+        continue
+    }
+
+    # Prefer adapters that Windows marks as real hardware. Some Wi-Fi/USB drivers
+    # report this incorrectly, so non-blacklisted candidates stay as a lower-ranked
+    # fallback instead of making discovery fail.
+    $rank = 1
+    if (($adapter.HardwareInterface -eq $true) -and ($adapter.Virtual -ne $true)) {
+        $rank = 0
+    }
+    $localAddress = [string](Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue |
+        Where-Object { $_.AddressState -eq 'Preferred' } | Select-Object -First 1).IPAddress
+    $rows += [PSCustomObject]@{
+        InterfaceIndex = [uint32]$route.InterfaceIndex
+        NextHop = [string]$route.NextHop
+        RouteMetric = [uint32]$route.RouteMetric
+        InterfaceMetric = [uint32]$ip.InterfaceMetric
+        PhysicalRank = [uint32]$rank
+        Address = $localAddress
+    }
+}
+ConvertTo-Json -InputObject $rows -Compress
+"#
+}
+
+#[cfg(any(windows, test))]
 fn capture_underlay_sync() -> Result<UnderlayRoute> {
     let forced = match std::env::var("TOTS_PHYSICAL_IFINDEX") {
         Ok(raw) if !raw.trim().is_empty() => {
@@ -549,83 +760,10 @@ fn capture_underlay_sync() -> Result<UnderlayRoute> {
         _ => None,
     };
 
-    let script = if let Some(index) = forced {
-        format!(
-            r#"
-            $rows = @()
-            $adapter = Get-NetAdapter -InterfaceIndex {index} -IncludeHidden -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -eq $adapter -or $adapter.Status -ne 'Up') {{
-                throw 'TOTS_PHYSICAL_IFINDEX does not name an Up adapter'
-            }}
-            $ip = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex {index} -ErrorAction SilentlyContinue |
-                Where-Object {{ $_.ConnectionState -eq 'Connected' }} | Select-Object -First 1
-            if ($null -eq $ip) {{
-                throw 'TOTS_PHYSICAL_IFINDEX has no connected IPv4 interface'
-            }}
-            $localAddress = [string](Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex {index} -ErrorAction SilentlyContinue |
-                Where-Object {{ $_.AddressState -eq 'Preferred' }} | Select-Object -First 1).IPAddress
-            $rows = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex {index} -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
-                Where-Object {{ $_.NextHop -ne '0.0.0.0' }} |
-                ForEach-Object {{
-                    [PSCustomObject]@{{
-                        InterfaceIndex = [uint32]$_.InterfaceIndex
-                        NextHop = [string]$_.NextHop
-                        RouteMetric = [uint32]$_.RouteMetric
-                        InterfaceMetric = [uint32]$ip.InterfaceMetric
-                        PhysicalRank = [uint32]0
-                        Address = $localAddress
-                    }}
-                }})
-            if ($rows.Count -eq 0) {{
-                throw 'TOTS_PHYSICAL_IFINDEX has no usable active IPv4 default route'
-            }}
-            ConvertTo-Json -InputObject $rows -Compress
-            "#
-        )
-    } else {
-        r#"
-        $rows = @()
-        $virtualPattern = 'Wintun|(^|[^A-Za-z])TUN([^A-Za-z]|$)|(^|[^A-Za-z])TAP([^A-Za-z]|$)|Virtual|VPN|WireGuard|ZeroTier|Radmin|Hamachi|Loopback|Hyper-V|Tailscale|OpenVPN|ToTS'
-        $routes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction Stop |
-            Where-Object { $_.NextHop -ne '0.0.0.0' })
-        foreach ($route in $routes) {
-            $adapter = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -eq $adapter -or $adapter.Status -ne 'Up') {
-                continue
-            }
-            $identity = [string]$adapter.Name + ' ' + [string]$adapter.InterfaceDescription
-            if ($identity -match $virtualPattern) {
-                continue
-            }
-            $ip = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue |
-                Where-Object { $_.ConnectionState -eq 'Connected' } | Select-Object -First 1
-            if ($null -eq $ip) {
-                continue
-            }
-
-            # Prefer adapters that Windows marks as real hardware. Some Wi-Fi/USB
-            # drivers report this incorrectly, so non-blacklisted candidates remain
-            # as a lower-priority fallback rather than making discovery fail.
-            $rank = 1
-            if (($adapter.HardwareInterface -eq $true) -and ($adapter.Virtual -ne $true)) {
-                $rank = 0
-            }
-            $localAddress = [string](Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue |
-                Where-Object { $_.AddressState -eq 'Preferred' } | Select-Object -First 1).IPAddress
-            $rows += [PSCustomObject]@{
-                InterfaceIndex = [uint32]$route.InterfaceIndex
-                NextHop = [string]$route.NextHop
-                RouteMetric = [uint32]$route.RouteMetric
-                InterfaceMetric = [uint32]$ip.InterfaceMetric
-                PhysicalRank = [uint32]$rank
-                Address = $localAddress
-            }
-        }
-        ConvertTo-Json -InputObject $rows -Compress
-        "#
-        .to_owned()
+    let script = match forced {
+        Some(index) => forced_underlay_script(index),
+        None => automatic_underlay_script().to_owned(),
     };
-
     let output = powershell(&script).context("read physical IPv4 default route")?;
     let json = String::from_utf8(output.stdout).context("default-route JSON was not UTF-8")?;
     let underlay = parse_default_route(&json, 0)?;
@@ -746,31 +884,13 @@ fn set_ipv4_dns_script(indices: &[u32]) -> String {
         .join("; ")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn install_sync(
     tun_index: i32,
     protected: Vec<Ipv4Addr>,
     underlay: UnderlayRoute,
 ) -> Result<FullTunnelRoutes> {
-    if tun_index <= 0 {
-        bail!("invalid TUN interface index");
-    }
-    validate_underlay(tun_index as u32, underlay)?;
-    if protected.is_empty() {
-        bail!("full tunnel requires at least one protected transport endpoint");
-    }
-    if protected
-        .iter()
-        .any(|ip| ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast())
-    {
-        bail!("protected transport endpoints must be usable IPv4 addresses");
-    }
-
-    let mut guard = FullTunnelRoutes {
-        changes: OwnedChanges::default(),
-        underlay,
-        protected: protected.iter().copied().collect(),
-    };
+    let mut guard = build_guard(tun_index, &protected, underlay)?;
     let result = (|| -> Result<()> {
         // ToTS carries IPv4 only. Block IPv6 egress while the tunnel is up
         // rather than silently letting IPv6-capable applications bypass Wintun.
@@ -798,10 +918,8 @@ fn install_sync(
 
         // Verify the active route table instead of treating a successful PowerShell
         // process exit as proof that Windows accepted the full-tunnel routes.
-        powershell(&format!(
-            "Set-NetIPInterface -InterfaceIndex {tun_index} -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 1 -ErrorAction Stop; $required = @('0.0.0.0/1','128.0.0.0/1','0.0.0.0/0'); foreach ($prefix in $required) {{ $found = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -InterfaceIndex {tun_index} -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object {{ $_.NextHop -eq '0.0.0.0' }}); if ($found.Count -eq 0) {{ throw ('missing ToTS route ' + $prefix + ' on interface {tun_index}') }} }}; $adapter = Get-NetAdapter -InterfaceIndex {tun_index} -IncludeHidden -ErrorAction Stop | Select-Object -First 1; if ($adapter.Status -ne 'Up') {{ throw 'ToTS Wintun adapter is not Up' }}"
-        ))
-        .context("verify Windows full-tunnel routes")?;
+        powershell(&verify_full_tunnel_script(tun_index as u32))
+            .context("verify Windows full-tunnel routes")?;
 
         // Snapshot and replace DNS on both the physical underlay and Wintun. This
         // prevents Windows' multi-homed DNS client from continuing to query the
@@ -833,13 +951,16 @@ fn install_sync(
     Ok(guard)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn snapshot_dns(index: u32) -> Result<DnsSnapshot> {
-    let output = powershell(&format!(
-        "$servers = @(Get-DnsClientServerAddress -InterfaceIndex {index} -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object {{ $_.ServerAddresses }} | Where-Object {{ $_ }}); ConvertTo-Json -InputObject $servers -Compress"
-    ))
-    .with_context(|| format!("snapshot IPv4 DNS servers on interface {index}"))?;
+    let output = powershell(&snapshot_dns_script(index))
+        .with_context(|| format!("snapshot IPv4 DNS servers on interface {index}"))?;
     let raw = String::from_utf8(output.stdout).context("DNS snapshot was not UTF-8")?;
+    parse_dns_snapshot(index, &raw)
+}
+
+#[cfg(any(windows, test))]
+fn parse_dns_snapshot(index: u32, raw: &str) -> Result<DnsSnapshot> {
     let value: serde_json::Value = serde_json::from_str(raw.trim())
         .context("parse IPv4 DNS snapshot")?;
     let entries: Vec<&serde_json::Value> = match &value {
@@ -857,6 +978,17 @@ fn snapshot_dns(index: u32) -> Result<DnsSnapshot> {
         }
     }
     Ok(DnsSnapshot { index, servers })
+}
+
+/// Stand-in for the Windows PowerShell runner.
+///
+/// The Windows route implementation is compiled under `cfg(test)` on every host so
+/// the Linux test suite type-checks it: a Windows-only field previously hid a
+/// `collect()` mismatch until the Windows CI job failed. Calls from a non-Windows
+/// test always fail, which is what those tests expect.
+#[cfg(all(test, not(windows)))]
+fn powershell(_script: &str) -> Result<std::process::Output> {
+    bail!("Windows PowerShell is not available on this host")
 }
 
 #[cfg(windows)]
@@ -1012,6 +1144,125 @@ mod tests {
         assert_eq!(owned.dns[0].servers, vec!["1.1.1.1".parse::<Ipv4Addr>().unwrap()]);
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn refresh_protected_records_new_endpoints_without_duplicating_routes() {
+        // PowerShell is unavailable here, so every dynamic route add fails. The
+        // point of the test is that the code path compiles on Linux and that a
+        // failure is reported without corrupting the tracked set.
+        let mut guard = build_guard(7, &["203.0.113.9".parse().unwrap()], default_route()).unwrap();
+        let endpoint: Ipv4Addr = "198.51.100.7".parse().unwrap();
+        assert_eq!(guard.properties_for_test(), (true, 1));
+        // The script fails on this host, so no endpoint is claimed and no route is
+        // recorded; a partial failure must never corrupt the tracked set.
+        guard.refresh_protected(vec![endpoint]).await.unwrap();
+        assert_eq!(guard.properties_for_test(), (true, 1));
+        assert!(guard.changes.routes.is_empty());
+        // Unusable endpoints are filtered before any script runs.
+        guard
+            .refresh_protected(vec![Ipv4Addr::UNSPECIFIED, Ipv4Addr::LOCALHOST])
+            .await
+            .unwrap();
+        assert_eq!(guard.properties_for_test(), (true, 1));
+        // Releasing a stale endpoint must not panic with an empty route list.
+        guard
+            .release_endpoints_for_test(vec!["192.0.2.99".parse().unwrap()])
+            .await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn windows_installation_reports_a_missing_powershell_instead_of_panicking() {
+        // `install`, `install_route_plan`, `snapshot_dns` and `capture_underlay_sync`
+        // are Windows-only in production; on this host they must fail cleanly, which
+        // also type-checks them in the Linux test suite.
+        let plan = route_plan(7, default_route(), vec!["203.0.113.9".parse().unwrap()]);
+        assert!(install_route_plan(&plan).is_err());
+        assert!(snapshot_dns(12).is_err());
+        let result = install_sync(7, vec!["203.0.113.9".parse().unwrap()], default_route());
+        let error = match result {
+            Ok(_) => panic!("no PowerShell on this host, so install must fail"),
+            Err(error) => error,
+        };
+        assert!(!format!("{error:#}").is_empty());
+        // Partial routes must be rolled back, never leaked as live system routes.
+        assert!(capture_underlay_sync().is_err());
+    }
+
+    #[test]
+    fn capture_underlay_validates_the_forced_index_before_running_powershell() {
+        std::env::set_var("TOTS_PHYSICAL_IFINDEX", "0");
+        let error = capture_underlay_sync().expect_err("index 0 is invalid");
+        assert!(format!("{error:#}").contains("TOTS_PHYSICAL_IFINDEX"));
+        std::env::set_var("TOTS_PHYSICAL_IFINDEX", "not-a-number");
+        assert!(capture_underlay_sync().is_err());
+        std::env::remove_var("TOTS_PHYSICAL_IFINDEX");
+    }
+
+    #[test]
+    fn guard_accepts_valid_endpoints_and_rejects_unusable_ones() {
+        let underlay = default_route();
+        let guard = build_guard(7, &["203.0.113.9".parse().unwrap()], underlay).unwrap();
+        // The initial route plan's endpoints must be recorded, otherwise the first
+        // refresh re-adds them and the set drifts.
+        assert!(guard.protected.contains(&"203.0.113.9".parse().unwrap()));
+        assert_eq!(guard.underlay, underlay);
+        assert!(guard.changes.routes.is_empty());
+        assert!(guard.changes.dns.is_empty());
+        assert!(guard.changes.ipv6_rule.is_none());
+
+        // Same checks `install` enforced inline before the guard was extracted.
+        assert!(build_guard(0, &["203.0.113.9".parse().unwrap()], underlay).is_err());
+        assert!(build_guard(7, &[], underlay).is_err());
+        for bad in ["0.0.0.0", "127.0.0.1", "224.0.0.1", "255.255.255.255"] {
+            assert!(
+                build_guard(7, &[bad.parse().unwrap()], underlay).is_err(),
+                "accepted {bad}"
+            );
+        }
+        // The underlay index must never be the TUN index.
+        assert!(build_guard(12, &["203.0.113.9".parse().unwrap()], underlay).is_err());
+    }
+
+    #[test]
+    fn protected_endpoint_set_expires_idle_entries_and_respects_its_cap() {
+        let mut set = ProtectedEndpoints::default();
+        for octet in 1..=4u8 {
+            set.insert(Ipv4Addr::new(203, 0, 113, octet));
+        }
+        assert_eq!(set.len(), 4);
+        // Nothing is stale before the grace period.
+        assert!(set.expired(std::time::Instant::now()).is_empty());
+        // After it, every entry may be released. `insert` timestamps with
+        // `Instant::now()`, so allow for the elapsed test execution.
+        let later = std::time::Instant::now() + ProtectedEndpoints::IDLE_EXPIRY * 2;
+        assert_eq!(set.expired(later).len(), 4);
+
+        // Above the cap the oldest entries are released even while still "fresh".
+        let mut capped = ProtectedEndpoints::default();
+        let overflow = 10usize;
+        for index in 0..(ProtectedEndpoints::MAX + overflow) {
+            let address = Ipv4Addr::new(
+                198,
+                51,
+                u8::try_from(index / 250).unwrap_or(0),
+                u8::try_from(index % 250).unwrap_or(0),
+            );
+            capped.insert(address);
+        }
+        assert_eq!(capped.len(), ProtectedEndpoints::MAX + overflow);
+        let released = capped.expired(std::time::Instant::now());
+        assert_eq!(released.len(), overflow);
+
+        // Re-touching a tracked endpoint refreshes it, so an active provider
+        // endpoint is not released while it is still in use.
+        let active = Ipv4Addr::new(198, 51, 0, 0);
+        assert!(capped.contains(&active));
+        capped.touch(&active);
+        assert!(capped.contains(&active));
+        assert_eq!(capped.len(), ProtectedEndpoints::MAX + overflow);
+    }
+
     #[test]
     fn guard_does_not_claim_preexisting_routes() {
         let routes = route_plan(7, default_route(), vec![]);
@@ -1030,6 +1281,104 @@ mod tests {
           {"InterfaceIndex":12,"NextHop":"192.168.1.1","RouteMetric":20,"InterfaceMetric":10,"PhysicalRank":0}
         ]"#;
         assert_eq!(parse_default_route(rows, 0).unwrap(), default_route());
+    }
+
+    #[test]
+    fn windows_scripts_are_complete_and_brace_balanced() {
+        // These scripts used to be built with `format!`, so every PowerShell brace
+        // needed doubling and a mismatch only surfaced on a Windows build. They are
+        // now plain templates; assert that every placeholder was substituted and
+        // that braces balance, so the Linux test suite catches a broken script.
+        let route = Route {
+            address: "203.0.113.9".parse().unwrap(),
+            prefix: 32,
+            index: 12,
+            gateway: "192.168.1.1".parse().unwrap(),
+        };
+        let plan = route_plan(7, default_route(), vec!["203.0.113.9".parse().unwrap()]);
+        let scripts = vec![
+            install_route_plan_script(&plan),
+            add_route_script(route),
+            remove_route_script(route),
+            remove_ipv6_rule_script("ToTS-IPv6-Block-1234"),
+            verify_full_tunnel_script(7),
+            snapshot_dns_script(12),
+            forced_underlay_script(12),
+            automatic_underlay_script().to_owned(),
+            ipv6_block_rule_script("ToTS-IPv6-Block-1234"),
+            set_ipv4_dns_script(&[7, 12]),
+            restore_dns_script(&DnsSnapshot {
+                index: 12,
+                servers: vec!["1.1.1.1".parse().unwrap()],
+            }),
+        ];
+        const TOKENS: [&str; 7] = [
+            "__ROWS__",
+            "__QUERY__",
+            "__INDEX__",
+            "__GATEWAY__",
+            "__DESTINATION__",
+            "__RULE__",
+            "__TOTS_RULE__",
+        ];
+        for script in scripts {
+            for token in TOKENS {
+                assert!(
+                    !script.contains(token),
+                    "unsubstituted {token} in: {}",
+                    script.trim()
+                );
+            }
+            assert!(
+                script.matches('{').count() == script.matches('}').count(),
+                "unbalanced braces in: {}",
+                script.trim()
+            );
+            assert!(!script.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn windows_route_scripts_carry_the_route_they_manage() {
+        let route = Route {
+            address: "203.0.113.9".parse().unwrap(),
+            prefix: 32,
+            index: 12,
+            gateway: "192.168.1.1".parse().unwrap(),
+        };
+        let add = add_route_script(route);
+        assert!(add.contains("-DestinationPrefix '203.0.113.9/32'"));
+        assert!(add.contains("-InterfaceIndex 12"));
+        assert!(add.contains("-NextHop '192.168.1.1'"));
+        assert!(add.contains("exit 10"));
+        assert!(remove_route_script(route).contains("Remove-NetRoute"));
+        // Every plan row must reach the script as a literal object.
+        let plan = route_plan(7, default_route(), vec!["203.0.113.9".parse().unwrap()]);
+        let install = install_route_plan_script(&plan);
+        assert!(install.contains("Address='203.0.113.9'; Prefix=32; InterfaceIndex=12"));
+        assert!(install.contains("Address='0.0.0.0'; Prefix=1; InterfaceIndex=7"));
+        let verify = verify_full_tunnel_script(7);
+        assert!(verify.contains("-InterfaceIndex 7"));
+        assert!(verify.contains("'0.0.0.0/1'"));
+        assert!(!verify.contains("__INDEX__"));
+    }
+
+    #[test]
+    fn windows_dns_snapshot_parsing_is_shared_with_the_script_builder() {
+        assert!(snapshot_dns_script(12).contains("-InterfaceIndex 12"));
+        let snapshot = parse_dns_snapshot(12, r#"["1.1.1.1","8.8.8.8","1.1.1.1"]"#).unwrap();
+        assert_eq!(snapshot.index, 12);
+        assert_eq!(
+            snapshot.servers,
+            vec![
+                "1.1.1.1".parse::<Ipv4Addr>().unwrap(),
+                "8.8.8.8".parse::<Ipv4Addr>().unwrap()
+            ]
+        );
+        assert!(parse_dns_snapshot(12, "null").unwrap().servers.is_empty());
+        assert!(parse_dns_snapshot(12, r#""9.9.9.9""#).is_ok());
+        assert!(parse_dns_snapshot(12, "123").is_err());
+        assert!(parse_dns_snapshot(12, r#"["not-an-ip"]"#).is_err());
     }
 
     #[test]

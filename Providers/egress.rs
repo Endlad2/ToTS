@@ -163,12 +163,17 @@ fn env(name: &str) -> Option<String> {
 /// physical adapter's own IPv4 address makes the strong-host model choose that
 /// adapter, so the client publishes the captured underlay address here.
 pub fn configure_address(address: Ipv4Addr, name: Option<&str>) -> Option<Egress> {
-    if let Some(existing) = current() {
-        return Some(existing);
-    }
-    let selected = Egress::new(name.unwrap_or("physical-underlay"))
-        .with_index(env(EGRESS_INDEX_ENV).and_then(|value| value.parse::<u32>().ok()))
-        .with_address(Some(address));
+    // The client may already have selected an adapter by name (`--egress-interface`)
+    // before the underlay address became known, so merge instead of ignoring it.
+    let selected = match current() {
+        Some(existing) => Egress {
+            address: Some(address),
+            ..existing
+        },
+        None => Egress::new(name.unwrap_or("physical-underlay"))
+            .with_index(env(EGRESS_INDEX_ENV).and_then(|value| value.parse::<u32>().ok()))
+            .with_address(Some(address)),
+    };
     publish(&selected);
     store(Some(selected))
 }
@@ -349,6 +354,11 @@ pub fn apply(socket: &Socket) -> bool {
     let Some(egress) = ensure() else {
         return false;
     };
+    if !platform_supported() {
+        // Windows has no device-bind socket option; `outbound_bind` already pinned
+        // the source address, so this is not an error worth reporting.
+        return false;
+    }
     if let Err(error) = bind_device(socket, &egress) {
         return record_error(format!(
             "cannot bind to interface {}: {error}",

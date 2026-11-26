@@ -33,7 +33,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
-socket2 = "0.6"
+# `all` is what exposes `bind_device`/`bind_device_by_index_v4`; rely on it explicitly
+# instead of inheriting the feature through tokio/hyper-util unification.
+socket2 = { version = "0.6", features = ["all"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
