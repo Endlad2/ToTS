@@ -415,11 +415,18 @@ async fn missing_subscriber_sdp_times_out_and_sends_leave() {
 }
 
 #[tokio::test]
-async fn missing_turn_credentials_times_out_and_sends_leave() {
+async fn sessions_without_turn_credentials_still_become_ready() {
+    // A STUN-only (or host-candidate-only) assignment is a valid media session.
+    // Gating readiness on TURN credentials made provisioning time out on such
+    // networks, which is why the gate was removed.
     let mut fixture = Fixture::start(Mode::NoTurn).await;
-    let result = establish(fixture.call(), Duration::from_millis(700)).await;
-    assert!(matches!(result, Err(crate::Error::Timeout(_))));
-    fixture.event("subscriber-answer").await;
+    let session = establish(fixture.call(), Duration::from_secs(5))
+        .await
+        .expect("a session without TURN credentials must still negotiate");
+    let data = session.json().await;
+    assert_eq!(data["status"], "ready");
+    assert_eq!(data["webrtc"]["ice_servers"], json!([]));
+    session.close().await.unwrap();
     fixture.event("leave").await;
     fixture.finish().await;
 }

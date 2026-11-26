@@ -10,10 +10,7 @@ use reqwest::{cookie::{CookieStore, Jar}, Client};
 use serde_json::{json, Value};
 use std::{sync::Arc, time::{Duration, Instant}};
 use tokio::sync::oneshot;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
-};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
 use tracing::{debug, warn};
 
 pub const MAX_WORKER_ROOMS: usize = 50;
@@ -85,10 +82,8 @@ pub fn worker_room_data(data: &Value, worker_id: usize) -> Result<Value> {
             .ok_or_else(|| Error::Provider("cups worker room has no room_id".into()))?;
         return Ok(json!({"room_id":room_id}));
     }
-    if worker_id == 0 {
-        if data.get("room_id").and_then(Value::as_str).is_some() {
-            return Ok(data.clone());
-        }
+    if worker_id == 0 && data.get("room_id").and_then(Value::as_str).is_some() {
+        return Ok(data.clone());
     }
     Err(Error::Provider(
         "cups worker has no provisioned room; create the config with cups.worker_count >= --n".into(),
@@ -152,7 +147,7 @@ async fn run(
 ) -> Result<()> {
     remember_url(&endpoint.route_ips, BASE_ROOM_URL).await;
     let jar = Arc::new(Jar::default());
-    let client = Client::builder()
+    let client = crate::egress::configure_http(Client::builder())
         .cookie_provider(jar.clone())
         .timeout(Duration::from_secs(30))
         .build()
@@ -221,7 +216,10 @@ async fn reconnect_wait(endpoint: &mut ChannelEndpoint, attempt: u32) -> Result<
     tokio::select! {
         _ = tokio::time::sleep(delay) => Ok(()),
         changed = endpoint.shutdown.changed() => {
-            if changed.is_err() || *endpoint.shutdown.borrow() { Ok(()) } else { Ok(()) }
+            // Either the sender was dropped or shutdown was requested: retrying is
+            // pointless in both cases, the caller re-checks the flag.
+            let _ = changed;
+            Ok(())
         }
     }
 }
@@ -336,7 +334,7 @@ async fn connect_and_serve(
                 .map_err(|e| provider_error("cups Cookie header", e))?,
         );
     }
-    let (mut socket, _) = connect_async(request)
+    let (mut socket, _) = crate::ws::connect(request, None)
         .await
         .map_err(|e| provider_error("cups WebSocket connect", e))?;
     socket
@@ -440,7 +438,7 @@ fn cups_data_message(auth: &Auth, id: u64, data: &[u8]) -> Message {
     payload.extend_from_slice(&(data.len() as u16).to_be_bytes());
     payload.extend_from_slice(data);
     let numbers = pack_numbers(&payload);
-    let mut cursors = Vec::with_capacity((numbers.len() + 1) / 2);
+    let mut cursors = Vec::with_capacity(numbers.len().div_ceil(2));
     for chunk in numbers.chunks(2) {
         cursors.push(json!({
             "row":chunk[0],
@@ -603,12 +601,12 @@ fn meta_content(html: &str, name: &str) -> Option<String> {
 
 fn extract_html_uuid(html: &str, attr: &str) -> Option<String> {
     let value = attr_value_any(html, attr)?;
-    let (after_key, encoded_quote) = if let Some(index) = value.find("uuid&quot;") {
-        (&value[index + "uuid&quot;".len()..], true)
-    } else if let Some(index) = value.find("\"uuid\"") {
-        (&value[index + "\"uuid\"".len()..], false)
-    } else {
-        return None;
+    let (after_key, encoded_quote) = match value.find("uuid&quot;") {
+        Some(index) => (&value[index + "uuid&quot;".len()..], true),
+        None => {
+            let index = value.find("\"uuid\"")?;
+            (&value[index + "\"uuid\"".len()..], false)
+        }
     };
     let colon = after_key.find(':')? + 1;
     let after_colon = after_key[colon..].trim_start();

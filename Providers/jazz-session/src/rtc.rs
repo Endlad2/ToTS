@@ -61,6 +61,8 @@ const RTP_TOTS_HEADER: usize = 23;
 const RTP_TOTS_CHUNK: usize = 1000;
 const MAX_MEDIA_MESSAGE: usize = 32 * 1024;
 const MAX_MEDIA_FRAGMENTS: usize = 64;
+/// Bound on partially reassembled messages; the oldest is evicted first.
+const MAX_PENDING_ASSEMBLIES: usize = 128;
 const REASSEMBLY_TTL: Duration = Duration::from_secs(15);
 const RTP_CLOCK_STEP: u32 = 960; // 20 ms at 48 kHz
 const VIDEO_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -164,7 +166,10 @@ impl DataPlane {
             let packet = RtpPacket {
                 header: RtpHeader {
                     version: 2,
-                    marker: index + 1 == packet_count,
+                    // RFC 3551 marks the start of a talkspurt. Setting it on the
+                    // single packet of every message would reset talkspurt state
+                    // in strict receivers on every datagram.
+                    marker: packet_count > 1 && index + 1 == packet_count,
                     sequence_number: clock.0,
                     timestamp,
                     ..Default::default()
@@ -442,11 +447,21 @@ impl Reassembler {
         self.counters
             .reassembly_expired
             .fetch_add((before - self.messages.len()) as u64, Ordering::Relaxed);
-        if self.messages.len() > 128 {
-            self.counters
-                .reassembly_evicted
-                .fetch_add(self.messages.len() as u64, Ordering::Relaxed);
-            self.messages.clear();
+        if self.messages.len() > MAX_PENDING_ASSEMBLIES {
+            // Evict the single oldest partial message. Clearing the map threw away
+            // every in-progress payload (and their received fragments) at once,
+            // which under load silently dropped whole ToTS datagrams.
+            if let Some(oldest) = self
+                .messages
+                .iter()
+                .min_by_key(|(_, entry)| entry.created)
+                .map(|(key, _)| *key)
+            {
+                self.messages.remove(&oldest);
+                self.counters
+                    .reassembly_evicted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         if packet.len() < RTP_TOTS_HEADER || &packet[..4] != RTP_TOTS_MAGIC {
             return self.reject();
@@ -539,10 +554,17 @@ impl Peer {
         // relay gather path needed for TURN/TCP/TLS and Windows commonly
         // exposes unusable link-local/IPv6 adapters that otherwise produce 10049.
         settings.set_network_types(vec![NetworkType::Udp4]);
-        settings.set_ip_filter(Box::new(|ip| match ip {
-            IpAddr::V4(ip) => !ip.is_link_local() && !ip.is_unspecified(),
-            IpAddr::V6(_) => false,
-        }));
+        // Never advertise or use the ToTS tunnel address as a media path.
+        settings.set_ip_filter(Box::new(crate::icemux::ip_filter));
+        // Restrict candidate gathering to adapters that can actually carry
+        // provider media, and mux ICE over a single socket pinned to the
+        // physical underlay. Without this the media sockets follow the system
+        // default route, which a full-tunnel client has just pointed at its own
+        // TUN device, so WebRTC loops back into the tunnel and media never flows.
+        settings.set_interface_filter(crate::icemux::interface_filter());
+        if let Some(mux) = crate::icemux::pinned_udp_mux() {
+            settings.set_udp_network(crate::icemux::UDPNetwork::Muxed(mux));
+        }
         let api = APIBuilder::new()
             .with_media_engine(engine)
             .with_interceptor_registry(registry)
@@ -584,6 +606,9 @@ impl Peer {
                 let is_connected = state == RTCPeerConnectionState::Connected;
                 connected.store(is_connected, Ordering::SeqCst);
                 if is_connected {
+                    // `notify_one` stores a permit, so a readiness change that
+                    // happens before a waiter is first polled is not lost.
+                    ready_notify.notify_one();
                     ready_notify.notify_waiters();
                 }
             })
@@ -607,8 +632,12 @@ impl Peer {
                         return;
                     }
                     incoming_track_ready.store(true, Ordering::SeqCst);
+                    ready.notify_one();
                     ready.notify_waiters();
-                    if carrier.is_video() {
+                    {
+                        // Drain RTCP for every carrier. Without this the default
+                        // audio path never read sender/receiver reports or the
+                        // SFU's feedback, and its buffers were never consumed.
                         let counters = counters.clone();
                         tokio::spawn(async move {
                             while let Ok((packets, _)) = receiver.read_rtcp().await {
@@ -692,6 +721,7 @@ impl Peer {
     ) -> Result<(), MediaError> {
         let _operation = self.operation.lock().await;
         if self.pc.remote_description().await.is_some() {
+            // A rejected candidate is not fatal: ICE proceeds with the others.
             self.pc
                 .add_ice_candidate(candidate)
                 .await
@@ -830,53 +860,60 @@ fn ice_stats_summary(stats: &StatsReport) -> Value {
     json!({"pair_states":states,"nominated_pairs":nominated})
 }
 
+/// Parse the signalling server's ICE server list.
+///
+/// Entries the engine cannot use are skipped, not fatal: an SFU routinely mixes
+/// `turns:`/`transport=tcp` URLs, STUN-only entries and objects with unusual
+/// fields, and one of them used to abort the whole join (`Media::new` →
+/// "media initialization failed") even though the remaining servers were usable.
 fn configuration(value: &Value) -> Result<Vec<RTCIceServer>, MediaError> {
     let entries = value.as_array().ok_or(MediaError)?;
     let mut result = Vec::new();
 
     for item in entries {
-        let object = item.as_object().ok_or(MediaError)?;
+        let Some(object) = item.as_object() else {
+            continue;
+        };
         let mut raw_urls = match object.get("urls") {
             Some(Value::Array(items)) => items
                 .iter()
-                .map(|v| v.as_str().map(str::to_owned).ok_or(MediaError))
-                .collect::<Result<Vec<_>, _>>()?,
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect::<Vec<_>>(),
             Some(Value::String(value)) => vec![value.clone()],
             None | Some(Value::Null) => Vec::new(),
-            _ => return Err(MediaError),
+            _ => Vec::new(),
         };
         if let Some(value) = object.get("url").filter(|v| !v.is_null()) {
-            let url = value.as_str().ok_or(MediaError)?;
-            if !raw_urls.iter().any(|item| item == url) {
-                raw_urls.push(url.to_owned());
+            if let Some(url) = value.as_str() {
+                if !raw_urls.iter().any(|item| item == url) {
+                    raw_urls.push(url.to_owned());
+                }
             }
         }
 
-        let string = |key: &str| -> Result<String, MediaError> {
+        let string = |key: &str| -> String {
             match object.get(key) {
-                None | Some(Value::Null) => Ok(String::new()),
-                Some(Value::String(value)) => Ok(value.clone()),
-                _ => Err(MediaError),
+                Some(Value::String(value)) => value.clone(),
+                _ => String::new(),
             }
         };
-        let username = string("username")?;
-        let credential = string("credential")?;
+        let username = string("username");
+        let credential = string("credential");
 
         let mut urls = Vec::new();
         for raw in raw_urls {
-            let parsed = Url::parse_url(&raw).map_err(|_| MediaError)?;
+            let Ok(parsed) = Url::parse_url(&raw) else {
+                continue;
+            };
             let supported = if parsed.scheme == SchemeType::Stun {
                 true
             } else if parsed.scheme == SchemeType::Turn {
-                parsed.proto == ProtoType::Udp
+                parsed.proto == ProtoType::Udp && !username.is_empty() && !credential.is_empty()
             } else {
                 false
             };
             if !supported {
                 continue;
-            }
-            if parsed.scheme == SchemeType::Turn && (username.is_empty() || credential.is_empty()) {
-                return Err(MediaError);
             }
             urls.push(raw);
         }
@@ -1014,6 +1051,7 @@ impl Media {
             sid.to_owned(),
         ));
         *self.data.outgoing_track.write().await = Some(track.clone());
+        self.data.ready.notify_one();
         self.data.ready.notify_waiters();
         let transceiver = self
             .publisher
@@ -1027,7 +1065,9 @@ impl Media {
             )
             .await
             .map_err(|_| MediaError)?;
-        if self.data.carrier.is_video() {
+        {
+            // RTCP must be drained on the publishing side for every carrier,
+            // otherwise sender reports/NACKs accumulate unread.
             let sender = transceiver.sender().await;
             let counters = self.receive_counters.clone();
             tokio::spawn(async move {
@@ -1088,23 +1128,36 @@ impl Media {
     }
 
     pub(crate) async fn candidates(&self, items: &[Value]) -> Result<(), MediaError> {
+        // Signalling servers routinely trickle entries we cannot use: unknown
+        // targets, end-of-candidates markers, unsupported transports. Skipping
+        // them keeps the session alive; the previous code aborted the whole call
+        // on the first such item.
+        let mut applied = 0usize;
         for item in items {
-            let peer = match item.get("target").and_then(Value::as_str) {
-                Some("PUBLISHER") => &self.publisher,
-                Some("SUBSCRIBER") => &self.subscriber,
-                _ => return Err(MediaError),
+            let Some(peer) = item.get("target").and_then(Value::as_str).and_then(|target| {
+                match target {
+                    "PUBLISHER" => Some(&self.publisher),
+                    "SUBSCRIBER" => Some(&self.subscriber),
+                    _ => None,
+                }
+            }) else {
+                continue;
             };
-            let candidate: RTCIceCandidateInit =
-                serde_json::from_value(item.clone()).map_err(|_| MediaError)?;
+            let Ok(candidate) = serde_json::from_value::<RTCIceCandidateInit>(item.clone()) else {
+                continue;
+            };
             let text = candidate
                 .candidate
                 .strip_prefix("candidate:")
                 .unwrap_or(&candidate.candidate);
-            if !text.is_empty() {
-                unmarshal_candidate(text).map_err(|_| MediaError)?;
+            if !text.is_empty() && unmarshal_candidate(text).is_err() {
+                continue;
             }
-            peer.candidate(item.clone(), candidate).await?;
+            if peer.candidate(item.clone(), candidate).await.is_ok() {
+                applied += 1;
+            }
         }
+        let _ = applied;
         Ok(())
     }
 

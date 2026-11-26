@@ -10,7 +10,66 @@ pub struct FullTunnelRoutes {
     #[cfg(windows)]
     underlay: UnderlayRoute,
     #[cfg(windows)]
-    protected: std::collections::BTreeSet<Ipv4Addr>,
+    protected: ProtectedEndpoints,
+}
+
+/// Escape-route bookkeeping for provider endpoints.
+///
+/// Provider/TURN/CDN addresses rotate across reconnects, and the refresh tick runs
+/// every second. Remembering every address ever seen grew the route table and the
+/// per-tick PowerShell work without bound on long sessions, so endpoints that have
+/// not been reported for a while are removed again.
+#[cfg(windows)]
+#[derive(Default)]
+struct ProtectedEndpoints {
+    entries: std::collections::BTreeMap<Ipv4Addr, std::time::Instant>,
+}
+
+#[cfg(windows)]
+impl ProtectedEndpoints {
+    const MAX: usize = 512;
+    const IDLE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(900);
+
+    fn contains(&self, address: &Ipv4Addr) -> bool {
+        self.entries.contains_key(address)
+    }
+
+    fn insert(&mut self, address: Ipv4Addr) {
+        self.entries.insert(address, std::time::Instant::now());
+    }
+
+    fn touch(&mut self, address: &Ipv4Addr) {
+        if let Some(seen) = self.entries.get_mut(address) {
+            *seen = std::time::Instant::now();
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Endpoints that may be released: idle for the grace period, or the oldest
+    /// entries once the cap is exceeded.
+    fn expired(&self, now: std::time::Instant) -> Vec<Ipv4Addr> {
+        let mut candidates: Vec<(Ipv4Addr, std::time::Instant)> = self
+            .entries
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) >= Self::IDLE_EXPIRY)
+            .map(|(address, seen)| (*address, *seen))
+            .collect();
+        let remaining = self.entries.len().saturating_sub(candidates.len());
+        if remaining > Self::MAX {
+            let mut oldest: Vec<(Ipv4Addr, std::time::Instant)> = self
+                .entries
+                .iter()
+                .filter(|(address, _)| !candidates.iter().any(|(taken, _)| taken == *address))
+                .map(|(address, seen)| (*address, *seen))
+                .collect();
+            oldest.sort_by_key(|(_, seen)| *seen);
+            candidates.extend(oldest.into_iter().take(remaining - Self::MAX));
+        }
+        candidates.into_iter().map(|(address, _)| address).collect()
+    }
 }
 
 /// Physical/default underlay captured before Wintun is opened.
@@ -23,6 +82,12 @@ pub(crate) struct UnderlayRoute {
     index: u32,
     gateway: Ipv4Addr,
     metric: u64,
+    /// The adapter's own IPv4 address.
+    ///
+    /// Windows has no `SO_BINDTODEVICE`, so this is what pins ToTS transport
+    /// sockets to the physical adapter: a socket bound to the underlay's address
+    /// cannot be emitted through the TUN device.
+    address: Option<Ipv4Addr>,
 }
 
 pub(crate) async fn capture_underlay() -> Result<UnderlayRoute> {
@@ -64,17 +129,24 @@ impl FullTunnelRoutes {
     pub async fn refresh_protected(&mut self, endpoints: Vec<Ipv4Addr>) -> Result<()> {
         #[cfg(windows)]
         {
-            let candidates: Vec<Ipv4Addr> = endpoints
+            let live: Vec<Ipv4Addr> = endpoints
                 .into_iter()
                 .filter(|ip| {
                     !ip.is_unspecified()
                         && !ip.is_loopback()
                         && !ip.is_multicast()
                         && !ip.is_broadcast()
-                        && !self.protected.contains(ip)
                 })
                 .collect();
-            if candidates.is_empty() {
+            for address in &live {
+                self.protected.touch(address);
+            }
+            let candidates: Vec<Ipv4Addr> = live
+                .into_iter()
+                .filter(|ip| !self.protected.contains(ip))
+                .collect();
+            let stale = self.protected.expired(std::time::Instant::now());
+            if candidates.is_empty() && stale.is_empty() {
                 return Ok(());
             }
             let underlay = self.underlay;
@@ -108,9 +180,20 @@ impl FullTunnelRoutes {
             .await
             .context("Windows dynamic endpoint-route task failed")?;
             self.changes.routes.extend(created);
-            self.protected.extend(installed);
+            for address in installed {
+                self.protected.insert(address);
+            }
             for failure in failures {
                 tracing::warn!(error = %failure, "could not add a Windows provider escape route; will retry");
+            }
+            if !stale.is_empty() {
+                self.release_endpoints(stale).await;
+            }
+            if self.protected.len() > ProtectedEndpoints::MAX {
+                tracing::warn!(
+                    protected = self.protected.len(),
+                    "Windows escape-route set is above its cap; oldest endpoints are released first"
+                );
             }
         }
         #[cfg(not(windows))]
@@ -118,6 +201,49 @@ impl FullTunnelRoutes {
             let _ = endpoints;
         }
         Ok(())
+    }
+
+    /// Remove escape routes for endpoints that are no longer reported.
+    #[cfg(windows)]
+    async fn release_endpoints(&mut self, stale: Vec<Ipv4Addr>) {
+        if stale.is_empty() {
+            return;
+        }
+        let underlay = self.underlay;
+        let (released, failures) = tokio::task::spawn_blocking(move || {
+            let mut released = Vec::new();
+            let mut failures = Vec::new();
+            for address in stale {
+                let route = Route {
+                    address,
+                    prefix: 32,
+                    index: underlay.index,
+                    gateway: underlay.gateway,
+                };
+                match powershell(&format!(
+                    "$existing = @({}); if ($existing.Count -gt 0) {{ $existing | Remove-NetRoute -Confirm:$false -ErrorAction Stop | Out-Null }}",
+                    route.query()
+                )) {
+                    Ok(_) => released.push(address),
+                    Err(error) => failures.push(format!("{address}: {error:#}")),
+                }
+            }
+            (released, failures)
+        })
+        .await
+        .unwrap_or_default();
+        if !released.is_empty() {
+            self.changes
+                .routes
+                .retain(|route| !released.contains(&route.address));
+            for address in released {
+                self.protected.entries.remove(&address);
+            }
+            tracing::info!("released Windows provider escape routes for stale endpoints");
+        }
+        for failure in failures {
+            tracing::warn!(error = %failure, "could not release a Windows provider escape route");
+        }
     }
 
     pub async fn cleanup(mut self) -> Result<()> {
@@ -238,11 +364,22 @@ fn parse_default_route(json: &str, excluded_index: u32) -> Result<UnderlayRoute>
             .saturating_mul(1_000_000)
             .saturating_add(u64::from(number("RouteMetric")?))
             .saturating_add(u64::from(number("InterfaceMetric")?));
+        let address = row
+            .get("Address")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<Ipv4Addr>().ok())
+            .filter(|address| {
+                !address.is_unspecified()
+                    && !address.is_loopback()
+                    && !address.is_multicast()
+                    && !address.is_broadcast()
+            });
         if index != excluded_index {
             candidates.push(UnderlayRoute {
                 index,
                 gateway,
                 metric,
+                address,
             });
         }
     }
@@ -425,6 +562,8 @@ fn capture_underlay_sync() -> Result<UnderlayRoute> {
             if ($null -eq $ip) {{
                 throw 'TOTS_PHYSICAL_IFINDEX has no connected IPv4 interface'
             }}
+            $localAddress = [string](Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex {index} -ErrorAction SilentlyContinue |
+                Where-Object {{ $_.AddressState -eq 'Preferred' }} | Select-Object -First 1).IPAddress
             $rows = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex {index} -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
                 Where-Object {{ $_.NextHop -ne '0.0.0.0' }} |
                 ForEach-Object {{
@@ -434,6 +573,7 @@ fn capture_underlay_sync() -> Result<UnderlayRoute> {
                         RouteMetric = [uint32]$_.RouteMetric
                         InterfaceMetric = [uint32]$ip.InterfaceMetric
                         PhysicalRank = [uint32]0
+                        Address = $localAddress
                     }}
                 }})
             if ($rows.Count -eq 0) {{
@@ -470,12 +610,15 @@ fn capture_underlay_sync() -> Result<UnderlayRoute> {
             if (($adapter.HardwareInterface -eq $true) -and ($adapter.Virtual -ne $true)) {
                 $rank = 0
             }
+            $localAddress = [string](Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue |
+                Where-Object { $_.AddressState -eq 'Preferred' } | Select-Object -First 1).IPAddress
             $rows += [PSCustomObject]@{
                 InterfaceIndex = [uint32]$route.InterfaceIndex
                 NextHop = [string]$route.NextHop
                 RouteMetric = [uint32]$route.RouteMetric
                 InterfaceMetric = [uint32]$ip.InterfaceMetric
                 PhysicalRank = [uint32]$rank
+                Address = $localAddress
             }
         }
         ConvertTo-Json -InputObject $rows -Compress
@@ -489,9 +632,19 @@ fn capture_underlay_sync() -> Result<UnderlayRoute> {
     tracing::info!(
         physical_interface_index = underlay.index,
         physical_gateway = %underlay.gateway,
+        physical_address = %underlay
+            .address
+            .map(|address| address.to_string())
+            .unwrap_or_default(),
         forced = forced.is_some(),
         "captured Windows transport underlay"
     );
+    // Publish the underlay so ToTS's own sockets (direct UDP, TURN, provider HTTP
+    // and WebSocket signalling, WebRTC media) are bound to the physical adapter
+    // instead of following the full-tunnel default route.
+    if let Some(address) = underlay.address {
+        tots_core::egress::configure_address(address, None);
+    }
     Ok(underlay)
 }
 
@@ -751,6 +904,7 @@ mod tests {
             index: 12,
             gateway: "192.168.1.1".parse().unwrap(),
             metric: 30,
+            address: None,
         }
     }
 
@@ -876,6 +1030,21 @@ mod tests {
           {"InterfaceIndex":12,"NextHop":"192.168.1.1","RouteMetric":20,"InterfaceMetric":10,"PhysicalRank":0}
         ]"#;
         assert_eq!(parse_default_route(rows, 0).unwrap(), default_route());
+    }
+
+    #[test]
+    fn captures_the_adapter_ipv4_for_windows_source_binding() {
+        let rows = r#"[
+          {"InterfaceIndex":12,"NextHop":"192.168.1.1","RouteMetric":20,"InterfaceMetric":10,"Address":"192.168.1.10"},
+          {"InterfaceIndex":13,"NextHop":"192.168.1.1","RouteMetric":30,"InterfaceMetric":10,"Address":"not-an-address"}
+        ]"#;
+        let selected = parse_default_route(rows, 0).unwrap();
+        assert_eq!(selected.address, Some("192.168.1.10".parse().unwrap()));
+        // An unusable address is dropped instead of blocking capture.
+        let rows = r#"[
+          {"InterfaceIndex":12,"NextHop":"192.168.1.1","RouteMetric":20,"InterfaceMetric":10,"Address":"0.0.0.0"}
+        ]"#;
+        assert_eq!(parse_default_route(rows, 0).unwrap().address, None);
     }
 
     #[test]

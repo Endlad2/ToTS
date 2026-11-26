@@ -58,6 +58,15 @@ struct Args {
     /// Stop gracefully after this many seconds (for tests/app lifecycle integration).
     #[arg(long)]
     run_for_seconds: Option<u64>,
+    /// Force the physical adapter that carries ToTS transport and provider
+    /// signalling. Android normally sets this automatically from the default route;
+    /// the app may pass its own underlay (for example "wlan0").
+    #[arg(long, value_name = "NAME")]
+    egress_interface: Option<String>,
+    /// Disable physical-adapter pinning and use the ordinary route table. The
+    /// hosting app must then protect ToTS sockets itself.
+    #[arg(long)]
+    no_egress_pinning: bool,
 }
 
 fn config_from_args(a: &Args) -> Result<ConnectionConfig> {
@@ -94,6 +103,23 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = config_from_args(&args)?;
     cfg.validate()?;
+    // Keep ToTS transport and provider signalling off the VpnService TUN. The
+    // hosting app must still exclude its own package/UID for sockets that cannot be
+    // pinned (see AGENT.MD); pinning removes the loop for everything ToTS owns.
+    tots_core::egress::set_tunnel(Some("tots"), Some(cfg.virtual_ipv4()));
+    if args.no_egress_pinning {
+        std::env::set_var(tots_core::egress::EGRESS_DISABLE_ENV, "1");
+    } else {
+        match tots_core::egress::configure(args.egress_interface.as_deref()) {
+            Some(egress) => info!(
+                interface = egress.name(),
+                "ToTS transport is pinned to the physical adapter"
+            ),
+            None => info!(
+                "no physical egress adapter selected; ToTS transport follows the system route table"
+            ),
+        }
+    }
 
     let (manager, inbound) = WorkerManager::start(
         cfg.clone(),

@@ -143,7 +143,10 @@ pub async fn open(fd: Option<i32>, fd_socket: Option<&str>) -> Result<AndroidTun
         };
     }
 
-    let async_fd = AsyncFd::new(owned).context("register Android TUN fd with epoll")?;
+    // `register` is the I/O-safe entry point: it takes ownership of the `OwnedFd`,
+    // so the safety contract (the caller must not use the descriptor through
+    // another handle) is satisfied by construction.
+    let async_fd = unsafe { AsyncFd::register(owned) }.context("register Android TUN fd with epoll")?;
     Ok(AndroidTun {
         fd: async_fd,
         original_fd,

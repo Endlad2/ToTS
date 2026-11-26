@@ -32,8 +32,15 @@ impl MediaCarrier {
             48_000
         }
     }
+    /// Every carrier timestamps from the wall clock.
+    ///
+    /// The previous `Audio` path advanced the RTP timestamp by a fixed 20 ms per
+    /// *message*. `DataPlane::send` is called once per ToTS datagram, so at
+    /// 200 datagrams/s the audio clock ran 4x real time and kept accelerating
+    /// with load, which distorts the SFU's jitter/forwarding estimates exactly
+    /// when the tunnel is busy.
     pub(crate) fn uses_wallclock(self) -> bool {
-        self != Self::Audio
+        true
     }
 
     pub(crate) fn wrap_fragment(

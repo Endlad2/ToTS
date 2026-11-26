@@ -30,7 +30,7 @@ pub enum Reliability {
     Unreliable,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FlowKey {
     pub src: Ipv4Addr,
     pub dst: Ipv4Addr,
@@ -64,6 +64,19 @@ impl FlowManager {
             17 => Reliability::Unreliable,
             // ICMP and other control protocols benefit from bounded recovery.
             _ => Reliability::Reliable,
+        }
+    }
+
+    /// How long a queued best-effort packet may wait before it is stale.
+    ///
+    /// TCP carries its own retransmission and a 750 ms budget discarded whole
+    /// queued windows during provider hiccups, which the inner stack then had to
+    /// recover from scratch (multi-second stalls). UDP stays short because an old
+    /// datagram is worse than a lost one for interactive traffic.
+    pub fn best_effort_budget(packet: &[u8]) -> std::time::Duration {
+        match ip_transport(packet).map(|(protocol, _, _)| protocol) {
+            Some(6) => std::time::Duration::from_secs(2),
+            _ => std::time::Duration::from_millis(750),
         }
     }
 
@@ -359,6 +372,30 @@ impl FlowScheduler {
             .debit(bytes);
     }
 
+    #[cfg(test)]
+    pub(crate) fn flow_count(&self) -> usize {
+        self.flows.len()
+    }
+
+    /// Insert synthetic flows to exercise eviction without building packets.
+    #[cfg(test)]
+    pub(crate) fn insert_test_flows(&mut self, count: usize) {
+        let now = Instant::now();
+        for index in 0..count {
+            let key = FlowKey {
+                src: Ipv4Addr::new(10, 0, (index >> 8) as u8, index as u8),
+                dst: Ipv4Addr::new(203, 0, 113, 1),
+                protocol: 6,
+                src_port: index as u16,
+                dst_port: 443,
+            };
+            self.flows.insert(
+                key,
+                StripeState::new(index as u64 % 4, now, 1200, false),
+            );
+        }
+    }
+
     fn evict_flows(&mut self, now: Instant) {
         self.evict_counter = self.evict_counter.wrapping_add(1);
         if self.flows.len() < FLOW_TABLE_SOFT_LIMIT && !self.evict_counter.is_multiple_of(1024) {
@@ -367,7 +404,19 @@ impl FlowScheduler {
         self.flows
             .retain(|_, state| now.saturating_duration_since(state.last_seen) < FLOW_IDLE_TTL);
         if self.flows.len() > FLOW_TABLE_SOFT_LIMIT * 2 {
-            self.flows.clear();
+            // Clearing the whole table re-pinned every bulk flow to a new worker at
+            // once (a reordering/latency burst) and reset the server's routing state
+            // for the device. Drop only the oldest quarter instead.
+            let excess = self.flows.len() - FLOW_TABLE_SOFT_LIMIT;
+            let mut by_age: Vec<(FlowKey, Instant)> = self
+                .flows
+                .iter()
+                .map(|(key, state)| (*key, state.last_seen))
+                .collect();
+            by_age.sort_by_key(|(_, last_seen)| *last_seen);
+            for (key, _) in by_age.into_iter().take(excess.max(self.flows.len() / 4)) {
+                self.flows.remove(&key);
+            }
         }
     }
 }
@@ -585,6 +634,31 @@ mod tests {
         assert_eq!(
             FlowManager::classify(&ipv4_packet(6, 1000, 443, 64, 1)),
             Reliability::Unreliable
+        );
+    }
+
+    #[test]
+    fn flow_table_eviction_preserves_most_flows_instead_of_resetting_everything() {
+        let mut scheduler = FlowScheduler::default();
+        let total = FLOW_TABLE_SOFT_LIMIT * 2 + 256;
+        scheduler.insert_test_flows(total);
+        assert_eq!(scheduler.flow_count(), total);
+        // Any selection triggers eviction housekeeping.
+        let packet = {
+            let mut packet = vec![0u8; 40];
+            packet[0] = 0x45;
+            packet[9] = 6;
+            packet
+        };
+        let _ = scheduler.select(&packet, &[0, 1, 2, 3]);
+        let remaining = scheduler.flow_count();
+        assert!(
+            remaining > FLOW_TABLE_SOFT_LIMIT,
+            "eviction dropped too much: {remaining} of {total}"
+        );
+        assert!(
+            remaining < total,
+            "eviction kept everything, so the table would grow without bound"
         );
     }
 }

@@ -22,10 +22,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::oneshot;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
-};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
 use tracing::{debug, warn};
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/137 Safari/537.36";
@@ -130,7 +127,7 @@ async fn run(
     remember_url(&endpoint.route_ips, &url).await;
     let jar = Arc::new(Jar::default());
     seed_cookies(&jar, &url, &data)?;
-    let client = Client::builder()
+    let client = crate::egress::configure_http(Client::builder())
         .cookie_provider(jar.clone())
         .redirect(Policy::none())
         .timeout(Duration::from_secs(20))
@@ -208,7 +205,7 @@ async fn connect_and_serve(
         );
     }
 
-    let (mut socket, _) = connect_async(request)
+    let (mut socket, _) = crate::ws::connect(request, None)
         .await
         .map_err(|e| provider_error("ya-docs WebSocket connect", e))?;
 
@@ -710,7 +707,7 @@ fn encode_fingerprint(nonce: &str) -> Result<String> {
             "asin": 0.12349655394506357,
             "atan": 0.4636476090008061,
             "cos": -0.8390715290095377,
-            "exp": 2.718281828459045,
+            "exp": std::f64::consts::E,
             "log1p": 2.3978952727983707,
             "sin": -0.9917788534431158,
             "tan": -0.23206847684369653
@@ -786,7 +783,7 @@ fn extract_between<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> O
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(text.len() / 2);

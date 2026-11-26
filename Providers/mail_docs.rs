@@ -122,7 +122,7 @@ async fn run(
 ) -> Result<()> {
     remember_url(&endpoint.route_ips, "https://cloud.mail.ru/").await;
     let jar = Arc::new(Jar::default());
-    let client = Client::builder()
+    let client = crate::egress::configure_http(Client::builder())
         .cookie_provider(jar.clone())
         .timeout(Duration::from_secs(20))
         .build()
@@ -183,9 +183,15 @@ async fn connect_and_serve(
     }
     let ws_url = url::Url::parse(&info.ws_url)
         .map_err(|e| provider_error("mail-docs WebSocket URL", e))?;
-    let mut socket = WebSocket::connect(ws_url)
+    let mut connect = WebSocket::connect(ws_url)
         .with_options(Options::default().with_balanced_compression())
-        .with_request(request)
+        .with_request(request);
+    // Pin the carrier socket to the physical adapter so a full-tunnel route
+    // change cannot route Mail.ru media through the ToTS TUN itself.
+    if let Some(address) = crate::egress::local_address() {
+        connect = connect.with_local_address(std::net::IpAddr::V4(address));
+    }
+    let mut socket = connect
         .await
         .map_err(|e| provider_error("mail-docs WebSocket connect", e))?;
 

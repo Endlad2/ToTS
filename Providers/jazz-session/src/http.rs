@@ -61,7 +61,7 @@ impl Service {
                 .parse()
                 .expect("UUID header"),
         );
-        let client = reqwest::Client::builder()
+        let client = crate::egress::configure_http(reqwest::Client::builder())
             .default_headers(headers)
             .user_agent("jazz-session/0.1")
             .timeout(timeout)

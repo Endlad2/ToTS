@@ -32,6 +32,9 @@ const SERVER_ACK_QUEUE: usize = 4096;
 const SERVER_ACK_BATCH_MAX: usize = 32;
 const SERVER_ACK_BATCH_DELAY: Duration = Duration::from_millis(2);
 const TO_TUN_QUEUE: usize = 16_384;
+/// Per-session server egress queue. 128 packets was far shallower than the
+/// client's 2048, so ordinary bursts were dropped inside the tunnel.
+const PER_SESSION_EGRESS_QUEUE: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PathKind {
@@ -78,6 +81,8 @@ struct OutboundPacket {
     assoc_id: u16,
     bytes: Vec<u8>,
     scheduler: Arc<Mutex<FlowScheduler>>,
+    /// Staleness budget for a best-effort packet in this queue.
+    stale_after: Duration,
     enqueued_at: tokio::time::Instant,
 }
 
@@ -237,7 +242,7 @@ impl PeerRegistry {
         let Ok(slot) = self.slots.clone().try_acquire_owned() else {
             return Ok(None);
         };
-        let (outbound, receiver) = mpsc::channel(128);
+        let (outbound, receiver) = mpsc::channel(PER_SESSION_EGRESS_QUEUE);
         let (ack_outbound, ack_receiver) = mpsc::channel(SERVER_ACK_QUEUE);
         let peer = Arc::new(Peer {
             device_id: id,
@@ -293,9 +298,13 @@ impl PeerRegistry {
                     Some(device_auth_fingerprint(&device))
                 }
                 Ok(_) => None,
-                Err(_) => {
-                    tracing::warn!(device_id = %id, "worker authorization refresh failed");
-                    None
+                Err(error) => {
+                    // A transient SQLite error (busy/locked/IO) must not deauthorize
+                    // every session of the device: that produced a mass reconnect and
+                    // a burst of provider re-provisioning. Keep sessions and retry on
+                    // the next tick.
+                    tracing::warn!(device_id = %id, %error, "worker authorization refresh failed; keeping sessions");
+                    continue;
                 }
             };
             let _registration = self.registration.lock().await;
@@ -372,23 +381,55 @@ pub async fn run(args: Args, db: Db) -> Result<()> {
         let tx = from_tun_tx.clone();
         tokio::spawn(async move {
             let mut b = vec![0u8; 65535];
+            let mut consecutive_errors = 0u32;
             loop {
                 match rd.read(&mut b).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => {
+                        // A closed TUN means this process can no longer carry
+                        // traffic; exiting lets the service manager restart it
+                        // instead of leaving a half-dead daemon that still accepts
+                        // authenticated datagrams.
+                        tracing::error!("server TUN closed; terminating so the service can restart");
+                        std::process::exit(1);
+                    }
                     Ok(n) => {
+                        consecutive_errors = 0;
                         if tx.send(b[..n].to_vec()).await.is_err() {
-                            break;
+                            tracing::error!("server TUN read loop cannot reach the dataplane");
+                            std::process::exit(1);
                         }
+                    }
+                    Err(error) => {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        // Transient EIO/EINTR must not permanently disable ingress.
+                        tracing::warn!(%error, consecutive_errors, "server TUN read failed; retrying");
+                        if consecutive_errors >= 32 {
+                            tracing::error!("server TUN read keeps failing; terminating");
+                            std::process::exit(1);
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
             }
         });
         tokio::spawn(async move {
+            let mut consecutive_errors = 0u32;
             while let Some(p) = to_tun_rx.recv().await {
-                if wr.write_all(&p).await.is_err() {
-                    break;
+                match wr.write_all(&p).await {
+                    Ok(()) => consecutive_errors = 0,
+                    Err(error) => {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        tracing::warn!(%error, consecutive_errors, "server TUN write failed; retrying");
+                        if consecutive_errors >= 32 {
+                            tracing::error!("server TUN write keeps failing; terminating");
+                            std::process::exit(1);
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
             }
+            tracing::error!("server TUN writer channel closed; terminating");
+            std::process::exit(1);
         });
     } else {
         tokio::spawn(async move { while to_tun_rx.recv().await.is_some() {} });
@@ -590,7 +631,24 @@ async fn handle_received(
         return;
     }
     peer.last_seen_ms.store(now_millis(), Ordering::Relaxed);
-    active_by_ip.insert(peer.virtual_ip, peer.device_id);
+    // Virtual addresses are derived from the device UUID, so two devices can hash
+    // to the same value. Last-writer-wins silently stole the older device's return
+    // traffic; keep the first owner and refuse to hijack a live mapping instead.
+    match active_by_ip.entry(peer.virtual_ip) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => {
+            if *entry.get() != peer.device_id {
+                tracing::warn!(
+                    device_id = %peer.device_id,
+                    virtual_ip = %peer.virtual_ip,
+                    owner = %entry.get(),
+                    "virtual IPv4 collision; return traffic stays with the first device"
+                );
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(peer.device_id);
+        }
+    }
     let addr = incoming.addr;
     let media = incoming.media;
     {
@@ -716,10 +774,12 @@ async fn route_from_tun(
         else {
             continue;
         };
+        let stale_after = FlowManager::best_effort_budget(&packet);
         let outbound = OutboundPacket {
             assoc_id,
             bytes: packet,
             scheduler: scheduler.clone(),
+            stale_after,
             enqueued_at: tokio::time::Instant::now(),
         };
         if peer.outbound.try_send(outbound).is_err() {
@@ -805,7 +865,7 @@ async fn peer_send_loop(
         }
         let reliability = FlowManager::classify(&outbound.bytes);
         if reliability == tots_core::flow::Reliability::Unreliable
-            && outbound.enqueued_at.elapsed() > Duration::from_millis(750)
+            && outbound.enqueued_at.elapsed() > outbound.stale_after
         {
             continue;
         }

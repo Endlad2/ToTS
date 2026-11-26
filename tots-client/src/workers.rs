@@ -25,11 +25,32 @@ const PRIMARY_RETRIES_BEFORE_FALLBACK: usize = 3;
 const WORKER_QUEUE: usize = 2048;
 const INBOUND_QUEUE: usize = 4096;
 const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(5);
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
+/// A worker is declared dead only after this much silence. It is deliberately
+/// longer than three probe intervals because a single lost probe must not tear
+/// down a working provider path.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(25);
 const STARTUP_PARALLELISM: usize = VK_WORKERS_PER_BOOTSTRAP;
 const ACK_QUEUE: usize = 4096;
 const ACK_BATCH_MAX: usize = 32;
 const ACK_BATCH_DELAY: Duration = Duration::from_millis(2);
+/// Longest a single transport send may block. A provider socket that stops
+/// accepting datagrams must not freeze the TUN loop or the health probe.
+const PATH_SEND_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Longest the scheduler may wait for space in a congested worker queue.
+const QUEUE_SEND_TIMEOUT: Duration = Duration::from_millis(250);
+/// TUN packets waiting longer than this are stale for an interactive tunnel.
+const INBOUND_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(400);
+/// Native providers are slower to become media-ready than a raw UDP path, so the
+/// startup probe gets a wider budget for them.
+const NATIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// RTT samples above this multiple of the best observed sample are treated as
+/// degradation, provided the absolute difference is also large.
+const RTT_DEGRADE_FACTOR: u32 = 6;
+const RTT_DEGRADE_SLACK: Duration = Duration::from_millis(250);
+/// Consecutive degraded health ticks before a worker is rebuilt.
+const RTT_DEGRADE_TICKS: u8 = 6;
+/// A worker is restarted for RTT degradation at most this often.
+const RTT_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(300);
 
 fn validate_worker_request(cfg: &ConnectionConfig, workers: usize) -> Result<()> {
     if workers == 0 || workers > 256 {
@@ -180,6 +201,8 @@ struct OutboundPacket {
     assoc_id: u16,
     bytes: Vec<u8>,
     reliability: Reliability,
+    /// How long this packet may wait in the queue before it is stale.
+    stale_after: Duration,
     enqueued_at: Instant,
 }
 
@@ -205,6 +228,8 @@ struct ReceiveDiagnostics {
     ack_queue_wait_ns_max: AtomicU64,
     tun_inbound_wait_ns_sum: AtomicU64,
     tun_inbound_wait_ns_max: AtomicU64,
+    inbound_dropped: AtomicU64,
+    acks_dropped: AtomicU64,
 }
 
 struct WorkerSlot {
@@ -260,11 +285,11 @@ impl WorkerManager {
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
         let mut slots = Vec::with_capacity(workers);
         let mut receivers = Vec::with_capacity(workers);
-        for id in 0..workers {
+        for (id, order) in provider_orders.iter().enumerate() {
             let (sender, receiver) = mpsc::channel(WORKER_QUEUE);
             slots.push(Arc::new(WorkerSlot {
                 id,
-                preferred_provider: provider_orders[id][0],
+                preferred_provider: order[0],
                 healthy: AtomicBool::new(false),
                 provider: RwLock::new(None),
                 sender,
@@ -442,6 +467,7 @@ impl WorkerManager {
                     assoc_id: decision.assoc_id,
                     bytes: packet.to_vec(),
                     reliability,
+                    stale_after: FlowManager::best_effort_budget(packet),
                     enqueued_at: Instant::now(),
                 };
                 match slot.sender.try_send(outbound) {
@@ -456,15 +482,18 @@ impl WorkerManager {
                             .lock()
                             .await
                             .mark_congested(decision.worker_id);
-                        // Preserve flow ordering under queue pressure.
-                        match slot.sender.send(outbound).await {
-                            Ok(()) => {
+                        // Preserve flow ordering under queue pressure, but never
+                        // block the single TUN read loop on a stuck worker.
+                        match tokio::time::timeout(QUEUE_SEND_TIMEOUT, slot.sender.send(outbound))
+                            .await
+                        {
+                            Ok(Ok(())) => {
                                 self.stats
                                     .tun_tx_bytes
                                     .fetch_add(packet.len() as u64, Ordering::Relaxed);
                                 return Ok(());
                             }
-                            Err(_) => {
+                            Ok(Err(_)) | Err(_) => {
                                 slot.healthy.store(false, Ordering::Release);
                                 candidates.retain(|worker_id| *worker_id != decision.worker_id);
                             }
@@ -542,6 +571,8 @@ impl WorkerManager {
         let mut ack_queue_wait_ns_max = 0u64;
         let mut tun_inbound_wait_ns_sum = 0u64;
         let mut tun_inbound_wait_ns_max = 0u64;
+        let mut inbound_dropped = 0u64;
+        let mut acks_dropped = 0u64;
         for slot in &self.slots {
             let receive = &slot.receive;
             path_rx_datagrams += receive.path_datagrams.load(Ordering::Relaxed);
@@ -558,6 +589,8 @@ impl WorkerManager {
             ack_queue_wait_ns_sum += receive.ack_queue_wait_ns_sum.load(Ordering::Relaxed);
             ack_queue_wait_ns_max =
                 ack_queue_wait_ns_max.max(receive.ack_queue_wait_ns_max.load(Ordering::Relaxed));
+            inbound_dropped += receive.inbound_dropped.load(Ordering::Relaxed);
+            acks_dropped += receive.acks_dropped.load(Ordering::Relaxed);
             tun_inbound_wait_ns_sum += receive.tun_inbound_wait_ns_sum.load(Ordering::Relaxed);
             tun_inbound_wait_ns_max = tun_inbound_wait_ns_max
                 .max(receive.tun_inbound_wait_ns_max.load(Ordering::Relaxed));
@@ -637,6 +670,8 @@ impl WorkerManager {
             ack_queue_wait_ms_max = ack_queue_wait_ns_max as f64 / 1_000_000.0,
             tun_inbound_wait_ms_sum = tun_inbound_wait_ns_sum as f64 / 1_000_000.0,
             tun_inbound_wait_ms_max = tun_inbound_wait_ns_max as f64 / 1_000_000.0,
+            inbound_dropped,
+            acks_dropped,
             best_effort_samples,
             best_effort_evictions = recovery_stats.best_effort_evictions,
             recovery_sent_packets = recovery_stats.sent_packets,
@@ -801,7 +836,10 @@ async fn worker_supervisor(
             }
             Err(error) => {
                 slot.healthy.store(false, Ordering::Release);
-                slot.route_ips.write().await.clear();
+                // Keep the previously discovered provider endpoints. Clearing them
+                // removed the Windows escape routes exactly when a reconnect needed
+                // them, and after the full tunnel is up DNS resolution may already
+                // depend on the tunnel that is currently down.
                 warn!(
                     worker = slot.id,
                     provider = provider.as_str(),
@@ -958,12 +996,21 @@ async fn connect_path(
     // Probe all paths for this worker concurrently. Worker-level setup is already bounded by
     // STARTUP_PARALLELISM, so this removes serial 3-second probe tails without creating an
     // unbounded provider thundering herd.
+    // Native providers (Jazz, Cups, docs carriers) need a real media round trip
+    // after their signalling completes, so their first probe gets a wider budget;
+    // a 3-second budget classified slow-but-working joins as dead providers and
+    // closed a room that was about to start flowing.
+    let probe_timeout = if provider_name == ProviderName::Vk {
+        Duration::from_secs(3)
+    } else {
+        NATIVE_PROBE_TIMEOUT
+    };
     let mut probes = tokio::task::JoinSet::new();
     for candidate in &candidates {
         let candidate = candidate.clone();
         let engine = engine.clone();
         probes.spawn(async move {
-            let result = probe::probe(&engine, candidate.clone(), Duration::from_secs(3)).await;
+            let result = probe::probe(&engine, candidate.clone(), probe_timeout).await;
             (candidate, result)
         });
     }
@@ -1044,8 +1091,10 @@ async fn run_worker(
     );
     let acknowledgements = ack_loop(slot.clone(), engine.clone(), path.clone(), ack_rx);
     let recovery_loop = loss_loop(engine.clone(), path.clone(), recovery.clone());
+    let keepalive = path_keepalive(path.clone());
     let health = health_loop(slot.id, engine, path, recovery, last_rx);
     tokio::select! {
+        result = keepalive => result,
         result = sender => result,
         result = receiver => result,
         result = acknowledgements => result,
@@ -1058,6 +1107,22 @@ async fn run_worker(
                 Err(_) => Ok(()),
             }
         }
+    }
+}
+
+/// Send one datagram with a deadline.
+///
+/// A provider socket that stops draining (stalled WebSocket carrier, saturated
+/// relay) must be surfaced as a worker failure instead of blocking the worker's
+/// send loop, health probe and recovery timer forever.
+async fn send_datagram(path: &dyn DatagramPath, datagram: &[u8]) -> Result<()> {
+    match tokio::time::timeout(PATH_SEND_TIMEOUT, path.send(datagram)).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err(anyhow!(
+            "{} send stalled for {} ms",
+            path.name(),
+            PATH_SEND_TIMEOUT.as_millis()
+        )),
     }
 }
 
@@ -1078,9 +1143,27 @@ async fn send_prepared_frames(
         }
         // ACK traffic may advance the replay window while a data frame waits.
         let datagram = engine.seal_prepared(frame)?;
-        path.send(&datagram).await?;
+        send_datagram(path, &datagram).await?;
     }
     Ok(())
+}
+
+/// Refresh path-level state (TURN allocation, permissions, channel binding)
+/// independently of the receive loop.
+///
+/// Maintenance used to run only inside `recv()`. Any back-pressure in the receive
+/// path silently stopped the refresh, the relay forgot the allocation after a few
+/// minutes, and sends succeeded into a black hole until the worker timed out and
+/// was rebuilt — the observable "VPN works, then dies, then works" cycle.
+async fn path_keepalive(path: Arc<dyn DatagramPath>) -> Result<()> {
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        if let Err(error) = path.keepalive().await {
+            return Err(anyhow!("{} keepalive failed: {error}", path.name()));
+        }
+    }
 }
 
 async fn send_loop(
@@ -1094,7 +1177,7 @@ async fn send_loop(
         // Do not replay stale latency-sensitive traffic after a provider outage.
         // Reliable/control packets remain queued and still use bounded recovery.
         if outbound.reliability == Reliability::Unreliable
-            && outbound.enqueued_at.elapsed() > Duration::from_millis(750)
+            && outbound.enqueued_at.elapsed() > outbound.stale_after
         {
             continue;
         }
@@ -1110,6 +1193,16 @@ async fn send_loop(
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        // Track the packet before it leaves. A send that fails midway previously
+        // returned before `on_sent`, so the packet was neither tracked nor
+        // retransmitted and the payload was lost until the inner transport noticed.
+        recovery.lock().await.on_sent(
+            packet_id,
+            outbound.assoc_id,
+            outbound.bytes,
+            bytes,
+            outbound.reliability,
+        );
         send_prepared_frames(
             &engine,
             path.as_ref(),
@@ -1118,13 +1211,6 @@ async fn send_loop(
             outbound.reliability,
         )
         .await?;
-        recovery.lock().await.on_sent(
-            packet_id,
-            outbound.assoc_id,
-            outbound.bytes,
-            bytes,
-            outbound.reliability,
-        );
         slot.tx_packets.fetch_add(1, Ordering::Relaxed);
     }
     Err(anyhow!("worker outbound queue closed"))
@@ -1180,7 +1266,11 @@ async fn recv_loop(
                 queue_ack(&slot, &ack_tx, packet_id).await?;
                 slot.rx_packets.fetch_add(1, Ordering::Relaxed);
                 let started = Instant::now();
-                let sent = inbound_tx.send(bytes).await;
+                // Bounded wait only: while this receive loop is blocked, the path's
+                // own keepalives/refreshes are not polled either. Shedding a stale
+                // packet is correct — the inner transport recovers it.
+                let sent =
+                    tokio::time::timeout(INBOUND_ENQUEUE_TIMEOUT, inbound_tx.send(bytes)).await;
                 let waited = started.elapsed().as_nanos() as u64;
                 slot.receive
                     .tun_inbound_wait_ns_sum
@@ -1188,7 +1278,13 @@ async fn recv_loop(
                 slot.receive
                     .tun_inbound_wait_ns_max
                     .fetch_max(waited, Ordering::Relaxed);
-                sent.map_err(|_| anyhow!("TUN inbound queue closed"))?;
+                match sent {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return Err(anyhow!("TUN inbound queue closed")),
+                    Err(_) => {
+                        slot.receive.inbound_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
             DecodedPacket::Duplicate { packet_id } => {
                 slot.receive.duplicates.fetch_add(1, Ordering::Relaxed);
@@ -1201,8 +1297,8 @@ async fn recv_loop(
                 recovery.lock().await.on_ack_ranges(&ranges);
             }
             DecodedPacket::Probe { token, sent_micros } => {
-                path.send(&engine.make_probe_ack(token, sent_micros)?)
-                    .await?;
+                let response = engine.make_probe_ack(token, sent_micros)?;
+                send_datagram(path.as_ref(), &response).await?;
             }
             DecodedPacket::ProbeAck { sent_micros, .. } => {
                 let now = now_micros();
@@ -1226,8 +1322,11 @@ async fn queue_ack(slot: &WorkerSlot, ack_tx: &mpsc::Sender<u32>, packet_id: u32
     match ack_tx.try_send(packet_id) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(packet_id)) => {
+            // Do not await the ACK consumer from the receive loop: the resulting
+            // back-pressure starved path maintenance and liveness probes. ACK ranges
+            // are cumulative, so a dropped id is covered by a later batch.
             let started = Instant::now();
-            let sent = ack_tx.send(packet_id).await;
+            let sent = tokio::time::timeout(ACK_BATCH_DELAY * 4, ack_tx.send(packet_id)).await;
             let waited = started.elapsed().as_nanos() as u64;
             slot.receive
                 .ack_queue_wait_ns_sum
@@ -1235,7 +1334,14 @@ async fn queue_ack(slot: &WorkerSlot, ack_tx: &mpsc::Sender<u32>, packet_id: u32
             slot.receive
                 .ack_queue_wait_ns_max
                 .fetch_max(waited, Ordering::Relaxed);
-            sent.map_err(|_| anyhow!("ACK queue closed"))
+            match sent {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) => Err(anyhow!("ACK queue closed")),
+                Err(_) => {
+                    slot.receive.acks_dropped.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+            }
         }
         Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow!("ACK queue closed")),
     }
@@ -1262,7 +1368,7 @@ async fn ack_loop(
             }
         }
         let ack = engine.make_ack_batch(&pending)?;
-        path.send(&ack).await?;
+        send_datagram(path.as_ref(), &ack).await?;
         slot.receive
             .ack_datagrams_sent
             .fetch_add(1, Ordering::Relaxed);
@@ -1298,6 +1404,67 @@ async fn loss_loop(
     }
 }
 
+/// Consecutive RTT samples above the path's own baseline.
+///
+/// The previous logic compared against the *single lowest* sample ever seen and
+/// never aged it, so one lucky idle measurement made a busy-but-healthy relay
+/// look "degraded" forever and the worker was rebuilt every few minutes. The
+/// baseline now drifts upward slowly, the absolute slack scales with the path,
+/// and a restart is rate-limited.
+#[derive(Default)]
+struct RttBaseline {
+    best: Option<Duration>,
+    degraded_ticks: u8,
+    last_restart: Option<Instant>,
+}
+
+struct RttDegraded {
+    best: Duration,
+    srtt: Duration,
+}
+
+impl RttBaseline {
+    fn observe(&mut self, srtt: Duration, now: Instant) -> Option<RttDegraded> {
+        let best = match self.best {
+            None => {
+                self.best = Some(srtt);
+                return None;
+            }
+            Some(best) => best,
+        };
+        if srtt <= best {
+            self.best = Some(srtt);
+            self.degraded_ticks = 0;
+            return None;
+        }
+        // Age the baseline by 2 % per healthy tick so a genuinely slower underlay
+        // becomes the new normal instead of tripping the check forever.
+        self.best = Some(best + best.mul_f64(0.02));
+        let best = self.best.unwrap();
+        let threshold = best
+            .saturating_mul(RTT_DEGRADE_FACTOR)
+            .saturating_add(RTT_DEGRADE_SLACK);
+        if srtt <= threshold {
+            self.degraded_ticks = 0;
+            return None;
+        }
+        self.degraded_ticks = self.degraded_ticks.saturating_add(1);
+        if self.degraded_ticks < RTT_DEGRADE_TICKS {
+            return None;
+        }
+        let rate_limited = self
+            .last_restart
+            .is_some_and(|last| now.saturating_duration_since(last) < RTT_RESTART_MIN_INTERVAL);
+        if rate_limited {
+            self.degraded_ticks = 0;
+            return None;
+        }
+        self.last_restart = Some(now);
+        self.degraded_ticks = 0;
+        Some(RttDegraded { best, srtt })
+    }
+}
+
 async fn health_loop(
     worker_id: usize,
     engine: Arc<SessionEngine>,
@@ -1308,8 +1475,7 @@ async fn health_loop(
     let mut tick = tokio::time::interval(HEALTH_PROBE_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut counter = 0u64;
-    let mut best_srtt: Option<Duration> = None;
-    let mut degraded_ticks = 0u8;
+    let mut baseline = RttBaseline::default();
     loop {
         tick.tick().await;
         let now = now_millis();
@@ -1319,35 +1485,19 @@ async fn health_loop(
         }
 
         if let Some(srtt) = recovery.lock().await.srtt() {
-            match best_srtt {
-                None => best_srtt = Some(srtt),
-                Some(best) if srtt < best => {
-                    best_srtt = Some(srtt);
-                    degraded_ticks = 0;
-                }
-                Some(best) => {
-                    let degraded_at = best
-                        .saturating_mul(4)
-                        .saturating_add(Duration::from_millis(100));
-                    if srtt > degraded_at {
-                        degraded_ticks = degraded_ticks.saturating_add(1);
-                        if degraded_ticks >= 3 {
-                            anyhow::bail!(
-                                "worker {worker_id} path RTT degraded from {} ms to {} ms",
-                                best.as_millis(),
-                                srtt.as_millis()
-                            );
-                        }
-                    } else {
-                        degraded_ticks = 0;
-                    }
-                }
+            if let Some(degraded) = baseline.observe(srtt, Instant::now()) {
+                anyhow::bail!(
+                    "worker {worker_id} path RTT degraded from {} ms to {} ms",
+                    degraded.best.as_millis(),
+                    degraded.srtt.as_millis()
+                );
             }
         }
 
         counter = counter.wrapping_add(1);
         let token = ((worker_id as u64) << 48) ^ counter ^ now;
-        path.send(&engine.make_probe(token, now_micros())?).await?;
+        let probe = engine.make_probe(token, now_micros())?;
+        send_datagram(path.as_ref(), &probe).await?;
     }
 }
 
@@ -1547,6 +1697,56 @@ mod tests {
         send_task.await.unwrap().unwrap();
         let outbound = receiver.recv().await.expect("ready worker receives packet");
         assert_eq!(outbound.bytes, vec![0x45; 20]);
+    }
+
+    #[test]
+    fn rtt_baseline_ignores_slow_drift_but_catches_a_real_step() {
+        let mut baseline = RttBaseline::default();
+        let start = Instant::now();
+        // A slow drift of 5 % per tick is normal bufferbloat and must never trip.
+        let mut sample = Duration::from_millis(40);
+        for tick in 0..40u32 {
+            let verdict = baseline.observe(sample, start + Duration::from_secs(5 * u64::from(tick)));
+            assert!(verdict.is_none(), "drift at tick {tick} restarted a healthy worker");
+            sample += sample.mul_f64(0.05);
+        }
+        // A single sample far above the aged baseline needs several ticks, not one.
+        let mut baseline = RttBaseline::default();
+        baseline.observe(Duration::from_millis(40), start);
+        let mut degraded = None;
+        for tick in 0..8u32 {
+            if baseline
+                .observe(
+                    Duration::from_millis(900),
+                    start + Duration::from_secs(5 * u64::from(tick)),
+                )
+                .is_some()
+            {
+                degraded = Some(tick);
+                break;
+            }
+        }
+        let tick = degraded.expect("a 22x RTT step must eventually restart the worker");
+        assert!(tick >= u32::from(RTT_DEGRADE_TICKS) - 1, "restarted too eagerly at tick {tick}");
+    }
+
+    #[test]
+    fn rtt_restarts_are_rate_limited() {
+        let mut baseline = RttBaseline::default();
+        let start = Instant::now();
+        baseline.observe(Duration::from_millis(40), start);
+        let mut restarts = 0usize;
+        for tick in 0..200u32 {
+            if baseline
+                .observe(Duration::from_millis(900), start + Duration::from_secs(5 * u64::from(tick)))
+                .is_some()
+            {
+                restarts += 1;
+            }
+        }
+        // 200 ticks span 1000 s, so at most three restarts fit the 5-minute budget.
+        assert!(restarts <= 4, "{restarts} restarts in one session is a churn loop");
+        assert!(restarts >= 1);
     }
 
     #[test]

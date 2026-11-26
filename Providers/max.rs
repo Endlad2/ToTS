@@ -41,7 +41,7 @@ impl MaxSessionState {
     async fn cleanup(&mut self) {
         if let Some(signaling) = self.signaling.take() {
             let _ = signaling.hangup("HUNGUP").await;
-            let _ = signaling.close();
+            signaling.close();
         }
 
         if let (Some(session_key), Some(conversation_id)) =
@@ -64,7 +64,7 @@ impl MaxSessionState {
             let _ = request_is_ok(&self.session, opcodes::CHAT_LEAVE, payload, "MAX leave group").await;
         }
 
-        let _ = self.session.disconnect();
+        self.session.disconnect();
     }
 }
 
@@ -85,7 +85,7 @@ impl Provider for MaxProvider {
             .to_owned();
 
         let session = Session::new(max_session_config());
-        let http = reqwest::Client::builder()
+        let http = crate::egress::configure_http(reqwest::Client::builder())
             .timeout(Duration::from_secs(20))
             .user_agent(HTTP_USER_AGENT)
             .build()
@@ -409,7 +409,7 @@ async fn build_bootstrap(state: &mut MaxSessionState, access_token: &str) -> Res
             signaling_host = endpoint_host(&endpoint);
             state.signaling = Some(signaling);
         } else {
-            let _ = signaling.close();
+            signaling.close();
         }
     }
 

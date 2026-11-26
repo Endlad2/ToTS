@@ -25,6 +25,8 @@ Keep separate UDP ingress ports:
 
 VK TURN/UDP requires the 12-byte RTP envelope from `transport/rtp.rs` around encrypted ToTS bytes. The server recognizes RTP-wrapped packets and still accepts raw ToTS packets. Jazz uses a real WebRTC RTP media session and bridges its recovered datagrams to the existing server ingress; do not duplicate the packet codec, encryption or TUN routing there.
 
+Long-run stability invariants: TURN allocation maintenance must be driven by an independent task as well as by the receive loop (`DatagramPath::keepalive`), because a receive loop blocked on a full downstream queue otherwise lets the allocation expire while sends still "succeed". The client receive path must never block the TUN writer or the ACK batcher for long, every datagram send is deadline-bounded, and a worker restart for RTT degradation must use an aged baseline with rate limiting. Server TUN read/write loops and per-device authorization refreshes must retry transient errors instead of exiting or deauthorizing every session. Packet-number comparisons in recovery, ACK tracking and delivery deduplication must be wrap-aware for the 32-bit `packet_id` space.
+
 Each worker probes healthy candidates and selects by measured RTT. Retry probes every 500 ms with fresh authenticated sequence numbers under the client's overall three-second deadline; packet loss or malformed replies must not reset that deadline. A five-second liveness probe detects dead paths; sustained severe RTT degradation also restarts the worker so direct/WebRTC-side and TURN candidates are re-probed. Reconnect keeps the SessionEngine/sequence space so the first authenticated datagram can immediately rebind the server route (0-RTT-like path resumption). `--relay-only` excludes direct VPS/WebRTC-side UDP; `--probe-only` verifies that at least one worker is healthy without TUN. Native Jazz connections use the same `DatagramPath` boundary.
 
 ## Provider and session contract
@@ -69,6 +71,18 @@ Keep `tots-android/src/bootstrap.rs` and `tots-android/src/workers.rs` behavior 
 
 Persist Jazz invites in provider data. Restart restores active rooms. Revoke or provider replacement closes the previous bridge; periodic expiry maintenance closes expired room bridges. Each bridge owns its task and native path. Serialize lifecycle changes so a delayed restore cannot replace a newer configuration.
 
+### Physical egress pinning
+
+Every socket the *client* opens for itself — direct VPS UDP, TURN/UDP allocations, provider HTTP/REST, provider WebSocket signalling and the WebRTC/ICE media sockets — must leave through the resolved physical adapter, never through the full-tunnel default route. `Providers/egress.rs` is the single policy module; it is compiled into `tots-core` *and* (via `#[path]`) into the bundled `jazz-session` crate, so both halves of the provider stack share one interface. `Providers/ws.rs` is the WebSocket helper built on it.
+
+Rules that must not regress:
+
+- Resolution order: `--egress-interface` / `TOTS_EGRESS_INTERFACE`, then the IPv4 default route. Known virtual adapters (`tun*`, `tots*`, `wg*`, `utun*`, `docker*`, `veth*`, `br-*`, `tailscale*`, `Wintun`, ...) are never selected, and the ToTS TUN index/name must never be the underlay.
+- Only the client calls `egress::configure`. `tots-server` must keep binding wildcard listeners, so it never configures the policy and `bind_udp` stays unpinned there. Use `bind_udp_pinned`/`connect_udp_pinned` for client-side outbound sockets.
+- Mechanism: `SO_BINDTODEVICE` on Linux/Android/Fuchsia (`CAP_NET_RAW`); `IP_BOUND_IF` plus `TOTS_EGRESS_INTERFACE_INDEX` on the macOS family; adapter-address binding (`TOTS_EGRESS_ADDRESS` or the captured underlay address) on Windows, which has no device-bind socket option.
+- ICE must use a pinned `UDPMux` (`Providers/jazz-session/src/icemux.rs`) plus an interface filter, because `webrtc-rs` otherwise binds wildcard sockets that follow the default route. The ToTS virtual address is never an ICE candidate.
+- Pinning failure is reported once and is never fatal: an unprivileged client must still run (an Android app may rely on `VpnService.protect` instead). `--no-egress-pinning` / `TOTS_EGRESS_DISABLE=1` disable it explicitly.
+
 The desktop and Android clients accept a server-issued URI with `--config tots://...` or explicit CLI fields; neither loads secret configuration from a local config file. Windows `--tun-default-route` uses a guard that owns only its route/DNS changes. Capture the Windows physical IPv4 underlay **before opening Wintun**, then pin every currently known VPS/provider IPv4 endpoint through that captured interface/gateway before installing the two full-tunnel `/1` routes. Automatic discovery must reject known TUN/TAP/Wintun/VPN/virtual adapters and prefer hardware adapters without depending solely on `Get-NetAdapter -Physical`; `TOTS_PHYSICAL_IFINDEX` is the explicit operator override and must be validated. Never allow the selected underlay index to equal the ToTS TUN index. Android has no equivalent route flag: the APK `VpnService` establishes/configures the TUN and passes its descriptor through `--tun-fd-socket` using `SCM_RIGHTS` (or inherited `--tun-fd` only when guaranteed by the launcher). Normal exit, Ctrl+C and `--run-for-seconds` perform cleanup. Do not claim cleanup after force-killing a process. IPv6 routes are not managed; TURN/TCP/TLS is not implemented.
 
 ## Security invariants
@@ -93,6 +107,8 @@ The desktop and Android clients accept a server-issued URI with `--config tots:/
 | `tots-core/src/session.rs` | Per-worker packet engine, ACK-range tracking and replay/delivery deduplication |
 | `tots-core/src/transport/` | Datagram paths, tuned UDP sockets, STUN/TURN, RTP envelope and probes |
 | `tots-client/src/main.rs`, `tun_io.rs`, `workers.rs`, `routes.rs` | Desktop client lifecycle, TUN, worker pool/failover and Windows routing |
+| `Providers/egress.rs`, `Providers/ws.rs` | Shared physical-egress policy (device/address pinning, underlay detection) and the WebSocket handshake over a pinned socket; included by `tots-core` and `jazz-session` |
+| `Providers/jazz-session/src/icemux.rs` | Pinned ICE `UDPMux` plus candidate interface/address filters for Jazz media |
 | `tots-android/src/main.rs`, `tun_io.rs`, `workers.rs`, `bootstrap.rs` | Android executable lifecycle, inherited `VpnService` TUN fd and the mirrored worker/provider pool |
 | `tots-android/build.rs`, `scripts/build-android.sh` | Android cross-build and post-link executable rename to APK-safe `libtots.so` |
 | `tots-ios/src/lib.rs` | NetworkExtension C ABI |

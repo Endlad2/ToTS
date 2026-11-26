@@ -19,11 +19,14 @@ use tokio::{
     time::{self, Instant},
 };
 use tokio_tungstenite::{
-    connect_async_with_config,
     tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig, Message},
     MaybeTlsStream, WebSocketStream,
 };
 use url::Url;
+
+/// Upper bound on remembered track subscriptions. Reaching it stops new
+/// subscriptions instead of failing the session.
+const MAX_TRACK_SUBSCRIPTIONS: usize = 4096;
 
 pub(crate) struct CallInfo {
     pub name: String,
@@ -195,13 +198,12 @@ pub(crate) async fn establish(call: CallInfo, timeout: Duration) -> Result<CallS
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(2 * 1024 * 1024);
     config.max_frame_size = Some(2 * 1024 * 1024);
-    let (socket, _) = time::timeout(
-        timeout,
-        connect_async_with_config(request, Some(config), false),
-    )
-    .await
-    .map_err(|_| Error::Timeout("WebSocket handshake"))?
-    .map_err(|_| Error::WebSocket)?;
+    // The signalling socket is pinned to the physical underlay: after a
+    // full-tunnel route change it must not be carried by the ToTS TUN itself.
+    let (socket, _) = time::timeout(timeout, crate::ws::connect(request, Some(config)))
+        .await
+        .map_err(|_| Error::Timeout("WebSocket handshake"))?
+        .map_err(|_| Error::WebSocket)?;
     let join_url = call.join_url.clone();
     let state = Arc::new(RwLock::new(json!({"schema_version":1,"status":"joining",
         "call":{"name":call.name,"room_id":call.room_id,"join_url":call.join_url,"password":call.password,
@@ -235,6 +237,8 @@ pub(crate) async fn establish(call: CallInfo, timeout: Duration) -> Result<CallS
         ping_interval: Duration::ZERO,
         ping_timeout: Duration::ZERO,
         next_ping: Instant::now(),
+        last_ping_sent: 0,
+        published: false,
         last_rtc: Instant::now(),
         last_socket_ping: Instant::now(),
         rtt: 0,
@@ -300,6 +304,8 @@ struct Worker {
     ping_interval: Duration,
     ping_timeout: Duration,
     next_ping: Instant,
+    last_ping_sent: u64,
+    published: bool,
     last_rtc: Instant,
     last_socket_ping: Instant,
     rtt: u64,
@@ -362,12 +368,23 @@ impl Worker {
                 }
                 _ = timer.tick() => {
                     let now = Instant::now();
-                    if !self.ping_timeout.is_zero() && now.duration_since(self.last_rtc) > self.ping_timeout {
-                        return Err(Error::Timeout("ответ медиасервера"));
+                    if !self.ping_timeout.is_zero() {
+                        // A VPN session must survive a single coalesced/delayed pong.
+                        let slack = self.ping_timeout + 2 * self.ping_interval.max(Duration::from_secs(5));
+                        if now.duration_since(self.last_rtc) > slack {
+                            return Err(Error::Timeout("ответ медиасервера"));
+                        }
                     }
                     if !self.ping_interval.is_zero() && now >= self.next_ping && self.joined {
                         self.next_ping = now + self.ping_interval;
-                        self.send_media(json!({"method":"rtc:ping","ping_req":{"timestamp":timestamp(),"rtt":self.rtt}})).await?;
+                        let sent = timestamp();
+                        self.last_ping_sent = sent;
+                        // The media server correlates its reply with
+                        // `lastPingTimestamp`; sending only `timestamp` left RTT
+                        // unmeasured and could make every ping look unmatched.
+                        self.send_media(json!({"method":"rtc:ping","ping_req":{
+                            "timestamp":sent,"lastPingTimestamp":sent,"rtt":self.rtt}}))
+                        .await?;
                     }
                     if now.duration_since(self.last_socket_ping) >= Duration::from_secs(45) {
                         self.last_socket_ping = now;
@@ -418,12 +435,19 @@ impl Worker {
                         .ok_or(Error::Protocol("нет ICE servers"))?;
                     if let Some(previous) = &self.servers {
                         if previous != servers {
-                            return Err(Error::Protocol(
-                                "ICE-конфигурация изменилась; требуется новый вход",
-                            ));
+                            // TURN credentials rotate during long sessions. The WebRTC
+                            // engine binds ICE servers to its gatherer at construction
+                            // time, so a rotated list cannot be applied in place; the
+                            // already gathered relay candidate stays valid until the
+                            // allocation expires, and the ToTS layer above recovers a
+                            // genuinely dead path. Tearing the whole call down here
+                            // produced a permanent join/leave loop.
+                            self.state.write().await["webrtc"]["ice_servers_refresh"] =
+                                servers.clone();
                         }
                         if let Some(media) = self.media.read().await.clone() {
-                            media.configure(servers).await?;
+                            // Only validates; never fails the session on a rotation.
+                            let _ = media.configure(servers).await;
                         }
                     } else {
                         // The async WebRTC engine binds the initial ICE servers to its gatherer.
@@ -446,6 +470,10 @@ impl Worker {
                         .to_owned();
                     self.ping_interval = seconds(&join["pingInterval"])?;
                     self.ping_timeout = seconds(&join["pingTimeout"])?;
+                    if self.ping_interval.is_zero() && !self.ping_timeout.is_zero() {
+                        // Without an interval the timeout could never be refreshed.
+                        self.ping_interval = (self.ping_timeout / 3).max(Duration::from_secs(1));
+                    }
                     self.next_ping = Instant::now() + self.ping_interval;
                     self.state.write().await["rtc_join"] = join.clone();
                     self.rtc_joined = true;
@@ -455,7 +483,10 @@ impl Worker {
                     self.pending.push_back(payload);
                 }
                 Some("rtc:pong") => {
-                    if let Some(value) = payload.pointer("/pong_resp/lastPingTimestamp") {
+                    if let Some(value) = payload
+                        .pointer("/pong_resp/lastPingTimestamp")
+                        .or_else(|| payload.pointer("/pong_resp/timestamp"))
+                    {
                         let timestamp = value
                             .as_u64()
                             .or_else(|| value.as_str().and_then(|v| v.parse().ok()));
@@ -465,7 +496,10 @@ impl Worker {
                     }
                 }
                 Some(_) => {
-                    if self.joined && self.media.read().await.is_some() {
+                    // Participant events carry track SIDs that `subscription_changes` filters by
+        // the local identity. Draining before `rtc:join` would discard them, because
+        // the identity is still empty at that point.
+        if self.joined && self.rtc_joined && self.media.read().await.is_some() {
                         self.process_media(payload).await?;
                     } else {
                         if self.pending.len() >= 256 {
@@ -477,7 +511,10 @@ impl Worker {
                 None => return Err(Error::Protocol("нет media method")),
             }
         }
-        if self.joined && self.media.read().await.is_some() {
+        // Participant events carry track SIDs that `subscription_changes` filters by
+        // the local identity. Draining before `rtc:join` would discard them, because
+        // the identity is still empty at that point.
+        if self.joined && self.rtc_joined && self.media.read().await.is_some() {
             // The current web client publishes an explicitly unmuted track after rtc:join.
             if self.rtc_joined && !self.track_requested {
                 self.track_requested = true;
@@ -488,11 +525,11 @@ impl Worker {
             while let Some(payload) = self.pending.pop_front() {
                 self.process_media(payload).await?;
             }
-            if self.rtc_joined
-                && self.publisher_answer
-                && self.subscriber_answer
-                && self.turn_configured
-            {
+            // Readiness is the negotiated media state, not the presence of TURN
+            // credentials: a STUN-only or host-candidate-only SFU assignment is a
+            // valid session, and gating on TURN made provisioning time out on
+            // networks where the SFU returns no username/credential pair.
+            if self.rtc_joined && self.publisher_answer && self.subscriber_answer {
                 if let Some(ready) = self.ready.take() {
                     self.state.write().await["status"] = json!("ready");
                     let _ = ready.send(());
@@ -527,11 +564,15 @@ impl Worker {
             }
             Some("rtc:track:published") => {
                 let published = &payload["trackPublishedResponse"];
-                if published["cid"] == self.track_cid {
+                // Publish at most once per track: a repeated/echoed
+                // trackPublishedResponse used to add a second transceiver and a
+                // second offer while the first negotiation was still in flight.
+                if published["cid"] == self.track_cid && !self.published {
                     let sid = published
                         .pointer("/track/sid")
                         .and_then(Value::as_str)
                         .ok_or(Error::Protocol("нет server track id"))?;
+                    self.published = true;
                     let offer = media.publish(&self.track_cid, sid).await?;
                     self.send_media(offer).await?;
                 }
@@ -623,8 +664,10 @@ fn subscription_changes(
                 .ok_or(Error::Protocol("некорректный remote media track sid"))?;
             let subscribe = track["muted"] != true && participant["state"] != "DISCONNECTED";
             let changed = if subscribe {
-                if !subscribed.contains(sid) && subscribed.len() >= 4096 {
-                    return Err(Error::Protocol("слишком много media subscriptions"));
+                if !subscribed.contains(sid) && subscribed.len() >= MAX_TRACK_SUBSCRIPTIONS {
+                    // Never tear down a working call because the SFU keeps announcing
+                    // tracks for stale participants; stop growing the set instead.
+                    continue;
                 }
                 subscribed.insert(sid.to_owned())
             } else {

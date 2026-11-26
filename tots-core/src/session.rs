@@ -202,7 +202,23 @@ struct AckTracker {
 
 impl AckTracker {
     fn observe(&mut self, packet_id: u32) {
+        // Packet numbers wrap after 2^32 packets. Once the newest id is far ahead of
+        // an old entry in wrap-aware order, that entry belongs to the previous
+        // number space and can never be legitimately re-ACKed.
+        let newest = self
+            .received
+            .iter()
+            .copied()
+            .fold(packet_id, |newest, candidate| {
+                if candidate.wrapping_sub(newest) < (1 << 31) {
+                    candidate
+                } else {
+                    newest
+                }
+            });
         self.received.insert(packet_id);
+        self.received
+            .retain(|id| newest.wrapping_sub(*id) < (1 << 31));
         // Keep a bounded tail. Packet IDs are monotonically increasing within a session.
         while self.received.len() > 512 {
             let Some(first) = self.received.first().copied() else {
@@ -455,11 +471,26 @@ impl SessionEngine {
                 if let Some(bytes) = completed {
                     let mut delivered = self.delivered.lock();
                     delivered.insert(*packet_id);
+                    // Deduplicate in wrap-aware order: after the 32-bit packet-number
+                    // wrap the smallest ids are the *newest* ones, so a plain
+                    // "remove the first" policy pruned fresh ids and kept stale ones.
+                    let newest = delivered.iter().copied().fold(*packet_id, |newest, id| {
+                        if id.wrapping_sub(newest) < (1 << 31) {
+                            id
+                        } else {
+                            newest
+                        }
+                    });
+                    delivered.retain(|id| newest.wrapping_sub(*id) < (1 << 31));
                     while delivered.len() > 1024 {
-                        let Some(first) = delivered.first().copied() else {
+                        let Some(stalest) = delivered
+                            .iter()
+                            .copied()
+                            .max_by_key(|id| newest.wrapping_sub(*id))
+                        else {
                             break;
                         };
-                        delivered.remove(&first);
+                        delivered.remove(&stalest);
                     }
                     Ok(Some(DecodedPacket::Ip {
                         assoc_id: *assoc_id,

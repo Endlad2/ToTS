@@ -622,8 +622,87 @@ async fn prune_rooms(state: &ApiState) {
         drop(changes);
         if let Some((_, bridges)) = removed {
             close_rooms(bridges).await;
+        } else if !remove {
+            repair_dead_bridges(state, id).await;
         }
     }
+}
+
+/// Re-open room bridges whose task has stopped.
+///
+/// A provider media session can die (signalling close, ICE failure, SFU eviction)
+/// while its config row and room record stay valid. Previously the bridge simply
+/// disappeared from the data path and the room map kept a dead entry forever, so
+/// every ToTS datagram for that worker was dropped until the server restarted.
+async fn repair_dead_bridges(state: &ApiState, id: Uuid) {
+    let dead: Vec<usize> = match state.rooms.get(&id) {
+        Some(entry) => entry
+            .iter()
+            .enumerate()
+            .filter(|(_, bridge)| bridge.is_finished())
+            .map(|(index, _)| index)
+            .collect(),
+        None => return,
+    };
+    if dead.is_empty() {
+        return;
+    }
+    let Some(device) = state.db.get(id).await.ok().flatten() else {
+        return;
+    };
+    let Some(jazz) = provider_entry(device.provider, &device.provider_data, ProviderName::Jazz)
+    else {
+        // Only Jazz rooms are re-joinable from persisted invites; other native
+        // providers rebuild through restore on the next configuration change.
+        return;
+    };
+    let (Ok(links), Ok(carrier)) = (
+        persisted_room_links(jazz),
+        tots_core::providers::jazz::media_carrier(jazz),
+    ) else {
+        return;
+    };
+    let changes = state.room_changes.lock().await;
+    let target = state.args.turn_listen;
+    for index in dead {
+        let Some(link) = links.get(index) else {
+            continue;
+        };
+        tracing::warn!(device_id=%id, room=index, "Jazz room bridge stopped; re-joining");
+        let room = match tots_core::providers::jazz::join_room_with_carrier(link, carrier).await {
+            Ok(room) => room,
+            Err(_) => {
+                tracing::warn!(device_id=%id, room=index, "Jazz room re-join failed; will retry");
+                continue;
+            }
+        };
+        let path = room.path.clone();
+        let bridge = match NativeBridge::start(path.clone(), target).await {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                let _ = room.path.close().await;
+                tracing::warn!(device_id=%id, room=index, %error, "Jazz bridge restart failed");
+                continue;
+            }
+        };
+        if let Some(mut entry) = state.rooms.get_mut(&id) {
+            if let Some(slot) = entry.get_mut(index) {
+                if slot.is_finished() {
+                    *slot = bridge;
+                    tracing::info!(device_id=%id, room=index, "Jazz room bridge restored");
+                    continue;
+                }
+            }
+            // The room map changed while re-joining; keep the new bridge alive
+            // rather than leaking it.
+            entry.push(bridge);
+        } else {
+            let mut bridges = vec![bridge];
+            bridges.append(&mut Vec::new());
+            state.rooms.insert(id, bridges);
+        }
+    }
+    drop(changes);
 }
 
 async fn publish_restored_rooms(

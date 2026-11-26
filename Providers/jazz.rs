@@ -161,19 +161,30 @@ impl Provider for JazzProvider {
     async fn connect_native(&self, data: &Value) -> Result<Option<Arc<dyn DatagramPath>>> {
         let carrier = media_carrier(data)?;
         let data = parse_data(data)?;
-        let session = match data.connector_url {
+        let session = match data.connector_url.as_deref() {
             Some(connector) => {
-                jazz_session::join_preconnected_with_carrier(
+                match jazz_session::join_preconnected_with_carrier(
                     &data.join_link,
                     &data.name,
-                    &connector,
+                    connector,
                     carrier,
                 )
                 .await
+                {
+                    Ok(session) => Ok(session),
+                    Err(_) => {
+                        // A stored connector can expire or be invalidated by a room
+                        // restart; retrying with it forever left the worker unable to
+                        // ever reconnect. Fall back to a fresh HTTP preconnect.
+                        tracing::debug!(
+                            "Jazz preconnected join failed; retrying with a fresh connector"
+                        );
+                        jazz_session::join_call_with_carrier(&data.join_link, &data.name, carrier)
+                            .await
+                    }
+                }
             }
-            None => {
-                jazz_session::join_call_with_carrier(&data.join_link, &data.name, carrier).await
-            }
+            None => jazz_session::join_call_with_carrier(&data.join_link, &data.name, carrier).await,
         }
         .map_err(|_| Error::Provider("Jazz session join failed".into()))?;
         Ok(Some(JazzPath::connect(session, true).await?))
@@ -341,6 +352,12 @@ impl DatagramPath for JazzPath {
     }
 }
 
+/// Collect provider endpoint addresses for the Windows escape routes.
+///
+/// This is best effort on purpose: a DNS failure must never discard an already
+/// negotiated media session. The candidate/SDP literals gathered here are what
+/// the transport actually connects to; unresolved hostnames only mean those
+/// endpoints are not pre-pinned.
 async fn collect_route_ips(snapshot: &Value, join_link: &str) -> Result<Vec<Ipv4Addr>> {
     let (mut ips, endpoints) = route_sources(snapshot, join_link);
     for (host, port) in endpoints {
@@ -350,11 +367,12 @@ async fn collect_route_ips(snapshot: &Value, join_link: &str) -> Result<Vec<Ipv4
             }
             continue;
         }
-        let addresses =
-            tokio::time::timeout(Duration::from_secs(5), lookup_host((host.as_str(), port)))
-                .await
-                .map_err(|_| Error::Provider("Jazz endpoint DNS resolution timed out".into()))?
-                .map_err(|_| Error::Provider("Jazz endpoint DNS resolution failed".into()))?;
+        let Ok(Ok(addresses)) =
+            tokio::time::timeout(Duration::from_secs(5), lookup_host((host.as_str(), port))).await
+        else {
+            tracing::debug!(%host, "Jazz endpoint not resolved for escape routes");
+            continue;
+        };
         for address in addresses {
             if let IpAddr::V4(ip) = address.ip() {
                 if is_public_ipv4(ip) {

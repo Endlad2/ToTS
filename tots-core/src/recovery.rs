@@ -11,6 +11,22 @@ const BEST_EFFORT_SAMPLE_LIMIT: usize = 512;
 const MIN_PTO: Duration = Duration::from_secs(1);
 const MAX_PTO: Duration = Duration::from_secs(30);
 const PACING_BURST_BYTES: usize = 16 * 1024;
+/// Packet numbers are 32-bit and wrap after roughly 4.3 billion packets (about two
+/// days at 25k packets/s). Comparing them as plain integers made every packet look
+/// like it was thousands behind after the wrap, which turned into a retransmit
+/// storm and a collapsed congestion window.
+const HALF_NUMBER_SPACE: u32 = 1 << 31;
+
+/// True when `candidate` is newer than `reference` in wrap-aware order.
+fn is_newer(candidate: u32, reference: u32) -> bool {
+    let distance = candidate.wrapping_sub(reference);
+    distance != 0 && distance < HALF_NUMBER_SPACE
+}
+
+/// Number of packet numbers `largest` is ahead of `packet`, wrap-aware.
+fn distance_from(largest: u32, packet: u32) -> u32 {
+    largest.wrapping_sub(packet)
+}
 
 #[derive(Clone, Debug)]
 pub struct Retransmit {
@@ -191,8 +207,22 @@ impl RecoveryController {
             return 0;
         }
         let now = Instant::now();
-        if let Some(largest) = ranges.iter().map(|range| range.end).max() {
-            self.largest_acked = Some(self.largest_acked.map_or(largest, |old| old.max(largest)));
+        // Range ends are unordered in wrap-aware space, so pick the newest by
+        // comparison rather than by integer ordering.
+        let mut newest: Option<u32> = None;
+        for range in ranges {
+            newest = Some(match newest {
+                None => range.end,
+                Some(current) if is_newer(range.end, current) => range.end,
+                Some(current) => current,
+            });
+        }
+        if let Some(newest) = newest {
+            self.largest_acked = Some(match self.largest_acked {
+                None => newest,
+                Some(current) if is_newer(newest, current) => newest,
+                Some(current) => current,
+            });
         }
         let mut acked = Vec::new();
         for packet_id in self.in_flight.keys().copied() {
@@ -267,11 +297,11 @@ impl RecoveryController {
             let later_ack = sent.retries == 0
                 && self
                     .largest_acked
-                    .is_some_and(|largest| largest > packet_id);
+                    .is_some_and(|largest| is_newer(largest, packet_id));
             let packet_threshold = later_ack
                 && self
                     .largest_acked
-                    .is_some_and(|largest| largest - packet_id >= 3);
+                    .is_some_and(|largest| distance_from(largest, packet_id) >= 3);
             let age = now.saturating_duration_since(sent.last_sent);
             let time_threshold = later_ack && age >= loss_delay;
             if packet_threshold || time_threshold {
@@ -296,12 +326,12 @@ impl RecoveryController {
             }
             let later_ack = self
                 .largest_acked
-                .is_some_and(|largest| largest > packet_id);
+                .is_some_and(|largest| is_newer(largest, packet_id));
             let age = now.saturating_duration_since(sent.sent_at);
             if later_ack
                 && self
                     .largest_acked
-                    .is_some_and(|largest| largest - packet_id >= 3)
+                    .is_some_and(|largest| distance_from(largest, packet_id) >= 3)
             {
                 self.stats.packet_threshold_losses =
                     self.stats.packet_threshold_losses.saturating_add(1);
@@ -914,6 +944,41 @@ mod tests {
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].packet_id, 1);
         assert_eq!(recovery.bytes_in_flight(), 100);
+    }
+
+    #[test]
+    fn packet_number_wrap_does_not_fake_losses() {
+        // 32-bit packet numbers wrap after ~4.3e9 packets. After the wrap the new
+        // ids are numerically small, and plain integer comparison used to declare
+        // every fresh packet thousands behind `largest_acked` — a retransmit storm
+        // plus a collapsed window after about two days at 25k packets/s.
+        let mut controller = RecoveryController::default();
+        let high = u32::MAX - 1;
+        controller.on_sent(high, 1, vec![0; 40], 40, Reliability::Reliable);
+        assert!(controller.on_ack(high));
+        for id in [1u32, 2, 5] {
+            controller.on_sent(id, 1, vec![0; 40], 40, Reliability::Reliable);
+        }
+        assert!(
+            controller.poll_losses().is_empty(),
+            "post-wrap packets must not be treated as lost"
+        );
+        assert!(controller.bytes_in_flight() > 0);
+    }
+
+    #[test]
+    fn wrap_aware_largest_ack_accepts_a_newer_small_id() {
+        let mut controller = RecoveryController::default();
+        let high = u32::MAX - 1;
+        controller.on_sent(high, 1, vec![0; 40], 40, Reliability::Reliable);
+        controller.on_sent(3, 1, vec![0; 40], 40, Reliability::Reliable);
+        // An ACK for the new number space must become the new newest.
+        assert_eq!(controller.on_ack_ranges(&[AckRange { start: 3, end: 3 }]), 1);
+        // The stale pre-wrap packet is now genuinely behind by more than the
+        // threshold and is a real loss.
+        let lost = controller.poll_losses();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].packet_id, high);
     }
 
     #[test]

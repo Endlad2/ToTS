@@ -102,6 +102,8 @@ Useful options:
 | `--tun-default-route` | Explicitly enable Windows full-tunnel routing (already enabled by default). |
 | `--no-tun-default-route` | Opt out of Windows full-tunnel routing; leave system routes unchanged. |
 | `--run-for-seconds N` | End the connected TUN run gracefully after a bounded interval. |
+| `--egress-interface NAME` | Force the physical adapter (`eth0`, `wan`, `en0`, ...) that carries ToTS transport, provider HTTP/WebSocket signalling and WebRTC media. Default: detected from the IPv4 default route. |
+| `--no-egress-pinning` | Disable physical-adapter pinning and let ToTS sockets follow the system route table. |
 
 For example, add `--run-for-seconds 75` for a bounded test. Before Wintun is opened, the client snapshots the active physical IPv4 underlay. The route guard then pins the VPS and provider endpoint IPv4 addresses to that captured interface/gateway **before** installing the two TUN `/1` routes, so later Windows connectivity/metric changes cannot make ToTS transport packets recurse through `tots0`. Known virtual/VPN adapters are excluded from automatic underlay selection. If Windows or a driver still reports the wrong adapter, set `TOTS_PHYSICAL_IFINDEX` to the desired Wi-Fi/Ethernet interface index before launching the client:
 
@@ -177,13 +179,45 @@ transport workers; it deliberately does not install firewall/NAT or LAN policy
 routes. Router-wide policy routing remains the responsibility of the router
 manager (LaLune in this integration).
 
+## Physical egress pinning
+
+Every socket ToTS opens for itself — direct VPS UDP, TURN/UDP allocations, provider
+HTTP/REST, provider WebSocket signalling and WebRTC/ICE media — is pinned to a
+real hardware adapter so it never follows the full-tunnel default route back into
+the ToTS TUN device. This is what keeps the transport alive after the tunnel is
+up: without it, a reconnect would have to reach the provider through the tunnel
+that is currently down.
+
+The adapter is resolved once per process:
+
+1. `--egress-interface NAME` or `TOTS_EGRESS_INTERFACE`,
+2. otherwise the IPv4 default route is inspected and known virtual adapters
+   (`tun*`, `tots*`, `wg*`, `utun*`, `docker*`, `veth*`, `br-*`, `tailscale*`,
+   `WireGuard`, `Wintun`, ...) are excluded.
+
+Pinning uses `SO_BINDTODEVICE` on Linux/Android/Fuchsia (needs `CAP_NET_RAW` or
+root), `IP_BOUND_IF` with `TOTS_EGRESS_INTERFACE_INDEX` on the macOS family, and
+adapter-address binding plus the existing underlay host routes on Windows.
+`TOTS_EGRESS_ADDRESS` supplies a local IPv4 when it cannot be detected, and
+`TOTS_EGRESS_DISABLE=1` turns pinning off. Pinning failure is reported once and is
+never fatal: an unprivileged process (for example an Android app that protects
+sockets through `VpnService`) keeps working unpinned.
+
+```bash
+# Force Wi-Fi on a Linux desktop
+tots-client --config 'tots://...' --egress-interface wlp60s0
+
+# Router: WAN device on OpenWrt
+tots-openwrt --config-file /etc/tots/config.uri --egress-interface wan
+```
+
 ## Transport and encryption
 
 VK uses TURN/UDP allocation, authentication, permissions and channel binding. Its relay requires a 12-byte RTP envelope around each encrypted ToTS datagram. The server recognizes that envelope while continuing to accept raw ToTS datagrams for the direct/legacy path.
 
 Jazz uses actual WebSocket signalling and WebRTC RTP media through the restored `jazz-session` library. `preconnect_call` performs HTTP provisioning on the VPS; `join_preconnected` lets the PC connect directly to Jazz WSS/media endpoints. SSH is used for setup or private configuration retrieval, never for user traffic. Public media keepalives establish the remote track and are filtered before ToTS packet processing.
 
-The Jazz session publishes audio with `muted:false` and explicitly subscribes to remote unmuted AUDIO tracks, deduplicating updates and unsubscribing when tracks are muted. Encrypted path probes retry every 500 ms with fresh sequence numbers within an overall three-second deadline, allowing for initial packet loss during SFU renegotiation.
+The Jazz session publishes audio with `muted:false` and explicitly subscribes to remote unmuted AUDIO tracks, deduplicating updates and unsubscribing when tracks are muted. Readiness is the negotiated media state; TURN credentials are no longer required for a session to become ready, and an unusable ICE entry from the signalling server is skipped instead of aborting the join. A rotated `rtc:config`, an unknown/unsupported ICE candidate, or a stale `connector_url` no longer tears down or permanently blocks a worker. Encrypted path probes retry every 500 ms with fresh sequence numbers; VK keeps a three-second deadline and native providers get a ten-second one, because a media join legitimately needs a real RTP round trip.
 
 ToTS frames use XChaCha20-Poly1305 with an Argon2id-derived key, authenticated envelope metadata and replay protection. Each worker has its own session and sequence space; workers reuse the device key without repeating Argon2. Data frames receive their sequence number immediately before encrypted transmission. The replay window remains 128 packets. ACK-range feedback is delayed for at most about 2 ms and batched up to 32 received packet IDs per datagram, reducing control traffic and transport sends without changing authenticated packet numbering.
 
@@ -191,7 +225,7 @@ TCP/UDP IP traffic uses best-effort datagram forwarding, relying on the inner tr
 
 Bulk traffic moves between workers at roughly 16 KiB flowlet boundaries. Small UDP (up to 300-byte IP packets) stays sticky unless its short-window load rises above about 75% of one estimated allocation, at which point it is temporarily treated as bulk. Worker selection uses an adaptive token/deficit weight of about 247 kB/s (~2 Mbit/s) per allocation; this is a balancing estimate rather than a hard rate cap. The server receive hot path uses a larger bounded TUN ingress queue and no longer awaits one TUN enqueue plus one ACK network send per incoming IP packet; ACK transmission is handled by a separate per-session batcher. TURN paths also reuse their receive/send packet buffers instead of allocating a ~65 KiB receive Vec and multiple transmit Vecs per datagram. These changes follow the same hot-path separation/buffer-reuse principles as MRTT without importing its source code.
 
-Every worker owns a distinct authenticated `session_id`, so workers from one device cannot overwrite each other on the server. If a path dies, the same SessionEngine/sequence space is retained while the worker re-probes direct/WebRTC-side and TURN candidates; after repeated preferred-provider failures it tries configured fallback providers. This gives authenticated 0-RTT-like path resumption without importing QUIC wire format. A five-second status line reports TUN MB, healthy/target worker counts, per-provider worker split and the approximate aggregate VK scheduling capacity. TURN/TCP and TURN/TLS are not implemented.
+Every worker owns a distinct authenticated `session_id`, so workers from one device cannot overwrite each other on the server. A session must also survive long runs: TURN allocation maintenance is driven by a dedicated keepalive task as well as by the receive loop, the client receive path never blocks on downstream queues, worker restarts are rate-limited and based on an aged RTT baseline, and the server retries transient TUN and database errors instead of silently dropping every session of a device. If a path dies, the same SessionEngine/sequence space is retained while the worker re-probes direct/WebRTC-side and TURN candidates; after repeated preferred-provider failures it tries configured fallback providers. This gives authenticated 0-RTT-like path resumption without importing QUIC wire format. A five-second status line reports TUN MB, healthy/target worker counts, per-provider worker split and the approximate aggregate VK scheduling capacity. TURN/TCP and TURN/TLS are not implemented.
 
 ## Build and release delivery
 

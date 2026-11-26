@@ -19,6 +19,9 @@ start_service() {
     config_load tots
     config_get workers main workers 8
     config_get_bool relay_only main relay_only 1
+    # Physical WAN device that must carry ToTS transport and provider signalling.
+    # Empty means "detect from the IPv4 default route".
+    config_get egress_interface main egress_interface ''
     case "$workers" in
         ''|*[!0-9]*) workers=8 ;;
     esac
@@ -34,6 +37,7 @@ start_service() {
         --status-file "$STATUS_FILE" \
         --n "$workers"
     [ "$relay_only" -eq 1 ] && procd_append_param command --relay-only
+    [ -n "$egress_interface" ] && procd_append_param command --egress-interface "$egress_interface"
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1

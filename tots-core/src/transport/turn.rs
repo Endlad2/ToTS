@@ -52,13 +52,9 @@ impl TurnUdpPath {
             .find(|u| u.to_ascii_lowercase().starts_with("turn:"))
             .ok_or_else(|| Error::Transport("no TURN/UDP URL".into()))?;
         let server = parse_turn_udp(url)?;
-        let bind: SocketAddr = if server.is_ipv4() {
-            "0.0.0.0:0".parse().expect("static IPv4 bind")
-        } else {
-            "[::]:0".parse().expect("static IPv6 bind")
-        };
-        let socket = Arc::new(super::socket::bind_udp(bind)?);
-        socket.connect(server).await?;
+        // The allocation socket leaves through the physical underlay: after a
+        // full-tunnel route change it must not be carried by the ToTS TUN.
+        let socket = Arc::new(super::socket::connect_udp_pinned(server).await?);
         let unauth = stun::encode(
             stun::ALLOCATE_REQUEST,
             stun::transaction(),
@@ -133,6 +129,25 @@ impl TurnUdpPath {
             send_buffer: Mutex::new(Vec::with_capacity(2048)),
             receive_buffer: Mutex::new(vec![0u8; TURN_RX_BUFFER]),
         })
+    }
+
+    /// Advance allocation maintenance and return any control datagram that is due.
+    ///
+    /// `recv` drives maintenance in normal operation, but a receive loop that is
+    /// briefly blocked on a full inbound queue must not let the allocation's
+    /// lifetime, permissions or channel binding lapse: sends would then succeed
+    /// into a relay that has already forgotten about us.
+    async fn poll_maintenance(&self) -> Result<Option<Vec<u8>>> {
+        let mut maintenance = self.maintenance.lock().await;
+        maintenance.poll(Instant::now())
+    }
+
+    /// Refresh the allocation from outside the receive loop.
+    pub async fn refresh_allocation(&self) -> Result<()> {
+        if let Some(control) = self.poll_maintenance().await? {
+            self.socket.send(&control).await?;
+        }
+        Ok(())
     }
 }
 
@@ -387,6 +402,13 @@ impl DatagramPath for TurnUdpPath {
         if media_len > u16::MAX as usize {
             return Err(Error::Transport("TURN payload too large".into()));
         }
+        // Drive allocation maintenance from the send side too. `recv` normally
+        // owns it, but a worker that keeps sending while its receive loop is
+        // briefly descheduled must not let Refresh/CreatePermission/ChannelBind
+        // lapse. Errors are ignored here; only `recv` reports a dead allocation.
+        if let Ok(Some(control)) = self.poll_maintenance().await {
+            let _ = self.socket.send(control.as_slice()).await;
+        }
         // Reuse one packet buffer per TURN allocation. The mutex also serializes the
         // worker's data/control-feedback sends, avoiding allocator churn while preserving
         // datagram boundaries.
@@ -434,6 +456,10 @@ impl DatagramPath for TurnUdpPath {
                 self.maintenance.lock().await.response(&response)?;
             }
         }
+    }
+
+    async fn keepalive(&self) -> Result<()> {
+        self.refresh_allocation().await
     }
 
     async fn close(&self) -> Result<()> {
@@ -653,5 +679,27 @@ mod tests {
                 assert_eq!(next.attr(stun::ATTR_NONCE), Some(b"replacement".as_slice()));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn allocation_maintenance_runs_without_polling_recv() {
+        // The receive loop used to be the only driver of Refresh/CreatePermission/
+        // ChannelBind. Receiving back-pressure therefore expired the allocation while
+        // sends kept "succeeding" into the relay. `keepalive()` must refresh on its own.
+        let relay = fake_turn(false, true).await;
+        let path = TurnUdpPath::connect(&relay.credentials, "127.0.0.1:7801".parse().unwrap())
+            .await
+            .unwrap();
+        let before = relay.refreshes.load(Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while relay.refreshes.load(Ordering::SeqCst) == before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "keepalive did not refresh the allocation"
+            );
+            path.keepalive().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(relay.binds.load(Ordering::SeqCst), 1);
     }
 }

@@ -42,7 +42,7 @@ impl Provider for VkProvider {
                 "vk_call_links or vk_token is required".into(),
             ));
         }
-        let client = Client::builder()
+        let client = crate::egress::configure_http(Client::builder())
             .timeout(Duration::from_secs(15))
             .user_agent("ToTS/0.1")
             .build()
@@ -108,7 +108,7 @@ impl Provider for VkProvider {
         if token.is_empty() {
             return Ok(());
         }
-        let client = Client::builder()
+        let client = crate::egress::configure_http(Client::builder())
             .timeout(Duration::from_secs(10))
             .user_agent("ToTS/0.1")
             .build()

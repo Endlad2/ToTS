@@ -88,3 +88,81 @@ Compilation and live Android/Windows tests remain outstanding because this envir
 ## Windows DNS helper compile fix (2026-11-21)
 
 Moved `restore_dns_script` and `set_ipv4_dns_script` out of the IPv6 PowerShell raw string and back to module scope. They remain gated with `#[cfg(any(windows, test))]`, so the Windows implementation and its unit tests can resolve them. Removed the now-unused `HashSet` import from `tots-client/src/workers.rs`. The source-level checks confirm each helper is defined once, outside the raw PowerShell string, and that `Set-DnsClientServerAddress` calls do not pass the unsupported `-AddressFamily` parameter. A Cargo build/test could not be run in this environment because Rust/Cargo are unavailable.
+
+## Jazz interop, physical egress pinning and long-run stability (2026-11-26)
+
+### Jazz
+
+- Readiness no longer requires TURN credentials. A STUN-only or host-candidate-only
+  assignment is a valid media session; gating on a `turn:` URL with username and
+  credential made provisioning time out on networks where the media server returns
+  none. `MediaCarrier::Audio` now timestamps from the wall clock (`audio` used to
+  advance 20 ms of RTP clock per *datagram*, i.e. 4–20× real time under load), RTP
+  `marker` is set only on the last fragment of a multi-fragment message, and RTCP is
+  drained for the audio carrier as well as the video one.
+- A rotated `rtc:config`, an ICE candidate with an unknown target or an
+  unsupported transport, a duplicated `rtc:track:published`, and a stale
+  `connector_url` no longer tear the session down: the SDK keeps the negotiated
+  media, skips unusable candidates and reconnects through a fresh HTTP preconnect.
+  Signalling pings now carry `lastPingTimestamp` (RTT was never measured), a single
+  missed pong is tolerated, and a zero `pingInterval` is derived from the timeout
+  instead of silently disabling pings.
+- Route-IP discovery is best effort and never fails a working session, the client
+  keeps the previous endpoint set across a failed reconnect, the startup probe
+  budget is 10 s for native providers, and the Windows first-route gate uses the
+  same `min(45 + 5N, 300)` formula as every other startup wait.
+- Server-side bridges retry transient transport errors instead of exiting on the
+  first one, expose whether their task finished, and `prune_rooms` re-joins a dead
+  Jazz room from its persisted invite. Restored bridges are started only after the
+  dataplane has bound its ingress sockets, removing a boot-time bridge death.
+- Subscription tracking stops growing at its cap instead of failing the session,
+  participant events are not drained before the local identity is known, and the
+  reassembler evicts the oldest partial message rather than discarding all of them.
+
+### Physical egress pinning
+
+`Providers/egress.rs` is one policy module compiled into both `tots-core` and the
+bundled `jazz-session` crate. The client resolves a real adapter
+(`--egress-interface`/`TOTS_EGRESS_INTERFACE`, else the IPv4 default route, always
+excluding TUN/TAP/Wintun/VPN/virtual devices) once per process and pins every socket
+it opens itself: direct VPS UDP, TURN/UDP allocations, provider HTTP/REST, provider
+WebSocket signalling (`Providers/ws.rs`) and Jazz WebRTC media, the last through a
+pinned ICE `UDPMux` plus interface/address filters so no ToTS virtual address is ever
+advertised. Mechanisms: `SO_BINDTODEVICE` on Linux/Android/Fuchsia,
+`IP_BOUND_IF`+index on the macOS family, adapter-address binding on Windows (which
+also keeps the existing underlay host routes). Only the client configures the policy,
+so `tots-server` keeps binding wildcard listeners; failures are reported once and
+never fatal, and `--no-egress-pinning`/`TOTS_EGRESS_DISABLE=1` opt out. OpenWrt gains
+a matching `egress_interface` UCI option.
+
+### Long-run stability
+
+- TURN refresh/permission/channel-bind maintenance is driven by a dedicated
+  `DatagramPath::keepalive` task in addition to the receive loop, so back-pressure in
+  the receive path can no longer let the allocation expire while sends still succeed.
+- The client receive loop no longer blocks indefinitely on the TUN inbound queue or
+  the ACK batcher (bounded waits with shed-and-count), and every datagram send is
+  deadline-bounded, so a stalled provider socket surfaces as a worker failure instead
+  of freezing the TUN loop, the health probe and recovery.
+- Worker restarts use an aged RTT baseline with an absolute slack floor, six degraded
+  ticks and a five-minute rate limit; liveness now requires 25 s of silence. The VK
+  credential pool retires its oldest owned call generation instead of failing forever
+  at its cap.
+- Server TUN read/write loops retry transient errors (`error!` + terminate after 32
+  consecutive failures, so systemd restarts instead of leaving a half-dead daemon), a
+  transient SQLite error no longer deauthorizes every session of a device, a live
+  virtual-IP mapping cannot be hijacked by another device, per-session egress queues
+  are 1024 packets, and a stalled bridge is repaired.
+- Packet-number comparisons in recovery, ACK tracking and delivery deduplication are
+  wrap-aware, so the 32-bit `packet_id` space no longer produces a retransmit storm
+  after about 4.3 billion packets; TCP gets a 2 s queue-staleness budget while UDP
+  keeps 750 ms; flow-table pressure evicts the oldest quarter instead of clearing all
+  flows; and a packet is registered with recovery before its first frame is sent, so a
+  failed send is retransmitted instead of lost.
+
+Validation in this revision: `cargo test --workspace` (159 tests) and
+`cargo clippy --workspace --all-targets -- -D warnings` pass locally on
+rustc 1.100.0, plus `cargo test` in `Providers/jazz-session` (48 unit + 1 doc test).
+No live VK/Jazz/MAX endpoint, Windows host or Android device was available here, so
+provider interop, Windows source-address pinning and Android `SO_BINDTODEVICE`
+behaviour still need a real-network run.

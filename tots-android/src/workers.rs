@@ -260,11 +260,11 @@ impl WorkerManager {
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
         let mut slots = Vec::with_capacity(workers);
         let mut receivers = Vec::with_capacity(workers);
-        for id in 0..workers {
+        for (id, order) in provider_orders.iter().enumerate() {
             let (sender, receiver) = mpsc::channel(WORKER_QUEUE);
             slots.push(Arc::new(WorkerSlot {
                 id,
-                preferred_provider: provider_orders[id][0],
+                preferred_provider: order[0],
                 healthy: AtomicBool::new(false),
                 provider: RwLock::new(None),
                 sender,

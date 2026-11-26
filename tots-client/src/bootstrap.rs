@@ -98,11 +98,34 @@ impl BootstrapPool {
             }
             state.shared = None;
         }
-        // Old calls may still carry live workers; never evict them by force-finishing.
+        // Old calls may still carry live workers, so a generation is only retired
+        // once it is genuinely the oldest. Without retirement the pool reached its
+        // cap after a few hours of worker churn and every later bootstrap failed
+        // until the process was restarted.
         if state.owned.len() >= MAX_OWNED_GENERATIONS {
-            return Err(Error::Provider(
-                "VK owned-call limit reached; restart the client to renew".into(),
-            ));
+            let oldest = state.owned.remove(0);
+            match provider.cleanup(&oldest.data, &oldest.bootstrap).await {
+                Ok(()) => {
+                    tracing::warn!(
+                        remaining = state.owned.len(),
+                        "retired the oldest VK call generation to make room"
+                    );
+                }
+                Err(_) => {
+                    state.owned.insert(0, oldest);
+                    return Err(Error::Provider(
+                        "VK owned-call limit reached and the oldest call could not be retired"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        if state.owned.len() + 8 >= MAX_OWNED_GENERATIONS {
+            tracing::warn!(
+                owned = state.owned.len(),
+                limit = MAX_OWNED_GENERATIONS,
+                "VK call-generation budget is nearly exhausted"
+            );
         }
         if Instant::now() < state.not_before {
             tokio::time::sleep_until(state.not_before).await;

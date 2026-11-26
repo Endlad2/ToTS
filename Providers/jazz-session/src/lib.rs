@@ -2,11 +2,20 @@
 
 mod carrier;
 mod error;
+mod icemux;
 mod http;
 mod invite;
 mod rtc;
 mod session;
 mod snapshot;
+
+// Same physical-egress policy and WebSocket helper that `tots-core` uses. Both
+// files are included verbatim so the SDK's signalling and ICE sockets leave
+// through the client's real adapter instead of the full-tunnel TUN default route.
+#[path = "../../egress.rs"]
+pub mod egress;
+#[path = "../../ws.rs"]
+pub mod ws;
 
 pub use carrier::MediaCarrier;
 pub use error::{Error, Result};

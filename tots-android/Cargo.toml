@@ -23,3 +23,8 @@ tots-core = { path = "../tots-core" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# `#[tokio::test(start_paused = true)]` needs the test-util feature; a
+# single-package build does not inherit it from tots-client.
+tokio = { workspace = true, features = ["test-util"] }

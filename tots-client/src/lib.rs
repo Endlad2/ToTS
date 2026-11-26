@@ -72,6 +72,13 @@ struct Args {
     /// Stop gracefully after this many seconds (for unattended testing).
     #[arg(long)]
     run_for_seconds: Option<u64>,
+    /// Force the physical adapter that carries ToTS transport and provider
+    /// signalling (default: detected from the IPv4 default route).
+    #[arg(long, value_name = "NAME")]
+    egress_interface: Option<String>,
+    /// Disable physical-adapter pinning and use the ordinary route table.
+    #[arg(long)]
+    no_egress_pinning: bool,
 }
 
 fn full_tunnel_enabled(args: &Args, is_windows: bool) -> bool {
@@ -169,6 +176,37 @@ fn chrono_free_unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// Resolve the physical underlay for every socket this client opens itself.
+///
+/// Once the full tunnel is installed the system default route points at the ToTS
+/// TUN device. Any transport or provider socket created afterwards would be
+/// carried by the tunnel it is building, which is why provider traffic is pinned
+/// to a real adapter instead of following the route table.
+fn configure_egress(args: &Args, cfg: &ConnectionConfig) {
+    tots_core::egress::set_tunnel(Some(&args.tun_name), Some(cfg.virtual_ipv4()));
+    if args.no_egress_pinning {
+        std::env::set_var(tots_core::egress::EGRESS_DISABLE_ENV, "1");
+        info!(
+            "physical-adapter pinning disabled; ToTS transport follows the system route table"
+        );
+        return;
+    }
+    match tots_core::egress::configure(args.egress_interface.as_deref()) {
+        Some(egress) => info!(
+            interface = egress.name(),
+            interface_index = egress.index().unwrap_or(0),
+            address = %egress.address().map(|a| a.to_string()).unwrap_or_default(),
+            "ToTS transport is pinned to the physical adapter"
+        ),
+        None if cfg!(windows) => info!(
+            "Windows underlay is not captured yet; ToTS transport will be pinned to the physical adapter as soon as Wintun setup captures it"
+        ),
+        None => warn!(
+            "no physical egress adapter selected; ToTS transport will follow the system route table (set --egress-interface or TOTS_EGRESS_INTERFACE to force one)"
+        ),
+    }
+}
+
 async fn wait_for_shutdown() -> Result<()> {
     #[cfg(unix)]
     {
@@ -195,6 +233,7 @@ pub async fn run() -> Result<()> {
     let args = Args::parse();
     let cfg = config_from_args(&args)?;
     cfg.validate()?;
+    configure_egress(&args, &cfg);
     let (manager, inbound) = WorkerManager::start(
         cfg.clone(),
         args.n,
@@ -303,8 +342,12 @@ pub async fn run() -> Result<()> {
         info!(
             "Windows TUN created; waiting for the first healthy transport before switching system routes"
         );
+        // Long enough for one worst-case native media join (signalling + SDP +
+        // ICE); a 45 s gate aborted Jazz-only startups while the join was still
+        // in progress.
+        let gate = (45 + args.n as u64 * 5).min(300);
         if let Err(error) = manager
-            .wait_for_first_route_ready(Duration::from_secs(45))
+            .wait_for_first_route_ready(Duration::from_secs(gate))
             .await
         {
             if let Some(path) = args.status_file.as_deref() {
