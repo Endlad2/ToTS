@@ -1571,6 +1571,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-util",
+ "portable-atomic",
  "reqwest",
  "serde",
  "serde_json",
@@ -2088,6 +2089,9 @@ name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "potential_utf"
@@ -3219,6 +3223,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "portable-atomic",
  "serde_json",
  "tokio",
  "tots-core",
@@ -3234,6 +3239,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "portable-atomic",
  "serde_json",
  "tokio",
  "tots-core",
@@ -3260,6 +3266,7 @@ dependencies = [
  "kolibri-net",
  "md-5",
  "parking_lot",
+ "portable-atomic",
  "rand 0.8.8",
  "reqwest",
  "rmpv",
@@ -3305,6 +3312,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "portable-atomic",
  "rusqlite",
  "serde",
  "serde_json",

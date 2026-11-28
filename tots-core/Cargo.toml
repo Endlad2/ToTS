@@ -16,6 +16,7 @@ futures-util.workspace = true
 flate2.workspace = true
 hmac.workspace = true
 md-5.workspace = true
+portable-atomic.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true

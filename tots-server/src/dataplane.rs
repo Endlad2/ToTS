@@ -3,11 +3,12 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
+use portable_atomic::AtomicU64;
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Weak,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},

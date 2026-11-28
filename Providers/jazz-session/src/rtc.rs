@@ -2,11 +2,12 @@ use crate::carrier::{wallclock_timestamp, MediaCarrier};
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::{json, Value};
+use portable_atomic::AtomicU64;
 use std::{
     collections::HashMap,
     net::IpAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::{Duration, Instant},

@@ -13,8 +13,11 @@ use parking_lot::Mutex;
 use rand::{rngs::OsRng, RngCore};
 use std::{
     collections::BTreeSet,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
+// 64-битные счётчики: на 32-битных целях без нативных атомиков их даёт
+// portable-atomic (mips/mipsel, armv5).
+use portable_atomic::AtomicU64;
 
 #[derive(Debug)]
 pub enum DecodedPacket {

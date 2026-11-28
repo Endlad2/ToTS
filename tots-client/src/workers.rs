@@ -1,10 +1,11 @@
 use crate::bootstrap::{BootstrapPool, VK_WORKERS_PER_BOOTSTRAP};
 use anyhow::{anyhow, Context, Result};
+use portable_atomic::AtomicU64;
 use std::{
     collections::BTreeSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
